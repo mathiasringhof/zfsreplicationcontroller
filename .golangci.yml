@@ -1,0 +1,49 @@
+version: "2"
+
+run:
+  timeout: 5m
+  tests: true
+  relative-path-mode: gomod
+  modules-download-mode: readonly
+
+output:
+  formats:
+    text:
+      path: stdout
+      colors: false
+
+formatters:
+  enable:
+    - gofmt
+
+linters:
+  default: none
+  enable:
+    - bidichk
+    - bodyclose
+    - errcheck
+    - errorlint
+    - govet
+    - ineffassign
+    - nolintlint
+    - rowserrcheck
+    - sqlclosecheck
+    - staticcheck
+    - unused
+
+  settings:
+    errcheck:
+      check-type-assertions: true
+      check-blank: true
+
+    nolintlint:
+      require-explanation: true
+      require-specific: true
+
+  exclusions:
+    generated: strict
+    warn-unused: true
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0

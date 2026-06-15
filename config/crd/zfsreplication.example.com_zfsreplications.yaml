@@ -1,0 +1,133 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: zfsreplications.zfsreplication.example.com
+spec:
+  group: zfsreplication.example.com
+  names:
+    kind: ZFSReplication
+    listKind: ZFSReplicationList
+    plural: zfsreplications
+    singular: zfsreplication
+    shortNames:
+      - zfsrep
+  scope: Namespaced
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      schema:
+        openAPIV3Schema:
+          type: object
+          required:
+            - spec
+          properties:
+            apiVersion:
+              type: string
+            kind:
+              type: string
+            metadata:
+              type: object
+            spec:
+              type: object
+              required:
+                - source
+                - target
+              properties:
+                runID:
+                  type: string
+                source:
+                  type: object
+                  required:
+                    - nodeName
+                    - dataset
+                  properties:
+                    nodeName:
+                      type: string
+                      minLength: 1
+                    dataset:
+                      type: string
+                      minLength: 1
+                target:
+                  type: object
+                  required:
+                    - nodeName
+                    - dataset
+                  properties:
+                    nodeName:
+                      type: string
+                      minLength: 1
+                    dataset:
+                      type: string
+                      minLength: 1
+                snapshotPrefix:
+                  type: string
+                  default: zsync
+                bootstrap:
+                  type: object
+                  properties:
+                    mode:
+                      type: string
+                      default: FailIfNoBase
+                      enum:
+                        - FailIfNoBase
+                        - DestroyTargetAndReceiveFull
+                receive:
+                  type: object
+                  properties:
+                    receiveUnmounted:
+                      type: boolean
+                      default: true
+                    resumable:
+                      type: boolean
+                      default: true
+            status:
+              type: object
+              properties:
+                phase:
+                  type: string
+                  enum:
+                    - Pending
+                    - StartingReceiver
+                    - ReceiverReady
+                    - Running
+                    - Succeeded
+                    - Failed
+                observedRunID:
+                  type: string
+                lastAttemptedRunID:
+                  type: string
+                lastSuccessfulRunID:
+                  type: string
+                lastSuccessfulSnapshot:
+                  type: string
+                lastSuccessfulSnapshotGUID:
+                  type: string
+                senderJobName:
+                  type: string
+                receiverJobName:
+                  type: string
+                serviceName:
+                  type: string
+                tokenSecretName:
+                  type: string
+                startedAt:
+                  type: string
+                  format: date-time
+                completedAt:
+                  type: string
+                  format: date-time
+                lastError:
+                  type: string
+      additionalPrinterColumns:
+        - name: Phase
+          type: string
+          jsonPath: .status.phase
+        - name: Run
+          type: string
+          jsonPath: .spec.runID
+        - name: Last Success
+          type: string
+          jsonPath: .status.lastSuccessfulRunID

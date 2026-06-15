@@ -1,0 +1,19 @@
+apiVersion: zfsreplication.example.com/v1alpha1
+kind: ZFSReplication
+metadata:
+  name: pg-a-to-b
+  namespace: storage
+spec:
+  runID: manual-0001
+  source:
+    nodeName: worker-a
+    dataset: tank/pvc-11111111-aaaa
+  target:
+    nodeName: worker-b
+    dataset: tank/pvc-22222222-bbbb
+  snapshotPrefix: zsync
+  bootstrap:
+    mode: FailIfNoBase
+  receive:
+    receiveUnmounted: true
+    resumable: true
