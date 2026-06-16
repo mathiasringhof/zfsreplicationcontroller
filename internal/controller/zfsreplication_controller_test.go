@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"testing"
+	"time"
 
 	zfsv1 "github.com/mathias/zfsreplicationcontroller/api/v1alpha1"
 	batchv1 "k8s.io/api/batch/v1"
@@ -188,6 +189,53 @@ func TestReconcileAlreadySucceededStartsNothing(t *testing.T) {
 	assertMissing[*batchv1.Job](t, r.Client, "zfsrep-rep-manual-1-receiver")
 }
 
+func TestReconcileActiveLeaseHeldByDifferentRunBlocksNewRun(t *testing.T) {
+	rep := replication("manual-2")
+	r := newReconciler(t, rep, lease("zfsrep-rep", "manual-1", "active"))
+	result, err := r.Reconcile(context.Background(), request("rep"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.RequeueAfter < 14*time.Second || result.RequeueAfter > 16*time.Second {
+		t.Fatalf("RequeueAfter = %s, want around 15s", result.RequeueAfter)
+	}
+	assertMissing[*corev1.Secret](t, r.Client, "zfsrep-rep-manual-2-token")
+	assertMissing[*batchv1.Job](t, r.Client, "zfsrep-rep-manual-2-receiver")
+	assertMissing[*batchv1.Job](t, r.Client, "zfsrep-rep-manual-2-sender")
+}
+
+func TestReconcileNonActiveLeaseCanBeReusedByNewRun(t *testing.T) {
+	tests := []struct {
+		name  string
+		state string
+	}{
+		{name: "failed", state: "failed"},
+		{name: "succeeded", state: "succeeded"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rep := replication("manual-2")
+			r := newReconciler(t, rep, lease("zfsrep-rep", "manual-1", tt.state))
+			if _, err := r.Reconcile(context.Background(), request("rep")); err != nil {
+				t.Fatal(err)
+			}
+			assertExists[*corev1.Secret](t, r.Client, "zfsrep-rep-manual-2-token")
+			assertExists[*batchv1.Job](t, r.Client, "zfsrep-rep-manual-2-receiver")
+
+			var got coordinationv1.Lease
+			if err := r.Get(context.Background(), types.NamespacedName{Name: "zfsrep-rep", Namespace: "storage"}, &got); err != nil {
+				t.Fatal(err)
+			}
+			if got.Spec.HolderIdentity == nil || *got.Spec.HolderIdentity != "manual-2" {
+				t.Fatalf("HolderIdentity = %v, want manual-2", got.Spec.HolderIdentity)
+			}
+			if got.Annotations[leaseStateAnnotation] != "active" {
+				t.Fatalf("lease state = %q, want active", got.Annotations[leaseStateAnnotation])
+			}
+		})
+	}
+}
+
 func newReconciler(t *testing.T, objs ...client.Object) *ZFSReplicationReconciler {
 	t.Helper()
 	scheme := runtime.NewScheme()
@@ -250,6 +298,17 @@ func succeededJob(name string) *batchv1.Job {
 
 func failedJob(name string) *batchv1.Job {
 	return &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "storage"}, Status: batchv1.JobStatus{Failed: 1, Conditions: []batchv1.JobCondition{{Type: batchv1.JobFailed, Status: corev1.ConditionTrue, Message: "boom"}}}}
+}
+
+func lease(name, holder, state string) *coordinationv1.Lease {
+	return &coordinationv1.Lease{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        name,
+			Namespace:   "storage",
+			Annotations: map[string]string{leaseStateAnnotation: state},
+		},
+		Spec: coordinationv1.LeaseSpec{HolderIdentity: &holder},
+	}
 }
 
 func getJob(t *testing.T, c client.Client, name string) *batchv1.Job {
@@ -328,6 +387,12 @@ func newObject[T client.Object]() T {
 		return obj
 	case *batchv1.Job:
 		obj, ok := any(&batchv1.Job{}).(T)
+		if !ok {
+			panic("unsupported type")
+		}
+		return obj
+	case *coordinationv1.Lease:
+		obj, ok := any(&coordinationv1.Lease{}).(T)
 		if !ok {
 			panic("unsupported type")
 		}

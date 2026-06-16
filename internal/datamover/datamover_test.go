@@ -2,6 +2,7 @@ package datamover
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -16,14 +17,20 @@ type call struct {
 }
 
 type fakeRunner struct {
-	calls        []call
-	snapshots    map[string]bool
-	mounted      string
-	failSnapshot bool
+	calls         []call
+	snapshots     map[string]bool
+	mounted       string
+	failSnapshot  bool
+	destroyStderr string
+	destroyErr    error
+	pipeErr       error
 }
 
 func (f *fakeRunner) Run(_ context.Context, name string, args ...string) (string, string, error) {
 	f.calls = append(f.calls, call{name: name, args: args})
+	if strings.Join(args, " ") == "destroy -r tank/dst" {
+		return "", f.destroyStderr, f.destroyErr
+	}
 	if strings.Join(args, " ") == "get -H -o value mounted tank/dst" {
 		return f.mounted, "", nil
 	}
@@ -49,7 +56,7 @@ func (f *fakeRunner) Run(_ context.Context, name string, args ...string) (string
 func (f *fakeRunner) StartPipe(_ context.Context, name string, args ...string) (io.ReadCloser, <-chan error, error) {
 	f.calls = append(f.calls, call{name: name, args: args})
 	done := make(chan error, 1)
-	done <- nil
+	done <- f.pipeErr
 	close(done)
 	return io.NopCloser(strings.NewReader("stream")), done, nil
 }
@@ -103,12 +110,64 @@ func TestSenderUsesIncrementalWhenBaseExists(t *testing.T) {
 	if gotURL != "http://receiver/receive" {
 		t.Fatalf("receiver URL = %q", gotURL)
 	}
-	want := "send -i tank/src@zsync-run-0 tank/src@zsync-run-1"
-	if got := strings.Join(runner.calls[2].args, " "); got != want {
-		t.Fatalf("send args = %q, want %q", got, want)
+	if !hasCall(runner.calls, "send -i tank/src@zsync-run-0 tank/src@zsync-run-1") {
+		t.Fatalf("zfs send -i was not called: %#v", runner.calls)
 	}
 	if headers.Get("Authorization") != "Bearer secret-token" || headers.Get("X-ZFSRep-Mode") != "incremental" {
 		t.Fatalf("missing required headers: %#v", headers)
+	}
+}
+
+func TestSenderConfigFromEnvDefaultsSnapshotPrefix(t *testing.T) {
+	t.Setenv("SNAPSHOT_PREFIX", "")
+	cfg := SenderConfigFromEnv()
+	if cfg.SnapshotPrefix != "zsync" {
+		t.Fatalf("SnapshotPrefix = %q, want zsync", cfg.SnapshotPrefix)
+	}
+}
+
+func TestReceiverConfigFromEnvDefaults(t *testing.T) {
+	for _, key := range []string{"BOOTSTRAP_MODE", "RECEIVE_UNMOUNTED", "RECEIVE_RESUMABLE", "LISTEN_ADDR"} {
+		t.Setenv(key, "")
+	}
+	cfg := ReceiverConfigFromEnv()
+	if cfg.BootstrapMode != "FailIfNoBase" {
+		t.Fatalf("BootstrapMode = %q, want FailIfNoBase", cfg.BootstrapMode)
+	}
+	if !cfg.ReceiveUnmounted {
+		t.Fatalf("ReceiveUnmounted = false, want true")
+	}
+	if !cfg.ReceiveResumable {
+		t.Fatalf("ReceiveResumable = false, want true")
+	}
+	if cfg.ListenAddr != ":8080" {
+		t.Fatalf("ListenAddr = %q, want :8080", cfg.ListenAddr)
+	}
+}
+
+func TestConfigFromEnvExplicitValuesOverrideDefaults(t *testing.T) {
+	t.Setenv("SNAPSHOT_PREFIX", "nightly")
+	t.Setenv("BOOTSTRAP_MODE", BootstrapDestroyTargetAndReceiveFull)
+	t.Setenv("RECEIVE_UNMOUNTED", "false")
+	t.Setenv("RECEIVE_RESUMABLE", "false")
+	t.Setenv("LISTEN_ADDR", "127.0.0.1:9090")
+
+	sender := SenderConfigFromEnv()
+	if sender.SnapshotPrefix != "nightly" {
+		t.Fatalf("sender SnapshotPrefix = %q, want nightly", sender.SnapshotPrefix)
+	}
+	receiver := ReceiverConfigFromEnv()
+	if receiver.BootstrapMode != BootstrapDestroyTargetAndReceiveFull {
+		t.Fatalf("receiver BootstrapMode = %q, want %s", receiver.BootstrapMode, BootstrapDestroyTargetAndReceiveFull)
+	}
+	if receiver.ReceiveUnmounted {
+		t.Fatalf("ReceiveUnmounted = true, want false")
+	}
+	if receiver.ReceiveResumable {
+		t.Fatalf("ReceiveResumable = true, want false")
+	}
+	if receiver.ListenAddr != "127.0.0.1:9090" {
+		t.Fatalf("ListenAddr = %q, want 127.0.0.1:9090", receiver.ListenAddr)
 	}
 }
 
@@ -139,6 +198,88 @@ func TestSenderRefusesFullWhenBootstrapDisabled(t *testing.T) {
 		ReceiverURL: "http://example.invalid", TokenFile: tokenFile, BootstrapMode: "FailIfNoBase",
 	}, runner, nil)
 	if err == nil || !strings.Contains(err.Error(), "no base snapshot") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestSenderHTTPNon2xxIncludesReceiverStatusAndBody(t *testing.T) {
+	tokenFile := writeToken(t)
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if _, err := io.Copy(io.Discard, r.Body); err != nil {
+			return nil, err
+		}
+		return &http.Response{
+			StatusCode: http.StatusTeapot,
+			Status:     "418 I'm a teapot",
+			Body:       io.NopCloser(strings.NewReader("short and stout")),
+			Header:     http.Header{},
+		}, nil
+	})}
+	runner := &fakeRunner{snapshots: map[string]bool{
+		"tank/src@zsync-run-1": true,
+		"tank/src@zsync-run-0": true,
+	}}
+	_, err := RunSender(context.Background(), SenderConfig{
+		RunID: "run-1", SnapshotPrefix: "zsync", SrcDataset: "tank/src", BaseSnapshot: "zsync-run-0",
+		ReceiverURL: "http://receiver/receive", TokenFile: tokenFile, BootstrapMode: "FailIfNoBase",
+	}, runner, client)
+	if err == nil || !strings.Contains(err.Error(), "HTTP stream failed") || !strings.Contains(err.Error(), "418 I'm a teapot") || !strings.Contains(err.Error(), "short and stout") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestSenderHTTPClientErrorIsWrappedAsStreamFailure(t *testing.T) {
+	tokenFile := writeToken(t)
+	clientErr := errors.New("connection reset")
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if _, err := io.Copy(io.Discard, r.Body); err != nil {
+			return nil, err
+		}
+		return nil, clientErr
+	})}
+	runner := &fakeRunner{snapshots: map[string]bool{
+		"tank/src@zsync-run-1": true,
+		"tank/src@zsync-run-0": true,
+	}}
+	_, err := RunSender(context.Background(), SenderConfig{
+		RunID: "run-1", SnapshotPrefix: "zsync", SrcDataset: "tank/src", BaseSnapshot: "zsync-run-0",
+		ReceiverURL: "http://receiver/receive", TokenFile: tokenFile, BootstrapMode: "FailIfNoBase",
+	}, runner, client)
+	if err == nil || !strings.Contains(err.Error(), "HTTP stream failed") || !strings.Contains(err.Error(), "connection reset") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestSenderSurfacesSendPipeCompletionErrorAfterHTTPRequest(t *testing.T) {
+	tokenFile := writeToken(t)
+	requested := false
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		requested = true
+		if _, err := io.Copy(io.Discard, r.Body); err != nil {
+			return nil, err
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Status:     "200 OK",
+			Body:       io.NopCloser(strings.NewReader("ok")),
+			Header:     http.Header{},
+		}, nil
+	})}
+	runner := &fakeRunner{
+		snapshots: map[string]bool{
+			"tank/src@zsync-run-1": true,
+			"tank/src@zsync-run-0": true,
+		},
+		pipeErr: errors.New("send exited 1"),
+	}
+	_, err := RunSender(context.Background(), SenderConfig{
+		RunID: "run-1", SnapshotPrefix: "zsync", SrcDataset: "tank/src", BaseSnapshot: "zsync-run-0",
+		ReceiverURL: "http://receiver/receive", TokenFile: tokenFile, BootstrapMode: "FailIfNoBase",
+	}, runner, client)
+	if !requested {
+		t.Fatalf("HTTP request was not attempted")
+	}
+	if err == nil || !strings.Contains(err.Error(), "zfs send failed") || !strings.Contains(err.Error(), "send exited 1") {
 		t.Fatalf("error = %v", err)
 	}
 }
@@ -225,12 +366,96 @@ func TestReceiverRejectsMountedTarget(t *testing.T) {
 	}
 }
 
+func TestReceiverFullReceiveDestroysTargetBeforeReceive(t *testing.T) {
+	runner := &fakeRunner{snapshots: map[string]bool{"tank/dst@snap-1": true}, mounted: "no\n"}
+	receiver := newTestReceiverWithConfig(t, runner, ReceiverConfig{
+		RunID: "run-1", SnapshotName: "snap-1", DstDataset: "tank/dst", TokenFile: writeToken(t),
+		BootstrapMode: BootstrapDestroyTargetAndReceiveFull, ReceiveUnmounted: true, ReceiveResumable: true,
+	})
+	req := validReceiveRequest()
+	req.Header.Set("X-ZFSRep-Mode", "full")
+	rr := httptest.NewRecorder()
+	receiver.Handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	destroyIndex := callIndex(runner.calls, "destroy -r tank/dst")
+	receiveIndex := callIndex(runner.calls, "receive -u -s tank/dst")
+	if destroyIndex == -1 || receiveIndex == -1 {
+		t.Fatalf("destroy/receive calls missing: %#v", runner.calls)
+	}
+	if destroyIndex > receiveIndex {
+		t.Fatalf("destroy ran after receive: %#v", runner.calls)
+	}
+}
+
+func TestReceiverFullReceiveContinuesWhenDestroyFindsNoDataset(t *testing.T) {
+	runner := &fakeRunner{
+		snapshots:     map[string]bool{"tank/dst@snap-1": true},
+		mounted:       "no\n",
+		destroyStderr: "cannot open 'tank/dst': dataset does not exist",
+		destroyErr:    errFake,
+	}
+	receiver := newTestReceiverWithConfig(t, runner, ReceiverConfig{
+		RunID: "run-1", SnapshotName: "snap-1", DstDataset: "tank/dst", TokenFile: writeToken(t),
+		BootstrapMode: BootstrapDestroyTargetAndReceiveFull, ReceiveUnmounted: true, ReceiveResumable: true,
+	})
+	req := validReceiveRequest()
+	req.Header.Set("X-ZFSRep-Mode", "full")
+	rr := httptest.NewRecorder()
+	receiver.Handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	if !hasCall(runner.calls, "receive -u -s tank/dst") {
+		t.Fatalf("receive was not called: %#v", runner.calls)
+	}
+}
+
+func TestReceiverRejectsFullReceiveWhenBootstrapDisabled(t *testing.T) {
+	runner := &fakeRunner{snapshots: map[string]bool{"tank/dst@snap-1": true}, mounted: "no\n"}
+	receiver := newTestReceiver(t, runner)
+	req := validReceiveRequest()
+	req.Header.Set("X-ZFSRep-Mode", "full")
+	rr := httptest.NewRecorder()
+	receiver.Handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	if hasCall(runner.calls, "destroy -r tank/dst") || hasCall(runner.calls, "receive -u -s tank/dst") {
+		t.Fatalf("unexpected destructive calls: %#v", runner.calls)
+	}
+}
+
+func TestReceiverAllowsOnlySingleReceiveAttempt(t *testing.T) {
+	runner := &fakeRunner{snapshots: map[string]bool{"tank/dst@snap-1": true}, mounted: "no\n"}
+	receiver := newTestReceiver(t, runner)
+	first := httptest.NewRecorder()
+	receiver.Handler().ServeHTTP(first, validReceiveRequest())
+	if first.Code != http.StatusOK {
+		t.Fatalf("first status = %d body=%s", first.Code, first.Body.String())
+	}
+	second := httptest.NewRecorder()
+	receiver.Handler().ServeHTTP(second, validReceiveRequest())
+	if second.Code != http.StatusConflict {
+		t.Fatalf("second status = %d body=%s", second.Code, second.Body.String())
+	}
+	if got := countCalls(runner.calls, "receive -u -s tank/dst"); got != 1 {
+		t.Fatalf("receive calls = %d, want 1: %#v", got, runner.calls)
+	}
+}
+
 func newTestReceiver(t *testing.T, runner CommandRunner) *Receiver {
 	t.Helper()
-	receiver, err := NewReceiver(ReceiverConfig{
+	return newTestReceiverWithConfig(t, runner, ReceiverConfig{
 		RunID: "run-1", SnapshotName: "snap-1", DstDataset: "tank/dst", TokenFile: writeToken(t),
 		BootstrapMode: "FailIfNoBase", ReceiveUnmounted: true, ReceiveResumable: true,
-	}, runner)
+	})
+}
+
+func newTestReceiverWithConfig(t *testing.T, runner CommandRunner, cfg ReceiverConfig) *Receiver {
+	t.Helper()
+	receiver, err := NewReceiver(cfg, runner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -259,4 +484,27 @@ func writeToken(t *testing.T) string {
 		t.Fatal(err)
 	}
 	return f.Name()
+}
+
+func hasCall(calls []call, args string) bool {
+	return callIndex(calls, args) != -1
+}
+
+func callIndex(calls []call, args string) int {
+	for i, c := range calls {
+		if c.name == "zfs" && strings.Join(c.args, " ") == args {
+			return i
+		}
+	}
+	return -1
+}
+
+func countCalls(calls []call, args string) int {
+	count := 0
+	for _, c := range calls {
+		if c.name == "zfs" && strings.Join(c.args, " ") == args {
+			count++
+		}
+	}
+	return count
 }
