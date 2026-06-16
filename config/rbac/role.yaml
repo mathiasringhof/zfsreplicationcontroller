@@ -34,7 +34,6 @@ rules:
   - apiGroups:
       - ""
     resources:
-      - services
       - secrets
     verbs:
       - create

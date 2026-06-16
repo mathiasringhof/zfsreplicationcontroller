@@ -71,8 +71,10 @@ var errFake error = fakeErr{}
 func TestSenderUsesIncrementalWhenBaseExists(t *testing.T) {
 	tokenFile := writeToken(t)
 	var headers http.Header
+	var gotURL string
 	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		headers = r.Header.Clone()
+		gotURL = r.URL.String()
 		if _, err := io.Copy(io.Discard, r.Body); err != nil {
 			return nil, err
 		}
@@ -98,12 +100,28 @@ func TestSenderUsesIncrementalWhenBaseExists(t *testing.T) {
 	if guid != "123" {
 		t.Fatalf("guid = %q", guid)
 	}
+	if gotURL != "http://receiver/receive" {
+		t.Fatalf("receiver URL = %q", gotURL)
+	}
 	want := "send -i tank/src@zsync-run-0 tank/src@zsync-run-1"
 	if got := strings.Join(runner.calls[2].args, " "); got != want {
 		t.Fatalf("send args = %q, want %q", got, want)
 	}
 	if headers.Get("Authorization") != "Bearer secret-token" || headers.Get("X-ZFSRep-Mode") != "incremental" {
 		t.Fatalf("missing required headers: %#v", headers)
+	}
+}
+
+func TestSenderExitsBeforeWorkWhenNodeMismatch(t *testing.T) {
+	runner := &fakeRunner{snapshots: map[string]bool{}}
+	_, err := RunSender(context.Background(), SenderConfig{
+		ExpectedNode: "worker-a", ActualNode: "worker-b", TokenFile: "/does/not/matter",
+	}, runner, nil)
+	if err == nil || !strings.Contains(err.Error(), "node verification failed") {
+		t.Fatalf("error = %v", err)
+	}
+	if len(runner.calls) != 0 {
+		t.Fatalf("zfs calls = %#v", runner.calls)
 	}
 }
 
@@ -160,13 +178,46 @@ func TestReceiverRunsReceiveAndVerifiesSnapshot(t *testing.T) {
 	}
 }
 
+func TestReceiverExitsBeforeListeningWhenNodeMismatch(t *testing.T) {
+	runner := &fakeRunner{snapshots: map[string]bool{}, mounted: "no\n"}
+	receiver, err := NewReceiver(ReceiverConfig{
+		ExpectedNode: "worker-b", ActualNode: "worker-a", TokenFile: "/does/not/matter",
+	}, runner)
+	if err == nil || !strings.Contains(err.Error(), "node verification failed") {
+		t.Fatalf("error = %v receiver=%v", err, receiver)
+	}
+	if len(runner.calls) != 0 {
+		t.Fatalf("zfs calls = %#v", runner.calls)
+	}
+}
+
+func TestReceiverRequiresRunSnapshotAndModeHeaders(t *testing.T) {
+	tests := []struct {
+		name   string
+		header string
+		value  string
+	}{
+		{name: "run ID", header: "X-ZFSRep-Run-ID", value: "wrong"},
+		{name: "snapshot", header: "X-ZFSRep-Snapshot", value: "wrong"},
+		{name: "mode", header: "X-ZFSRep-Mode", value: "sideways"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			receiver := newTestReceiver(t, &fakeRunner{snapshots: map[string]bool{}, mounted: "no\n"})
+			req := validReceiveRequest()
+			req.Header.Set(tt.header, tt.value)
+			rr := httptest.NewRecorder()
+			receiver.Handler().ServeHTTP(rr, req)
+			if rr.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d body=%s", rr.Code, rr.Body.String())
+			}
+		})
+	}
+}
+
 func TestReceiverRejectsMountedTarget(t *testing.T) {
 	receiver := newTestReceiver(t, &fakeRunner{snapshots: map[string]bool{}, mounted: "yes\n"})
-	req := httptest.NewRequest(http.MethodPost, "/receive", strings.NewReader("stream"))
-	req.Header.Set("Authorization", "Bearer secret-token")
-	req.Header.Set("X-ZFSRep-Run-ID", "run-1")
-	req.Header.Set("X-ZFSRep-Snapshot", "snap-1")
-	req.Header.Set("X-ZFSRep-Mode", "incremental")
+	req := validReceiveRequest()
 	rr := httptest.NewRecorder()
 	receiver.Handler().ServeHTTP(rr, req)
 	if rr.Code != http.StatusConflict {
@@ -184,6 +235,15 @@ func newTestReceiver(t *testing.T, runner CommandRunner) *Receiver {
 		t.Fatal(err)
 	}
 	return receiver
+}
+
+func validReceiveRequest() *http.Request {
+	req := httptest.NewRequest(http.MethodPost, "/receive", strings.NewReader("stream"))
+	req.Header.Set("Authorization", "Bearer secret-token")
+	req.Header.Set("X-ZFSRep-Run-ID", "run-1")
+	req.Header.Set("X-ZFSRep-Snapshot", "snap-1")
+	req.Header.Set("X-ZFSRep-Mode", "incremental")
+	return req
 }
 
 func writeToken(t *testing.T) string {

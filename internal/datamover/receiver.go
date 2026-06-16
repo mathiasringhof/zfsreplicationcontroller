@@ -21,6 +21,8 @@ type ReceiverConfig struct {
 	ReceiveUnmounted bool
 	ReceiveResumable bool
 	ListenAddr       string
+	ExpectedNode     string
+	ActualNode       string
 }
 
 type Receiver struct {
@@ -41,10 +43,15 @@ func ReceiverConfigFromEnv() ReceiverConfig {
 		ReceiveUnmounted: getenv("RECEIVE_UNMOUNTED", "true") == "true",
 		ReceiveResumable: getenv("RECEIVE_RESUMABLE", "true") == "true",
 		ListenAddr:       getenv("LISTEN_ADDR", ":8080"),
+		ExpectedNode:     os.Getenv("EXPECTED_NODE_NAME"),
+		ActualNode:       os.Getenv("ACTUAL_NODE_NAME"),
 	}
 }
 
 func NewReceiver(cfg ReceiverConfig, runner CommandRunner) (*Receiver, error) {
+	if err := validateNode(cfg.ExpectedNode, cfg.ActualNode); err != nil {
+		return nil, err
+	}
 	tokenBytes, err := os.ReadFile(cfg.TokenFile)
 	if err != nil {
 		return nil, fmt.Errorf("read token: %w", err)
@@ -95,6 +102,10 @@ func (r *Receiver) receive(w http.ResponseWriter, req *http.Request) {
 	}
 
 	mode := req.Header.Get("X-ZFSRep-Mode")
+	if mode != "full" && mode != "incremental" {
+		http.Error(w, "invalid receive mode", http.StatusBadRequest)
+		return
+	}
 	if mode == "full" && r.cfg.BootstrapMode != BootstrapDestroyTargetAndReceiveFull {
 		http.Error(w, "full receive requires destructive bootstrap", http.StatusConflict)
 		return

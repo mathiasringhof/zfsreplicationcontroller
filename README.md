@@ -9,10 +9,12 @@ The transport is in-cluster pod-to-pod streaming only. It does not use SSH and h
 - Watches `ZFSReplication` objects.
 - Creates a per-run bearer token `Secret`.
 - Starts a privileged receiver `Job` on the target node.
-- Exposes the receiver with a per-run `ClusterIP` `Service`.
-- Starts a privileged sender `Job` on the source node after the receiver pod is ready.
+- Waits for the receiver Pod to become Running and Ready with a populated `status.podIP`.
+- Starts a privileged sender `Job` on the source node with `RECEIVER_URL=http://<receiverPodIP>:8080/receive`.
 - Runs `zfs snapshot`, `zfs send`, and authenticated HTTP streaming to `zfs receive -u -s`.
-- Updates basic status and cleans up the temporary `Service` and token `Secret` after success.
+- Updates basic status and cleans up the token `Secret` after success.
+
+MVP1 does not create a Kubernetes `Service`. The sender connects directly to the single receiver Pod IP for the run. This is acceptable for MVP1 because each run has exactly one receiver Pod and one sender Pod.
 
 ## Install
 
@@ -66,6 +68,15 @@ kubectl get zfsreplication pg-a-to-b -n storage -o yaml
 kubectl get jobs -n storage -l zfsreplication.example.com/name=pg-a-to-b
 ```
 
+While a run is active, status includes the selected receiver Pod:
+
+```yaml
+status:
+  phase: Running
+  receiverPodName: zfsrep-pg-a-to-b-manual-0002-receiver-abcde
+  receiverPodIP: 10.244.3.27
+```
+
 ## Operational Warnings
 
 The target dataset must be passive and unmounted. The receiver refuses to run if `zfs get -H -o value mounted <target>` returns `yes`.
@@ -73,6 +84,10 @@ The target dataset must be passive and unmounted. The receiver refuses to run if
 `DestroyTargetAndReceiveFull` is destructive. When the sender must perform a full send and this mode is enabled, the receiver may run `zfs destroy -r <target dataset>` before `zfs receive`.
 
 The controller does not discover PVCs, CSI snapshots, ZFS snapshots, or retention state. Dataset names and node names are explicit user input.
+
+Sender and receiver Jobs are pinned with `spec.template.spec.nodeName`, not only a node selector. Both containers verify at startup that the actual node from the downward API matches the expected node and exit before running ZFS commands if it does not.
+
+Jobs use `backoffLimit: 0` and `restartPolicy: Never`. If the receiver Pod fails, is replaced, or more than one ready receiver Pod exists, the run fails. MVP1 does not reconnect or update a running sender; retry by changing `spec.runID`.
 
 ## Development
 

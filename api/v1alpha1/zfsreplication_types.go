@@ -50,7 +50,8 @@ type ZFSReplicationStatus struct {
 	LastSuccessfulSnapshotGUID string       `json:"lastSuccessfulSnapshotGUID,omitempty"`
 	SenderJobName              string       `json:"senderJobName,omitempty"`
 	ReceiverJobName            string       `json:"receiverJobName,omitempty"`
-	ServiceName                string       `json:"serviceName,omitempty"`
+	ReceiverPodName            string       `json:"receiverPodName,omitempty"`
+	ReceiverPodIP              string       `json:"receiverPodIP,omitempty"`
 	TokenSecretName            string       `json:"tokenSecretName,omitempty"`
 	StartedAt                  *metav1.Time `json:"startedAt,omitempty"`
 	CompletedAt                *metav1.Time `json:"completedAt,omitempty"`

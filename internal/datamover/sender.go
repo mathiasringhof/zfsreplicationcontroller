@@ -20,6 +20,8 @@ type SenderConfig struct {
 	ReceiverURL    string
 	TokenFile      string
 	BootstrapMode  string
+	ExpectedNode   string
+	ActualNode     string
 }
 
 func SenderConfigFromEnv() SenderConfig {
@@ -32,10 +34,15 @@ func SenderConfigFromEnv() SenderConfig {
 		ReceiverURL:    os.Getenv("RECEIVER_URL"),
 		TokenFile:      os.Getenv("TOKEN_FILE"),
 		BootstrapMode:  os.Getenv("BOOTSTRAP_MODE"),
+		ExpectedNode:   os.Getenv("EXPECTED_NODE_NAME"),
+		ActualNode:     os.Getenv("ACTUAL_NODE_NAME"),
 	}
 }
 
 func RunSender(ctx context.Context, cfg SenderConfig, r CommandRunner, client *http.Client) (guid string, err error) {
+	if err := validateNode(cfg.ExpectedNode, cfg.ActualNode); err != nil {
+		return "", err
+	}
 	if cfg.SnapshotName == "" {
 		cfg.SnapshotName = cfg.SnapshotPrefix + "-" + cfg.RunID
 	}
@@ -119,4 +126,14 @@ func clean(stderr string, err error) string {
 		return stderr
 	}
 	return err.Error()
+}
+
+func validateNode(expected, actual string) error {
+	if expected == "" {
+		return nil
+	}
+	if actual != expected {
+		return fmt.Errorf("node verification failed: expected %q, got %q", expected, actual)
+	}
+	return nil
 }

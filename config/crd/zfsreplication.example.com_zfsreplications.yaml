@@ -109,7 +109,9 @@ spec:
                   type: string
                 receiverJobName:
                   type: string
-                serviceName:
+                receiverPodName:
+                  type: string
+                receiverPodIP:
                   type: string
                 tokenSecretName:
                   type: string

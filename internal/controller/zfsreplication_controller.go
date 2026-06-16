@@ -60,9 +60,6 @@ func (r *ZFSReplicationReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	if err := r.ensureReceiverJob(ctx, &rep, names); err != nil {
 		return ctrl.Result{}, err
 	}
-	if err := r.ensureService(ctx, &rep, names); err != nil {
-		return ctrl.Result{}, err
-	}
 
 	if failed, msg, err := r.jobFailed(ctx, rep.Namespace, names.ReceiverName, "receiver Job failed"); err != nil || failed {
 		if err != nil {
@@ -70,20 +67,50 @@ func (r *ZFSReplicationReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		}
 		return ctrl.Result{}, r.failRun(ctx, &rep, names, msg)
 	}
-	if ready, err := r.receiverReady(ctx, &rep, names); err != nil || !ready {
+	senderExists, err := r.jobExists(ctx, rep.Namespace, names.SenderName)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	receiverPodName := rep.Status.ReceiverPodName
+	receiverPodIP := rep.Status.ReceiverPodIP
+	if !senderExists {
+		receiverPod, ready, msg, err := r.usableReceiverPod(ctx, &rep, names)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
-		return ctrl.Result{RequeueAfter: 5 * time.Second}, r.patchStatus(ctx, &rep, func(st *zfsv1.ZFSReplicationStatus) {
-			st.Phase = zfsv1.PhaseStartingReceiver
+		if msg != "" {
+			return ctrl.Result{}, r.failRun(ctx, &rep, names, msg)
+		}
+		if !ready {
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, r.patchStatus(ctx, &rep, func(st *zfsv1.ZFSReplicationStatus) {
+				st.Phase = zfsv1.PhaseStartingReceiver
+				fillStatusNames(st, &rep, names)
+			})
+		}
+		receiverPodName = receiverPod.Name
+		receiverPodIP = receiverPod.Status.PodIP
+		if err := r.patchStatus(ctx, &rep, func(st *zfsv1.ZFSReplicationStatus) {
+			st.Phase = zfsv1.PhaseReceiverReady
+			st.ObservedRunID = rep.Spec.RunID
+			st.LastAttemptedRunID = rep.Spec.RunID
+			st.ReceiverPodName = receiverPodName
+			st.ReceiverPodIP = receiverPodIP
 			fillStatusNames(st, &rep, names)
-		})
-	}
+		}); err != nil {
+			return ctrl.Result{}, err
+		}
 
-	if err := r.ensureSenderJob(ctx, &rep, names); err != nil {
-		return ctrl.Result{}, err
+		if err := r.ensureSenderJob(ctx, &rep, names, receiverPodIP); err != nil {
+			return ctrl.Result{}, err
+		}
 	}
 	if failed, msg, err := r.jobFailed(ctx, rep.Namespace, names.SenderName, "sender Job failed"); err != nil || failed {
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{}, r.failRun(ctx, &rep, names, msg)
+	}
+	if failed, msg, err := r.jobFailed(ctx, rep.Namespace, names.ReceiverName, "receiver Job failed"); err != nil || failed {
 		if err != nil {
 			return ctrl.Result{}, err
 		}
@@ -106,6 +133,8 @@ func (r *ZFSReplicationReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 			st.LastAttemptedRunID = rep.Spec.RunID
 			st.LastSuccessfulRunID = rep.Spec.RunID
 			st.LastSuccessfulSnapshot = names.SnapshotName
+			st.ReceiverPodName = receiverPodName
+			st.ReceiverPodIP = receiverPodIP
 			st.CompletedAt = &now
 			st.LastError = ""
 			fillStatusNames(st, &rep, names)
@@ -120,6 +149,8 @@ func (r *ZFSReplicationReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		st.Phase = zfsv1.PhaseRunning
 		st.ObservedRunID = rep.Spec.RunID
 		st.LastAttemptedRunID = rep.Spec.RunID
+		st.ReceiverPodName = receiverPodName
+		st.ReceiverPodIP = receiverPodIP
 		fillStatusNames(st, &rep, names)
 	})
 }
@@ -128,7 +159,6 @@ func (r *ZFSReplicationReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&zfsv1.ZFSReplication{}).
 		Owns(&batchv1.Job{}).
-		Owns(&corev1.Service{}).
 		Owns(&corev1.Secret{}).
 		Complete(r)
 }
@@ -164,8 +194,8 @@ func (r *ZFSReplicationReconciler) ensureReceiverJob(ctx context.Context, rep *z
 	return r.ensureJob(ctx, rep, receiverJob(rep, names, r.image()))
 }
 
-func (r *ZFSReplicationReconciler) ensureSenderJob(ctx context.Context, rep *zfsv1.ZFSReplication, names runObjects) error {
-	return r.ensureJob(ctx, rep, senderJob(rep, names, r.image()))
+func (r *ZFSReplicationReconciler) ensureSenderJob(ctx context.Context, rep *zfsv1.ZFSReplication, names runObjects, receiverPodIP string) error {
+	return r.ensureJob(ctx, rep, senderJob(rep, names, r.image(), receiverPodIP))
 }
 
 func (r *ZFSReplicationReconciler) ensureJob(ctx context.Context, rep *zfsv1.ZFSReplication, job *batchv1.Job) error {
@@ -183,20 +213,16 @@ func (r *ZFSReplicationReconciler) ensureJob(ctx context.Context, rep *zfsv1.ZFS
 	return r.Create(ctx, job)
 }
 
-func (r *ZFSReplicationReconciler) ensureService(ctx context.Context, rep *zfsv1.ZFSReplication, names runObjects) error {
-	var svc corev1.Service
-	err := r.Get(ctx, types.NamespacedName{Name: names.ServiceName, Namespace: rep.Namespace}, &svc)
+func (r *ZFSReplicationReconciler) jobExists(ctx context.Context, ns, name string) (bool, error) {
+	var job batchv1.Job
+	err := r.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, &job)
 	if err == nil {
-		return nil
+		return true, nil
 	}
-	if !apierrors.IsNotFound(err) {
-		return err
+	if apierrors.IsNotFound(err) {
+		return false, nil
 	}
-	obj := receiverService(rep, names)
-	if err := ctrl.SetControllerReference(rep, obj, r.Scheme); err != nil {
-		return err
-	}
-	return r.Create(ctx, obj)
+	return false, err
 }
 
 func (r *ZFSReplicationReconciler) cleanupSucceededRun(ctx context.Context, rep *zfsv1.ZFSReplication, names runObjects) error {
@@ -205,7 +231,6 @@ func (r *ZFSReplicationReconciler) cleanupSucceededRun(ctx context.Context, rep 
 		errs = append(errs, fmt.Errorf("finish lease: %w", err))
 	}
 	for _, obj := range []client.Object{
-		&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: names.ServiceName, Namespace: rep.Namespace}},
 		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: names.SecretName, Namespace: rep.Namespace}},
 	} {
 		if err := r.Delete(ctx, obj); client.IgnoreNotFound(err) != nil {
@@ -215,21 +240,44 @@ func (r *ZFSReplicationReconciler) cleanupSucceededRun(ctx context.Context, rep 
 	return errors.Join(errs...)
 }
 
-func (r *ZFSReplicationReconciler) receiverReady(ctx context.Context, rep *zfsv1.ZFSReplication, names runObjects) (bool, error) {
+func (r *ZFSReplicationReconciler) usableReceiverPod(ctx context.Context, rep *zfsv1.ZFSReplication, names runObjects) (*corev1.Pod, bool, string, error) {
 	var pods corev1.PodList
 	labels := cloneLabels(names.Labels)
 	labels[labelPrefix+"/role"] = "receiver"
 	if err := r.List(ctx, &pods, client.InNamespace(rep.Namespace), client.MatchingLabels(labels)); err != nil {
-		return false, err
+		return nil, false, "", err
 	}
+	var usable []*corev1.Pod
+	hasTerminal := false
 	for _, pod := range pods.Items {
-		for _, cond := range pod.Status.Conditions {
-			if cond.Type == corev1.PodReady && cond.Status == corev1.ConditionTrue {
-				return true, nil
-			}
+		pod := pod
+		if pod.Status.Phase == corev1.PodFailed || pod.Status.Phase == corev1.PodSucceeded {
+			hasTerminal = true
+			continue
+		}
+		if pod.Status.Phase == corev1.PodRunning && pod.Status.PodIP != "" && podReady(&pod) {
+			usable = append(usable, &pod)
 		}
 	}
-	return false, nil
+	if len(usable) > 1 {
+		return nil, false, "multiple ready receiver Pods found", nil
+	}
+	if len(usable) == 1 {
+		return usable[0], true, "", nil
+	}
+	if hasTerminal {
+		return nil, false, "receiver Pod completed before sender was created", nil
+	}
+	return nil, false, "", nil
+}
+
+func podReady(pod *corev1.Pod) bool {
+	for _, cond := range pod.Status.Conditions {
+		if cond.Type == corev1.PodReady && cond.Status == corev1.ConditionTrue {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *ZFSReplicationReconciler) jobSucceeded(ctx context.Context, ns, name string) (bool, error) {
@@ -290,7 +338,6 @@ func fillStatusNames(st *zfsv1.ZFSReplicationStatus, rep *zfsv1.ZFSReplication, 
 	}
 	st.SenderJobName = names.SenderName
 	st.ReceiverJobName = names.ReceiverName
-	st.ServiceName = names.ServiceName
 	st.TokenSecretName = names.SecretName
 }
 
