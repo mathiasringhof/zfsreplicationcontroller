@@ -1,0 +1,192 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="${ZFS_SIM_ROOT:-/tmp/zfs-sim}"
+SNAP_DIR="${ROOT}/snapshots"
+PAYLOAD_DIR="${ROOT}/payloads"
+EVENTS="${ROOT}/events.jsonl"
+
+mkdir -p "${SNAP_DIR}" "${PAYLOAD_DIR}"
+ORIGINAL_COMMAND="zfs $*"
+
+json_escape() {
+  printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+snapshot_id() {
+  printf '%s' "$1" | sha256sum | awk '{print $1}'
+}
+
+snapshot_file() {
+  printf '%s/%s' "${SNAP_DIR}" "$(snapshot_id "$1")"
+}
+
+snapshot_exists() {
+  test -f "$(snapshot_file "$1")"
+}
+
+remember_snapshot() {
+  local snap="$1"
+  printf '%s\n' "${snap}" > "$(snapshot_file "${snap}")"
+}
+
+event() {
+  local action="$1"
+  local target="${2:-}"
+  local bytes="${3:-0}"
+  local sha="${4:-}"
+  local detail="${5:-}"
+  local now
+  now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  local line
+  line="$(printf '{"time":"%s","node":"%s","pod":"%s","role":"%s","runID":"%s","action":"%s","command":"%s","target":"%s","bytes":%s,"sha256":"%s","detail":"%s"}' \
+    "$(json_escape "${now}")" \
+    "$(json_escape "${ACTUAL_NODE_NAME:-unknown}")" \
+    "$(json_escape "${HOSTNAME:-unknown}")" \
+    "$(json_escape "${ZFSREP_ROLE:-unknown}")" \
+    "$(json_escape "${RUN_ID:-}")" \
+    "$(json_escape "${action}")" \
+    "$(json_escape "${ORIGINAL_COMMAND}")" \
+    "$(json_escape "${target}")" \
+    "${bytes}" \
+    "$(json_escape "${sha}")" \
+    "$(json_escape "${detail}")")"
+  printf '%s\n' "${line}" >> "${EVENTS}"
+  printf 'zfs-sim-event %s\n' "${line}" >&2
+}
+
+sha_file() {
+  sha256sum "$1" | awk '{print $1}'
+}
+
+bytes_file() {
+  wc -c < "$1" | tr -d ' '
+}
+
+cmd="${1:-}"
+
+case "${cmd}" in
+  get)
+    if [[ "${2:-}" == "-H" && "${3:-}" == "-o" && "${4:-}" == "value" && "${5:-}" == "mounted" ]]; then
+      dataset="${6:-}"
+      event get-mounted "${dataset}"
+      printf '%s\n' "${ZFS_SIM_MOUNTED:-no}"
+      exit 0
+    fi
+    if [[ "${2:-}" == "-H" && "${3:-}" == "-o" && "${4:-}" == "value" && "${5:-}" == "guid" ]]; then
+      snap="${6:-}"
+      if ! snapshot_exists "${snap}"; then
+        event get-guid "${snap}" 0 "" "missing"
+        printf 'cannot open %s: dataset does not exist\n' "${snap}" >&2
+        exit 1
+      fi
+      guid="$(snapshot_id "${snap}")"
+      event get-guid "${snap}" 0 "${guid}"
+      printf '%s\n' "${guid}"
+      exit 0
+    fi
+    ;;
+  snapshot)
+    snap="${2:-}"
+    if [[ -z "${snap}" ]]; then
+      printf 'missing snapshot name\n' >&2
+      exit 1
+    fi
+    remember_snapshot "${snap}"
+    event snapshot "${snap}"
+    exit 0
+    ;;
+  list)
+    if [[ "${2:-}" == "-H" && "${3:-}" == "-t" && "${4:-}" == "snapshot" ]]; then
+      snap="${5:-}"
+      if snapshot_exists "${snap}"; then
+        event list-snapshot "${snap}" 0 "" "exists"
+        printf '%s\n' "${snap}"
+        exit 0
+      fi
+      event list-snapshot "${snap}" 0 "" "missing"
+      printf 'cannot open %s: dataset does not exist\n' "${snap}" >&2
+      exit 1
+    fi
+    ;;
+  send)
+    shift
+    base=""
+    if [[ "${1:-}" == "-i" ]]; then
+      base="${2:-}"
+      shift 2
+      if ! snapshot_exists "${base}"; then
+        event send "${base}" 0 "" "missing base"
+        printf 'cannot open %s: dataset does not exist\n' "${base}" >&2
+        exit 1
+      fi
+    fi
+    snap="${1:-}"
+    if ! snapshot_exists "${snap}"; then
+      event send "${snap}" 0 "" "missing snapshot"
+      printf 'cannot open %s: dataset does not exist\n' "${snap}" >&2
+      exit 1
+    fi
+    payload="$(mktemp "${ROOT}/send.XXXXXX")"
+    {
+      printf 'ZFS_SIM_V1\n'
+      printf 'run_id=%s\n' "${RUN_ID:-}"
+      printf 'snapshot=%s\n' "${snap}"
+      printf 'base=%s\n' "${base}"
+      printf '\n'
+      i=0
+      while [[ "${i}" -lt 256 ]]; do
+        printf 'payload run=%s snapshot=%s base=%s line=%03d\n' "${RUN_ID:-}" "${snap}" "${base}" "${i}"
+        i=$((i + 1))
+      done
+    } > "${payload}"
+    bytes="$(bytes_file "${payload}")"
+    sha="$(sha_file "${payload}")"
+    event send "${snap}" "${bytes}" "${sha}" "base=${base}"
+    cat "${payload}"
+    rm -f "${payload}"
+    exit 0
+    ;;
+  receive)
+    shift
+    args=()
+    while [[ "$#" -gt 0 ]]; do
+      case "$1" in
+        -u|-s)
+          args+=("$1")
+          shift
+          ;;
+        *)
+          dataset="$1"
+          shift
+          ;;
+      esac
+    done
+    dataset="${dataset:-}"
+    if [[ -z "${dataset}" ]]; then
+      printf 'missing receive dataset\n' >&2
+      exit 1
+    fi
+    payload="$(mktemp "${ROOT}/receive.XXXXXX")"
+    cat > "${payload}"
+    bytes="$(bytes_file "${payload}")"
+    sha="$(sha_file "${payload}")"
+    snap="${dataset}@${SNAPSHOT_NAME:-received}"
+    remember_snapshot "${snap}"
+    cp "${payload}" "${PAYLOAD_DIR}/$(snapshot_id "${snap}").stream"
+    rm -f "${payload}"
+    event receive "${snap}" "${bytes}" "${sha}" "args=${args[*]:-}"
+    exit 0
+    ;;
+  destroy)
+    if [[ "${2:-}" == "-r" ]]; then
+      dataset="${3:-}"
+      event destroy "${dataset}"
+      exit 0
+    fi
+    ;;
+esac
+
+event unsupported "" 0 "" "args=$*"
+printf 'unsupported zfs simulator command: zfs %s\n' "$*" >&2
+exit 2

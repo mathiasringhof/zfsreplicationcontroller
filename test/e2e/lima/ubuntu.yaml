@@ -1,0 +1,28 @@
+images:
+  - location: "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-arm64.img"
+    arch: "aarch64"
+  - location: "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-amd64.img"
+    arch: "x86_64"
+
+cpus: 2
+memory: "2GiB"
+disk: "24GiB"
+
+mounts: []
+
+containerd:
+  system: false
+  user: false
+
+provision:
+  - mode: system
+    script: |
+      #!/bin/sh
+      set -eu
+      apt-get update
+      apt-get install -y --no-install-recommends curl ca-certificates iproute2
+      if [ ! -e /dev/zfs ]; then
+        touch /dev/zfs
+      fi
+      mkdir -p /var/lib/zfs-sim
+      chmod 0777 /var/lib/zfs-sim

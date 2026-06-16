@@ -1,0 +1,19 @@
+apiVersion: zfsreplication.example.com/v1alpha1
+kind: ZFSReplication
+metadata:
+  name: e2e-full
+  namespace: storage
+spec:
+  runID: e2e-full-1
+  source:
+    nodeName: worker-a
+    dataset: tank/src
+  target:
+    nodeName: worker-b
+    dataset: tank/dst
+  snapshotPrefix: zsync
+  bootstrap:
+    mode: DestroyTargetAndReceiveFull
+  receive:
+    receiveUnmounted: true
+    resumable: true
