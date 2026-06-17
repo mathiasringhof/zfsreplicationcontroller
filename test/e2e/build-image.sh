@@ -64,6 +64,7 @@ build_with_vm() {
   run_on_node "${CONTROL_PLANE}" sh -lc "rm -rf /tmp/zrc-src && mkdir -p /tmp/zrc-src && tar -C /tmp/zrc-src -xf /tmp/zrc-src.tar && cd /tmp/zrc-src && sudo buildah bud --isolation chroot --format docker -f test/e2e/image/Dockerfile.e2e -t '${IMAGE_TAG}' ."
 
   log "exporting image archive inside ${CONTROL_PLANE}"
+  run_on_node "${CONTROL_PLANE}" sudo rm -f /tmp/zrc-image.tar
   run_on_node "${CONTROL_PLANE}" sh -lc "sudo buildah push '${IMAGE_TAG}' docker-archive:/tmp/zrc-image.tar:'${IMAGE_TAG}'"
 
   log "copying image tar to ${IMAGE_TAR}"

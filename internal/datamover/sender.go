@@ -2,6 +2,7 @@ package datamover
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -79,6 +80,9 @@ func RunSender(ctx context.Context, cfg SenderConfig, r CommandRunner, client *h
 	}
 	defer func() {
 		if closeErr := body.Close(); closeErr != nil && err == nil {
+			if errors.Is(closeErr, os.ErrClosed) {
+				return
+			}
 			err = fmt.Errorf("close zfs send pipe: %w", closeErr)
 		}
 	}()

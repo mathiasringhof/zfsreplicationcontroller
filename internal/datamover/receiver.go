@@ -10,6 +10,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"time"
 )
 
 type ReceiverConfig struct {
@@ -26,11 +27,13 @@ type ReceiverConfig struct {
 }
 
 type Receiver struct {
-	cfg     ReceiverConfig
-	runner  CommandRunner
-	token   string
-	mu      sync.Mutex
-	started bool
+	cfg       ReceiverConfig
+	runner    CommandRunner
+	token     string
+	mu        sync.Mutex
+	started   bool
+	done      sync.Once
+	completed chan struct{}
 }
 
 func ReceiverConfigFromEnv() ReceiverConfig {
@@ -59,7 +62,12 @@ func NewReceiver(cfg ReceiverConfig, runner CommandRunner) (*Receiver, error) {
 	if cfg.BootstrapMode == "" {
 		cfg.BootstrapMode = "FailIfNoBase"
 	}
-	return &Receiver{cfg: cfg, runner: runner, token: strings.TrimSpace(string(tokenBytes))}, nil
+	return &Receiver{
+		cfg:       cfg,
+		runner:    runner,
+		token:     strings.TrimSpace(string(tokenBytes)),
+		completed: make(chan struct{}),
+	}, nil
 }
 
 func (r *Receiver) Handler() http.Handler {
@@ -72,8 +80,13 @@ func (r *Receiver) Handler() http.Handler {
 func (r *Receiver) Serve(ctx context.Context) error {
 	server := &http.Server{Addr: r.cfg.ListenAddr, Handler: r.Handler()}
 	go func() {
-		<-ctx.Done()
-		if err := server.Shutdown(context.Background()); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		select {
+		case <-ctx.Done():
+		case <-r.completed:
+		}
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := server.Shutdown(shutdownCtx); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Printf("shutdown receiver server: %v", err)
 		}
 	}()
@@ -157,4 +170,11 @@ func (r *Receiver) receive(w http.ResponseWriter, req *http.Request) {
 	if _, err := io.WriteString(w, "ok\n"); err != nil {
 		return
 	}
+	r.complete()
+}
+
+func (r *Receiver) complete() {
+	r.done.Do(func() {
+		close(r.completed)
+	})
 }

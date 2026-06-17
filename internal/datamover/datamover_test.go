@@ -9,6 +9,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 )
 
 type call struct {
@@ -24,6 +25,7 @@ type fakeRunner struct {
 	destroyStderr string
 	destroyErr    error
 	pipeErr       error
+	pipeCloseErr  error
 }
 
 func (f *fakeRunner) Run(_ context.Context, name string, args ...string) (string, string, error) {
@@ -58,7 +60,11 @@ func (f *fakeRunner) StartPipe(_ context.Context, name string, args ...string) (
 	done := make(chan error, 1)
 	done <- f.pipeErr
 	close(done)
-	return io.NopCloser(strings.NewReader("stream")), done, nil
+	body := io.ReadCloser(io.NopCloser(strings.NewReader("stream")))
+	if f.pipeCloseErr != nil {
+		body = closeErrReadCloser{Reader: strings.NewReader("stream"), err: f.pipeCloseErr}
+	}
+	return body, done, nil
 }
 
 func (f *fakeRunner) RunWithStdin(_ context.Context, stdin io.Reader, name string, args ...string) (string, string, error) {
@@ -74,6 +80,15 @@ type fakeErr struct{}
 func (fakeErr) Error() string { return "fake error" }
 
 var errFake error = fakeErr{}
+
+type closeErrReadCloser struct {
+	*strings.Reader
+	err error
+}
+
+func (c closeErrReadCloser) Close() error {
+	return c.err
+}
 
 func TestSenderUsesIncrementalWhenBaseExists(t *testing.T) {
 	tokenFile := writeToken(t)
@@ -284,6 +299,34 @@ func TestSenderSurfacesSendPipeCompletionErrorAfterHTTPRequest(t *testing.T) {
 	}
 }
 
+func TestSenderIgnoresAlreadyClosedSendPipe(t *testing.T) {
+	tokenFile := writeToken(t)
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if _, err := io.Copy(io.Discard, r.Body); err != nil {
+			return nil, err
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Status:     "200 OK",
+			Body:       io.NopCloser(strings.NewReader("ok")),
+			Header:     http.Header{},
+		}, nil
+	})}
+	runner := &fakeRunner{
+		snapshots: map[string]bool{
+			"tank/src@zsync-run-1": true,
+		},
+		pipeCloseErr: os.ErrClosed,
+	}
+	_, err := RunSender(context.Background(), SenderConfig{
+		RunID: "run-1", SnapshotPrefix: "zsync", SrcDataset: "tank/src",
+		ReceiverURL: "http://receiver/receive", TokenFile: tokenFile, BootstrapMode: BootstrapDestroyTargetAndReceiveFull,
+	}, runner, client)
+	if err != nil {
+		t.Fatalf("error = %v", err)
+	}
+}
+
 func TestReceiverRejectsInvalidToken(t *testing.T) {
 	receiver := newTestReceiver(t, &fakeRunner{snapshots: map[string]bool{}, mounted: "no\n"})
 	req := httptest.NewRequest(http.MethodPost, "/receive", strings.NewReader("stream"))
@@ -316,6 +359,22 @@ func TestReceiverRunsReceiveAndVerifiesSnapshot(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("zfs receive -u -s was not called: %#v", runner.calls)
+	}
+}
+
+func TestReceiverSignalsCompletionAfterSuccessfulReceive(t *testing.T) {
+	runner := &fakeRunner{snapshots: map[string]bool{"tank/dst@snap-1": true}, mounted: "no\n"}
+	receiver := newTestReceiver(t, runner)
+	rr := httptest.NewRecorder()
+	receiver.Handler().ServeHTTP(rr, validReceiveRequest())
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", rr.Code, rr.Body.String())
+	}
+
+	select {
+	case <-receiver.completed:
+	case <-time.After(time.Second):
+		t.Fatalf("receiver did not signal completion after successful receive")
 	}
 }
 
