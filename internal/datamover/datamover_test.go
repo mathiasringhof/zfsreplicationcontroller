@@ -160,6 +160,43 @@ func TestReceiverConfigFromEnvDefaults(t *testing.T) {
 	}
 }
 
+func TestExecRunnerMirrorsSuccessfulStderr(t *testing.T) {
+	oldStderr := os.Stderr
+	readStderr, writeStderr, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		os.Stderr = oldStderr
+		if err := readStderr.Close(); err != nil && !errors.Is(err, os.ErrClosed) {
+			t.Errorf("close stderr pipe reader: %v", err)
+		}
+	})
+	os.Stderr = writeStderr
+
+	stdout, stderr, err := ExecRunner{}.Run(context.Background(), "sh", "-c", "printf stdout; printf stderr >&2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeStderr.Close(); err != nil {
+		t.Fatal(err)
+	}
+	mirrored, err := io.ReadAll(readStderr)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if stdout != "stdout" {
+		t.Fatalf("stdout = %q", stdout)
+	}
+	if stderr != "stderr" {
+		t.Fatalf("stderr = %q", stderr)
+	}
+	if string(mirrored) != "stderr" {
+		t.Fatalf("mirrored stderr = %q", string(mirrored))
+	}
+}
+
 func TestConfigFromEnvExplicitValuesOverrideDefaults(t *testing.T) {
 	t.Setenv("SNAPSHOT_PREFIX", "nightly")
 	t.Setenv("BOOTSTRAP_MODE", BootstrapDestroyTargetAndReceiveFull)

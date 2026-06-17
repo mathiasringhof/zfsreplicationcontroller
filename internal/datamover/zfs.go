@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"strings"
 )
@@ -21,7 +22,7 @@ func (ExecRunner) Run(ctx context.Context, name string, args ...string) (string,
 	cmd := exec.CommandContext(ctx, name, args...)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
+	cmd.Stderr = io.MultiWriter(&stderr, os.Stderr)
 	err := cmd.Run()
 	return stdout.String(), stderr.String(), err
 }
@@ -33,7 +34,7 @@ func (ExecRunner) StartPipe(ctx context.Context, name string, args ...string) (i
 	if err != nil {
 		return nil, nil, err
 	}
-	cmd.Stderr = &stderr
+	cmd.Stderr = io.MultiWriter(&stderr, os.Stderr)
 	done := make(chan error, 1)
 	if err := cmd.Start(); err != nil {
 		return nil, nil, err
@@ -54,7 +55,7 @@ func (ExecRunner) RunWithStdin(ctx context.Context, stdin io.Reader, name string
 	var stdout, stderr bytes.Buffer
 	cmd.Stdin = stdin
 	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
+	cmd.Stderr = io.MultiWriter(&stderr, os.Stderr)
 	err := cmd.Run()
 	return stdout.String(), stderr.String(), err
 }
