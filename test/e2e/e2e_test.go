@@ -28,6 +28,7 @@ const (
 )
 
 func TestE2EFullAndIncrementalReplication(t *testing.T) {
+	skipIfRealZFS(t)
 	k := newKubectlRunner(t)
 	suffix := uniqueSuffix()
 	name := "e2e-flow-" + suffix
@@ -67,6 +68,7 @@ func TestE2EFullAndIncrementalReplication(t *testing.T) {
 }
 
 func TestE2EFailIfNoBase(t *testing.T) {
+	skipIfRealZFS(t)
 	k := newKubectlRunner(t)
 	suffix := uniqueSuffix()
 	sc := replicationCase{
@@ -93,6 +95,7 @@ func TestE2EFailIfNoBase(t *testing.T) {
 }
 
 func TestE2ESameDatasetRejectedBeforeJobs(t *testing.T) {
+	skipIfRealZFS(t)
 	k := newKubectlRunner(t)
 	suffix := uniqueSuffix()
 	sc := replicationCase{
@@ -116,6 +119,7 @@ func TestE2ESameDatasetRejectedBeforeJobs(t *testing.T) {
 }
 
 func TestE2ESendFailure(t *testing.T) {
+	skipIfRealZFS(t)
 	k := newKubectlRunner(t)
 	suffix := uniqueSuffix()
 	sc := replicationCase{
@@ -145,6 +149,7 @@ func TestE2ESendFailure(t *testing.T) {
 }
 
 func TestE2EReceiveFailure(t *testing.T) {
+	skipIfRealZFS(t)
 	k := newKubectlRunner(t)
 	suffix := uniqueSuffix()
 	sc := replicationCase{
@@ -174,6 +179,7 @@ func TestE2EReceiveFailure(t *testing.T) {
 }
 
 func TestE2EMountedTargetRejectedBeforeDestroy(t *testing.T) {
+	skipIfRealZFS(t)
 	k := newKubectlRunner(t)
 	suffix := uniqueSuffix()
 	sc := replicationCase{
@@ -200,6 +206,61 @@ func TestE2EMountedTargetRejectedBeforeDestroy(t *testing.T) {
 	events := k.zfsSimEvents(sc.Name, sc.RunID)
 	assertRunTopology(t, sc, events)
 	assertMountedTargetEvents(t, sc, events)
+}
+
+func TestE2ERealZFSFullAndIncrementalReplication(t *testing.T) {
+	if !realZFSEnabled() {
+		t.Skip("set E2E_ZFS_MODE=real to run real ZFS e2e tests")
+	}
+
+	k := newKubectlRunner(t)
+	suffix := uniqueSuffix()
+	pool := realZFSPool()
+	name := "e2e-real-" + suffix
+	first := replicationCase{
+		Name:           name,
+		RunID:          "r-" + suffix + "-1",
+		SourceNode:     e2eSourceNode,
+		TargetNode:     e2eTargetNode,
+		SourceDataset:  pool + "/src-real-" + suffix,
+		TargetDataset:  pool + "/dst-real-" + suffix,
+		SnapshotPrefix: "zsync",
+		BootstrapMode:  e2eBootstrapDestroyFull,
+	}
+	k.cleanupReplicationOnExit(name)
+	k.cleanupReplication(name)
+	k.cleanupRealZFSDatasetOnExit(first.SourceNode, "zfs-cln-src-"+suffix, first.SourceDataset)
+	k.cleanupRealZFSDatasetOnExit(first.TargetNode, "zfs-cln-dst-"+suffix, first.TargetDataset)
+
+	k.runRealZFS(first.SourceNode, "zfs-src-"+suffix, realZFSSetupSourceScript(pool, first.SourceDataset, "first-"+suffix))
+	k.runRealZFS(first.TargetNode, "zfs-dst-"+suffix, realZFSSetupTargetScript(pool, first.TargetDataset))
+
+	k.applyReplication(first)
+	firstStatus := k.waitForSuccess(first, 4*time.Minute)
+	assertSucceededStatus(t, first, firstStatus, firstStatus.LastSuccessfulSnapshotGUID)
+	if firstStatus.LastSuccessfulSnapshotGUID == "" {
+		t.Fatalf("lastSuccessfulSnapshotGUID is empty after real ZFS full send: %#v", firstStatus)
+	}
+	k.assertRealZFSSnapshotGUID(first.SourceNode, "zfs-src-g1-"+suffix, first.sourceSnapshot(), firstStatus.LastSuccessfulSnapshotGUID)
+	k.assertRealZFSSnapshotGUID(first.TargetNode, "zfs-dst-g1-"+suffix, first.targetSnapshot(), firstStatus.LastSuccessfulSnapshotGUID)
+	k.assertSecretDeleted(firstStatus.TokenSecretName)
+	k.assertLeaseState(first.Name, "succeeded")
+
+	second := first
+	second.RunID = "r-" + suffix + "-2"
+	second.BootstrapMode = e2eBootstrapFailIfNoBase
+	k.runRealZFS(second.SourceNode, "zfs-mut-"+suffix, realZFSMutateSourceScript(pool, second.SourceDataset, "second-"+suffix))
+
+	k.applyReplication(second)
+	secondStatus := k.waitForSuccess(second, 4*time.Minute)
+	assertSucceededStatus(t, second, secondStatus, secondStatus.LastSuccessfulSnapshotGUID)
+	if secondStatus.LastSuccessfulSnapshotGUID == "" {
+		t.Fatalf("lastSuccessfulSnapshotGUID is empty after real ZFS incremental send: %#v", secondStatus)
+	}
+	k.assertRealZFSSnapshotGUID(second.SourceNode, "zfs-src-g2-"+suffix, second.sourceSnapshot(), secondStatus.LastSuccessfulSnapshotGUID)
+	k.assertRealZFSSnapshotGUID(second.TargetNode, "zfs-dst-g2-"+suffix, second.targetSnapshot(), secondStatus.LastSuccessfulSnapshotGUID)
+	k.assertSecretDeleted(secondStatus.TokenSecretName)
+	k.assertLeaseState(second.Name, "succeeded")
 }
 
 type replicationCase struct {
@@ -494,6 +555,98 @@ func (k kubectlRunner) assertNoLease(name string) {
 	}
 }
 
+func (k kubectlRunner) cleanupRealZFSDatasetOnExit(node, jobName, dataset string) {
+	k.t.Helper()
+	if os.Getenv("E2E_KEEP_RESOURCES") == "1" {
+		k.t.Logf("leaving real ZFS dataset %s on %s because E2E_KEEP_RESOURCES=1", dataset, node)
+		return
+	}
+	k.t.Cleanup(func() {
+		if logs, err := k.tryRealZFS(node, jobName, "zfs destroy -r "+dataset+" >/dev/null 2>&1 || true"); err != nil {
+			k.t.Logf("cleanup real ZFS dataset %s on %s failed: %v\n%s", dataset, node, err, logs)
+		}
+	})
+}
+
+func (k kubectlRunner) assertRealZFSSnapshotGUID(node, jobName, snapshot, want string) {
+	k.t.Helper()
+	logs := k.runRealZFS(node, jobName, "zfs get -H -o value guid "+snapshot)
+	got := strings.TrimSpace(logs)
+	if got != want {
+		k.t.Fatalf("%s guid on %s = %q, want %q", snapshot, node, got, want)
+	}
+}
+
+func (k kubectlRunner) runRealZFS(node, name, script string) string {
+	k.t.Helper()
+	logs, err := k.tryRealZFS(node, name, script)
+	if err != nil {
+		k.t.Fatalf("real ZFS job %s on %s failed: %v\n%s", name, node, err, logs)
+	}
+	return logs
+}
+
+func (k kubectlRunner) tryRealZFS(node, name, script string) (string, error) {
+	k.t.Helper()
+	k.deleteJob(name)
+	defer k.deleteJob(name)
+
+	manifest := realZFSJobManifest(k.t, node, name, script)
+	if _, err := k.runInput(30*time.Second, manifest, "apply", "-f", "-"); err != nil {
+		return "", err
+	}
+	if err := k.waitForJobSuccess(name, 2*time.Minute); err != nil {
+		logs, logErr := k.runOutput(20*time.Second, "logs", "-n", e2eNamespace, "job/"+name, "--all-containers=true")
+		if logErr != nil {
+			return "", errors.Join(err, fmt.Errorf("collect job logs: %w", logErr))
+		}
+		return logs, err
+	}
+	logs, err := k.runOutput(20*time.Second, "logs", "-n", e2eNamespace, "job/"+name, "--all-containers=true")
+	if err != nil {
+		return "", err
+	}
+	return logs, nil
+}
+
+func (k kubectlRunner) deleteJob(name string) {
+	k.t.Helper()
+	if _, err := k.runOutput(45*time.Second, "delete", "job", name, "-n", e2eNamespace, "--ignore-not-found=true", "--wait=true", "--timeout=30s"); err != nil {
+		k.t.Logf("delete job %s: %v", name, err)
+	}
+}
+
+func (k kubectlRunner) waitForJobSuccess(name string, timeout time.Duration) error {
+	k.t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		job, err := k.getJob(name)
+		if err == nil {
+			if job.Status.Succeeded > 0 {
+				return nil
+			}
+			if job.Status.Failed > 0 {
+				return fmt.Errorf("job failed: %s", jobFailureMessage(job))
+			}
+		}
+		time.Sleep(1 * time.Second)
+	}
+	return fmt.Errorf("timed out waiting for job %s to complete", name)
+}
+
+func (k kubectlRunner) getJob(name string) (jobObject, error) {
+	k.t.Helper()
+	out, err := k.runOutput(20*time.Second, "get", "job", name, "-n", e2eNamespace, "-o", "json")
+	if err != nil {
+		return jobObject{}, err
+	}
+	var job jobObject
+	if err := json.Unmarshal([]byte(out), &job); err != nil {
+		return jobObject{}, fmt.Errorf("parse job: %w\n%s", err, out)
+	}
+	return job, nil
+}
+
 func (k kubectlRunner) run(timeout time.Duration, args ...string) {
 	if _, err := k.runOutput(timeout, args...); err != nil {
 		k.t.Fatal(err)
@@ -563,6 +716,21 @@ type leaseObject struct {
 	Metadata struct {
 		Annotations map[string]string `json:"annotations"`
 	} `json:"metadata"`
+}
+
+type jobObject struct {
+	Status struct {
+		Succeeded  int            `json:"succeeded"`
+		Failed     int            `json:"failed"`
+		Conditions []jobCondition `json:"conditions"`
+	} `json:"status"`
+}
+
+type jobCondition struct {
+	Type    string `json:"type"`
+	Status  string `json:"status"`
+	Reason  string `json:"reason"`
+	Message string `json:"message"`
 }
 
 type podList struct {
@@ -909,6 +1077,119 @@ func formatZFSEvents(events []zfsSimEvent) string {
 		_, _ = fmt.Fprintf(&b, "%s %s %s %s run=%s %q bytes=%d sha=%s detail=%q\n", event.Role, event.Node, event.Action, event.Target, event.RunID, event.Command, event.Bytes, event.SHA256, event.Detail)
 	}
 	return b.String()
+}
+
+func realZFSJobManifest(t *testing.T, node, name, script string) []byte {
+	t.Helper()
+	doc := map[string]any{
+		"apiVersion": "batch/v1",
+		"kind":       "Job",
+		"metadata": map[string]any{
+			"name":      name,
+			"namespace": e2eNamespace,
+		},
+		"spec": map[string]any{
+			"backoffLimit":            0,
+			"ttlSecondsAfterFinished": 300,
+			"template": map[string]any{
+				"spec": map[string]any{
+					"restartPolicy":                "Never",
+					"automountServiceAccountToken": false,
+					"nodeName":                     node,
+					"containers": []map[string]any{
+						{
+							"name":            "zfs",
+							"image":           e2eImageTag(),
+							"imagePullPolicy": "IfNotPresent",
+							"command":         []string{"/bin/sh", "-ec", script},
+							"securityContext": map[string]any{"privileged": true},
+							"volumeMounts": []map[string]any{
+								{"name": "dev-zfs", "mountPath": "/dev/zfs"},
+							},
+						},
+					},
+					"volumes": []map[string]any{
+						{"name": "dev-zfs", "hostPath": map[string]any{"path": "/dev/zfs"}},
+					},
+				},
+			},
+		},
+	}
+	out, err := json.MarshalIndent(doc, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+func realZFSSetupSourceScript(pool, dataset, marker string) string {
+	return realZFSPreamble(pool) + "\n" + strings.Join([]string{
+		"zfs destroy -r " + dataset + " >/dev/null 2>&1 || true",
+		"zfs create -o mountpoint=none " + dataset,
+		"zfs set org.zfsreplicationcontroller:e2e=" + marker + " " + dataset,
+	}, "\n")
+}
+
+func realZFSSetupTargetScript(pool, dataset string) string {
+	return realZFSPreamble(pool) + "\n" + strings.Join([]string{
+		"zfs destroy -r " + dataset + " >/dev/null 2>&1 || true",
+		"zfs create -o mountpoint=none " + dataset,
+	}, "\n")
+}
+
+func realZFSMutateSourceScript(pool, dataset, marker string) string {
+	return realZFSPreamble(pool) + "\n" +
+		"zfs set org.zfsreplicationcontroller:e2e=" + marker + " " + dataset
+}
+
+func realZFSPreamble(pool string) string {
+	return strings.Join([]string{
+		"command -v zfs >/dev/null",
+		"command -v zpool >/dev/null",
+		"zpool list -H " + pool + " >/dev/null",
+	}, "\n")
+}
+
+func jobFailureMessage(job jobObject) string {
+	for _, condition := range job.Status.Conditions {
+		if condition.Type == "Failed" && condition.Status == "True" {
+			if condition.Message != "" {
+				return condition.Message
+			}
+			if condition.Reason != "" {
+				return condition.Reason
+			}
+		}
+	}
+	return "unknown failure"
+}
+
+func skipIfRealZFS(t *testing.T) {
+	t.Helper()
+	if realZFSEnabled() {
+		t.Skip("simulator e2e test is disabled in real ZFS mode")
+	}
+}
+
+func realZFSEnabled() bool {
+	return os.Getenv("E2E_ZFS_MODE") == "real" || os.Getenv("E2E_REAL_ZFS") == "1"
+}
+
+func realZFSPool() string {
+	if pool := os.Getenv("E2E_REAL_ZFS_POOL"); pool != "" {
+		return pool
+	}
+	return "tank"
+}
+
+func e2eImageTag() string {
+	if image := os.Getenv("E2E_IMAGE_TAG"); image != "" {
+		return image
+	}
+	if realZFSEnabled() {
+		return "zfsreplicationcontroller:e2e-real"
+	}
+	return "zfsreplicationcontroller:e2e"
 }
 
 func uniqueSuffix() string {

@@ -34,8 +34,8 @@ choose_builder() {
 
 build_with_host_builder() {
   local cmd="$1"
-  log "building e2e image ${IMAGE_TAG} with ${cmd}"
-  "${cmd}" build -f "${E2E_DIR}/image/Dockerfile.e2e" -t "${IMAGE_TAG}" "${REPO_ROOT}"
+  log "building e2e image ${IMAGE_TAG} with ${cmd} using ${IMAGE_DOCKERFILE}"
+  "${cmd}" build -f "${IMAGE_DOCKERFILE}" -t "${IMAGE_TAG}" "${REPO_ROOT}"
 
   log "saving image tar ${IMAGE_TAR}"
   "${cmd}" save "${IMAGE_TAG}" -o "${IMAGE_TAR}"
@@ -44,6 +44,16 @@ build_with_host_builder() {
 build_with_vm() {
   need_cmd limactl
   instance_exists "${CONTROL_PLANE}" || die "control-plane VM does not exist; run test/e2e/up.sh first"
+
+  local dockerfile_rel
+  case "${IMAGE_DOCKERFILE}" in
+    "${REPO_ROOT}/"*)
+      dockerfile_rel="${IMAGE_DOCKERFILE#"${REPO_ROOT}/"}"
+      ;;
+    *)
+      die "E2E_IMAGE_DOCKERFILE must be inside ${REPO_ROOT} when using the VM builder"
+      ;;
+  esac
 
   local src_tar="${ARTIFACT_DIR}/src.tar"
   log "packing repository for VM build"
@@ -60,8 +70,8 @@ build_with_vm() {
   log "preparing buildah in ${CONTROL_PLANE}"
   run_on_node "${CONTROL_PLANE}" sh -lc "if ! command -v buildah >/dev/null 2>&1; then sudo apt-get update && sudo apt-get install -y --no-install-recommends buildah; fi"
 
-  log "building e2e image ${IMAGE_TAG} inside ${CONTROL_PLANE}"
-  run_on_node "${CONTROL_PLANE}" sh -lc "rm -rf /tmp/zrc-src && mkdir -p /tmp/zrc-src && tar -C /tmp/zrc-src -xf /tmp/zrc-src.tar && cd /tmp/zrc-src && sudo buildah bud --isolation chroot --format docker -f test/e2e/image/Dockerfile.e2e -t '${IMAGE_TAG}' ."
+  log "building e2e image ${IMAGE_TAG} inside ${CONTROL_PLANE} using ${dockerfile_rel}"
+  run_on_node "${CONTROL_PLANE}" sh -lc "rm -rf /tmp/zrc-src && mkdir -p /tmp/zrc-src && tar -C /tmp/zrc-src -xf /tmp/zrc-src.tar && cd /tmp/zrc-src && sudo buildah bud --isolation chroot --format docker -f '${dockerfile_rel}' -t '${IMAGE_TAG}' ."
 
   log "exporting image archive inside ${CONTROL_PLANE}"
   run_on_node "${CONTROL_PLANE}" sudo rm -f /tmp/zrc-image.tar

@@ -1,10 +1,14 @@
 # VM E2E Environment
 
 This directory contains scripts for a full Kubernetes environment with real
-controller, sender, and receiver Jobs. The `zfs` command in the e2e image is a
-simulator binary: it records calls, emits deterministic send streams, reads
-receive streams, stores per-container state under `/tmp/zfs-sim`, and prints
-JSON events into pod logs.
+controller, sender, and receiver Jobs. By default, the `zfs` command in the e2e
+image is a simulator binary: it records calls, emits deterministic send
+streams, reads receive streams, stores per-container state under `/tmp/zfs-sim`,
+and prints JSON events into pod logs.
+
+Set `E2E_ZFS_MODE=real` to build the production Ubuntu image with
+`zfsutils-linux`, disable the simulator, and run an opt-in smoke test against
+real ZFS pools in the Lima workers.
 
 ## Requirements
 
@@ -34,6 +38,18 @@ This creates three VMs:
 It installs k3s, builds the e2e image, imports it into every node, deploys the
 controller, and prints the generated kubeconfig path.
 
+For real ZFS mode:
+
+```sh
+E2E_ZFS_MODE=real ./test/e2e/run.sh
+E2E_ZFS_MODE=real KUBECONFIG=test/e2e/.artifacts/kubeconfig go test ./test/e2e -run TestE2ERealZFS -count=1 -v
+```
+
+Real mode installs `zfsutils-linux` on the worker VMs, loads the ZFS kernel
+module, and creates a file-backed `tank` pool on each worker under
+`/var/lib/zfs-real`. Override the defaults with `E2E_REAL_ZFS_POOL`,
+`E2E_REAL_ZFS_ROOT`, or `E2E_REAL_ZFS_SIZE`.
+
 ## Individual Steps
 
 ```sh
@@ -57,7 +73,7 @@ KUBECONFIG=test/e2e/.artifacts/kubeconfig kubectl create namespace storage
 KUBECONFIG=test/e2e/.artifacts/kubeconfig kubectl apply -f test/e2e/manifests/samples/full-bootstrap.yaml
 ```
 
-Collect simulator events and Kubernetes state with:
+Collect simulator events or real ZFS state plus Kubernetes state with:
 
 ```sh
 ./test/e2e/collect.sh

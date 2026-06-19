@@ -9,12 +9,19 @@ E2E_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 "${E2E_DIR}/deploy.sh"
 "${E2E_DIR}/status.sh"
 
+if [[ "${E2E_ZFS_MODE:-sim}" == "real" ]]; then
+  test_regex="TestE2ERealZFS"
+else
+  test_regex="TestE2E"
+fi
+
 cat >&2 <<EOF
 [e2e] environment is ready.
+[e2e] zfs mode: ${E2E_ZFS_MODE:-sim}
 [e2e] kubeconfig: ${E2E_DIR}/.artifacts/kubeconfig
 [e2e]
 [e2e] next steps for tests:
-[e2e]   KUBECONFIG=${E2E_DIR}/.artifacts/kubeconfig go test ./test/e2e -run TestE2E
+[e2e]   E2E_ZFS_MODE=${E2E_ZFS_MODE:-sim} KUBECONFIG=${E2E_DIR}/.artifacts/kubeconfig go test ./test/e2e -run ${test_regex}
 [e2e]
 [e2e] tear down with:
 [e2e]   ${E2E_DIR}/down.sh
