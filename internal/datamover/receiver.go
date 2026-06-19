@@ -123,6 +123,23 @@ func (r *Receiver) receive(w http.ResponseWriter, req *http.Request) {
 		http.Error(w, "full receive requires destructive bootstrap", http.StatusConflict)
 		return
 	}
+	if mode == "incremental" {
+		baseSnapshot := req.Header.Get("X-ZFSRep-Base-Snapshot")
+		baseGUID := req.Header.Get("X-ZFSRep-Base-GUID")
+		if baseSnapshot == "" || baseGUID == "" {
+			http.Error(w, "missing incremental base snapshot or guid", http.StatusBadRequest)
+			return
+		}
+		targetGUID, stderr, err := snapshotGUIDValue(req.Context(), r.runner, r.cfg.DstDataset+"@"+baseSnapshot)
+		if err != nil {
+			http.Error(w, "target base snapshot validation failed: "+clean(stderr, err), http.StatusConflict)
+			return
+		}
+		if targetGUID != baseGUID {
+			http.Error(w, "target base snapshot guid mismatch", http.StatusConflict)
+			return
+		}
+	}
 	mounted, stderr, err := r.runner.Run(req.Context(), "zfs", "get", "-H", "-o", "value", "mounted", r.cfg.DstDataset)
 	if err != nil {
 		http.Error(w, "target mounted check failed: "+clean(stderr, err), http.StatusInternalServerError)

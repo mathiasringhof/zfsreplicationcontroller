@@ -66,9 +66,17 @@ func snapshotExists(ctx context.Context, r CommandRunner, snap string) bool {
 }
 
 func snapshotGUID(ctx context.Context, r CommandRunner, snap string) string {
-	out, _, err := r.Run(ctx, "zfs", "get", "-H", "-o", "value", "guid", snap)
+	out, _, err := snapshotGUIDValue(ctx, r, snap)
 	if err != nil {
 		return ""
 	}
-	return strings.TrimSpace(out)
+	return out
+}
+
+func snapshotGUIDValue(ctx context.Context, r CommandRunner, snap string) (string, string, error) {
+	out, stderr, err := r.Run(ctx, "zfs", "get", "-H", "-o", "value", "guid", snap)
+	if err != nil {
+		return "", stderr, err
+	}
+	return strings.TrimSpace(out), stderr, nil
 }

@@ -27,7 +27,16 @@ snapshot_exists() {
 
 remember_snapshot() {
   local snap="$1"
-  printf '%s\n' "${snap}" > "$(snapshot_file "${snap}")"
+  local guid="${2:-$(snapshot_id "${snap}")}"
+  {
+    printf 'name=%s\n' "${snap}"
+    printf 'guid=%s\n' "${guid}"
+  } > "$(snapshot_file "${snap}")"
+}
+
+snapshot_guid() {
+  local snap="$1"
+  sed -n 's/^guid=//p' "$(snapshot_file "${snap}")" | head -n 1
 }
 
 event() {
@@ -80,7 +89,7 @@ case "${cmd}" in
         printf 'cannot open %s: dataset does not exist\n' "${snap}" >&2
         exit 1
       fi
-      guid="$(snapshot_id "${snap}")"
+      guid="$(snapshot_guid "${snap}")"
       event get-guid "${snap}" 0 "${guid}"
       printf '%s\n' "${guid}"
       exit 0
@@ -193,7 +202,14 @@ case "${cmd}" in
       printf 'invalid simulated zfs stream\n' >&2
       exit 1
     fi
-    remember_snapshot "${snap}"
+    source_snap="$(sed -n 's/^snapshot=//p' "${payload}" | head -n 1)"
+    if [[ -z "${source_snap}" ]]; then
+      rm -f "${payload}"
+      event receive "${snap}" "${bytes}" "${sha}" "missing snapshot metadata"
+      printf 'simulated zfs stream missing snapshot metadata\n' >&2
+      exit 1
+    fi
+    remember_snapshot "${snap}" "$(snapshot_id "${source_snap}")"
     cp "${payload}" "${PAYLOAD_DIR}/$(snapshot_id "${snap}").stream"
     rm -f "${payload}"
     event receive "${snap}" "${bytes}" "${sha}" "args=${args[*]:-}"

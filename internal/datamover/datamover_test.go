@@ -20,6 +20,7 @@ type call struct {
 type fakeRunner struct {
 	calls         []call
 	snapshots     map[string]bool
+	guids         map[string]string
 	mounted       string
 	failSnapshot  bool
 	destroyStderr string
@@ -50,6 +51,13 @@ func (f *fakeRunner) Run(_ context.Context, name string, args ...string) (string
 		return "", "", nil
 	}
 	if args[0] == "get" && args[4] == "guid" {
+		snap := args[5]
+		if !f.snapshots[snap] {
+			return "", "not found", errFake
+		}
+		if guid := f.guids[snap]; guid != "" {
+			return guid + "\n", "", nil
+		}
 		return "123\n", "", nil
 	}
 	return "", "", nil
@@ -130,6 +138,12 @@ func TestSenderUsesIncrementalWhenBaseExists(t *testing.T) {
 	}
 	if headers.Get("Authorization") != "Bearer secret-token" || headers.Get("X-ZFSRep-Mode") != "incremental" {
 		t.Fatalf("missing required headers: %#v", headers)
+	}
+	if headers.Get("X-ZFSRep-Base-Snapshot") != "zsync-run-0" {
+		t.Fatalf("base snapshot header = %q, want zsync-run-0", headers.Get("X-ZFSRep-Base-Snapshot"))
+	}
+	if headers.Get("X-ZFSRep-Base-GUID") != "123" {
+		t.Fatalf("base GUID header = %q, want 123", headers.Get("X-ZFSRep-Base-GUID"))
 	}
 }
 
@@ -376,13 +390,15 @@ func TestReceiverRejectsInvalidToken(t *testing.T) {
 }
 
 func TestReceiverRunsReceiveAndVerifiesSnapshot(t *testing.T) {
-	runner := &fakeRunner{snapshots: map[string]bool{"tank/dst@snap-1": true}, mounted: "no\n"}
+	runner := &fakeRunner{snapshots: receiverSnapshots(), mounted: "no\n"}
 	receiver := newTestReceiver(t, runner)
 	req := httptest.NewRequest(http.MethodPost, "/receive", strings.NewReader("stream"))
 	req.Header.Set("Authorization", "Bearer secret-token")
 	req.Header.Set("X-ZFSRep-Run-ID", "run-1")
 	req.Header.Set("X-ZFSRep-Snapshot", "snap-1")
 	req.Header.Set("X-ZFSRep-Mode", "incremental")
+	req.Header.Set("X-ZFSRep-Base-Snapshot", "base-0")
+	req.Header.Set("X-ZFSRep-Base-GUID", "123")
 	rr := httptest.NewRecorder()
 	receiver.Handler().ServeHTTP(rr, req)
 	if rr.Code != http.StatusOK {
@@ -400,7 +416,7 @@ func TestReceiverRunsReceiveAndVerifiesSnapshot(t *testing.T) {
 }
 
 func TestReceiverSignalsCompletionAfterSuccessfulReceive(t *testing.T) {
-	runner := &fakeRunner{snapshots: map[string]bool{"tank/dst@snap-1": true}, mounted: "no\n"}
+	runner := &fakeRunner{snapshots: receiverSnapshots(), mounted: "no\n"}
 	receiver := newTestReceiver(t, runner)
 	rr := httptest.NewRecorder()
 	receiver.Handler().ServeHTTP(rr, validReceiveRequest())
@@ -440,7 +456,7 @@ func TestReceiverRequiresRunSnapshotAndModeHeaders(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			receiver := newTestReceiver(t, &fakeRunner{snapshots: map[string]bool{}, mounted: "no\n"})
+			receiver := newTestReceiver(t, &fakeRunner{snapshots: receiverSnapshots(), mounted: "no\n"})
 			req := validReceiveRequest()
 			req.Header.Set(tt.header, tt.value)
 			rr := httptest.NewRecorder()
@@ -453,7 +469,7 @@ func TestReceiverRequiresRunSnapshotAndModeHeaders(t *testing.T) {
 }
 
 func TestReceiverRejectsMountedTarget(t *testing.T) {
-	receiver := newTestReceiver(t, &fakeRunner{snapshots: map[string]bool{}, mounted: "yes\n"})
+	receiver := newTestReceiver(t, &fakeRunner{snapshots: receiverSnapshots(), mounted: "yes\n"})
 	req := validReceiveRequest()
 	rr := httptest.NewRecorder()
 	receiver.Handler().ServeHTTP(rr, req)
@@ -463,7 +479,7 @@ func TestReceiverRejectsMountedTarget(t *testing.T) {
 }
 
 func TestReceiverFullReceiveDestroysTargetBeforeReceive(t *testing.T) {
-	runner := &fakeRunner{snapshots: map[string]bool{"tank/dst@snap-1": true}, mounted: "no\n"}
+	runner := &fakeRunner{snapshots: receiverSnapshots(), mounted: "no\n"}
 	receiver := newTestReceiverWithConfig(t, runner, ReceiverConfig{
 		RunID: "run-1", SnapshotName: "snap-1", DstDataset: "tank/dst", TokenFile: writeToken(t),
 		BootstrapMode: BootstrapDestroyTargetAndReceiveFull, ReceiveUnmounted: true, ReceiveResumable: true,
@@ -487,7 +503,7 @@ func TestReceiverFullReceiveDestroysTargetBeforeReceive(t *testing.T) {
 
 func TestReceiverFullReceiveContinuesWhenDestroyFindsNoDataset(t *testing.T) {
 	runner := &fakeRunner{
-		snapshots:     map[string]bool{"tank/dst@snap-1": true},
+		snapshots:     receiverSnapshots(),
 		mounted:       "no\n",
 		destroyStderr: "cannot open 'tank/dst': dataset does not exist",
 		destroyErr:    errFake,
@@ -509,7 +525,7 @@ func TestReceiverFullReceiveContinuesWhenDestroyFindsNoDataset(t *testing.T) {
 }
 
 func TestReceiverRejectsFullReceiveWhenBootstrapDisabled(t *testing.T) {
-	runner := &fakeRunner{snapshots: map[string]bool{"tank/dst@snap-1": true}, mounted: "no\n"}
+	runner := &fakeRunner{snapshots: receiverSnapshots(), mounted: "no\n"}
 	receiver := newTestReceiver(t, runner)
 	req := validReceiveRequest()
 	req.Header.Set("X-ZFSRep-Mode", "full")
@@ -524,7 +540,7 @@ func TestReceiverRejectsFullReceiveWhenBootstrapDisabled(t *testing.T) {
 }
 
 func TestReceiverAllowsOnlySingleReceiveAttempt(t *testing.T) {
-	runner := &fakeRunner{snapshots: map[string]bool{"tank/dst@snap-1": true}, mounted: "no\n"}
+	runner := &fakeRunner{snapshots: receiverSnapshots(), mounted: "no\n"}
 	receiver := newTestReceiver(t, runner)
 	first := httptest.NewRecorder()
 	receiver.Handler().ServeHTTP(first, validReceiveRequest())
@@ -538,6 +554,43 @@ func TestReceiverAllowsOnlySingleReceiveAttempt(t *testing.T) {
 	}
 	if got := countCalls(runner.calls, "receive -u -s tank/dst"); got != 1 {
 		t.Fatalf("receive calls = %d, want 1: %#v", got, runner.calls)
+	}
+}
+
+func TestReceiverRequiresIncrementalBaseHeaders(t *testing.T) {
+	receiver := newTestReceiver(t, &fakeRunner{snapshots: receiverSnapshots(), mounted: "no\n"})
+	req := validReceiveRequest()
+	req.Header.Del("X-ZFSRep-Base-Snapshot")
+	req.Header.Del("X-ZFSRep-Base-GUID")
+	rr := httptest.NewRecorder()
+	receiver.Handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "missing incremental base") {
+		t.Fatalf("body = %q", rr.Body.String())
+	}
+}
+
+func TestReceiverRejectsIncrementalWhenTargetBaseGUIDDiffers(t *testing.T) {
+	runner := &fakeRunner{
+		snapshots: receiverSnapshots(),
+		guids:     map[string]string{"tank/dst@base-0": "target-guid"},
+		mounted:   "no\n",
+	}
+	receiver := newTestReceiver(t, runner)
+	req := validReceiveRequest()
+	req.Header.Set("X-ZFSRep-Base-GUID", "source-guid")
+	rr := httptest.NewRecorder()
+	receiver.Handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "target base snapshot guid mismatch") {
+		t.Fatalf("body = %q", rr.Body.String())
+	}
+	if hasCall(runner.calls, "receive -u -s tank/dst") {
+		t.Fatalf("receive should not run after base GUID mismatch: %#v", runner.calls)
 	}
 }
 
@@ -564,7 +617,16 @@ func validReceiveRequest() *http.Request {
 	req.Header.Set("X-ZFSRep-Run-ID", "run-1")
 	req.Header.Set("X-ZFSRep-Snapshot", "snap-1")
 	req.Header.Set("X-ZFSRep-Mode", "incremental")
+	req.Header.Set("X-ZFSRep-Base-Snapshot", "base-0")
+	req.Header.Set("X-ZFSRep-Base-GUID", "123")
 	return req
+}
+
+func receiverSnapshots() map[string]bool {
+	return map[string]bool{
+		"tank/dst@base-0": true,
+		"tank/dst@snap-1": true,
+	}
 }
 
 func writeToken(t *testing.T) string {

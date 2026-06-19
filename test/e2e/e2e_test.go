@@ -894,6 +894,7 @@ func assertIncrementalZFSEvents(t *testing.T, sc replicationCase, baseSnapshotNa
 	t.Helper()
 	sourceSnap := sc.sourceSnapshot()
 	baseSourceSnap := sc.SourceDataset + "@" + baseSnapshotName
+	baseTargetSnap := sc.TargetDataset + "@" + baseSnapshotName
 	targetSnap := sc.targetSnapshot()
 
 	sourceList := requireSingleEvent(t, events, "sender", "list-snapshot", sourceSnap)
@@ -904,6 +905,10 @@ func assertIncrementalZFSEvents(t *testing.T, sc replicationCase, baseSnapshotNa
 	baseList := requireSingleEvent(t, events, "sender", "list-snapshot", baseSourceSnap)
 	if baseList.Detail != "exists" {
 		t.Fatalf("base source snapshot lookup detail = %q, want exists: %#v", baseList.Detail, baseList)
+	}
+	baseGUID := requireSingleEvent(t, events, "sender", "get-guid", baseSourceSnap)
+	if baseGUID.SHA256 == "" {
+		t.Fatalf("sender base get-guid did not record a GUID: %#v", baseGUID)
 	}
 	send := requireSingleEvent(t, events, "sender", "send", sourceSnap)
 	wantSend := "zfs send -i " + baseSourceSnap + " " + sourceSnap
@@ -919,6 +924,10 @@ func assertIncrementalZFSEvents(t *testing.T, sc replicationCase, baseSnapshotNa
 		t.Fatalf("sender get-guid did not record a GUID: %#v", guid)
 	}
 
+	targetBaseGUID := requireSingleEvent(t, events, "receiver", "get-guid", baseTargetSnap)
+	if targetBaseGUID.SHA256 != baseGUID.SHA256 {
+		t.Fatalf("target base GUID = %q, want source base GUID %q", targetBaseGUID.SHA256, baseGUID.SHA256)
+	}
 	requireSingleEvent(t, events, "receiver", "get-mounted", sc.TargetDataset)
 	requireNoEvent(t, events, "receiver", "destroy", sc.TargetDataset)
 	receive := requireSingleEvent(t, events, "receiver", "receive", targetSnap)
@@ -937,10 +946,12 @@ func assertIncrementalZFSEvents(t *testing.T, sc replicationCase, baseSnapshotNa
 		{role: "sender", action: "list-snapshot", target: sourceSnap},
 		{role: "sender", action: "snapshot", target: sourceSnap},
 		{role: "sender", action: "list-snapshot", target: baseSourceSnap},
+		{role: "sender", action: "get-guid", target: baseSourceSnap},
 		{role: "sender", action: "send", target: sourceSnap},
 		{role: "sender", action: "get-guid", target: sourceSnap},
 	})
 	assertEventOrder(t, events, []eventMatch{
+		{role: "receiver", action: "get-guid", target: baseTargetSnap},
 		{role: "receiver", action: "get-mounted", target: sc.TargetDataset},
 		{role: "receiver", action: "receive", target: targetSnap},
 		{role: "receiver", action: "list-snapshot", target: targetSnap},

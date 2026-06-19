@@ -67,9 +67,16 @@ func RunSender(ctx context.Context, cfg SenderConfig, r CommandRunner, client *h
 
 	mode := "full"
 	args := []string{"send", srcSnap}
+	baseGUID := ""
 	if cfg.BaseSnapshot != "" && snapshotExists(ctx, r, cfg.SrcDataset+"@"+cfg.BaseSnapshot) {
+		var stderr string
 		mode = "incremental"
-		args = []string{"send", "-i", cfg.SrcDataset + "@" + cfg.BaseSnapshot, srcSnap}
+		baseSnap := cfg.SrcDataset + "@" + cfg.BaseSnapshot
+		baseGUID, stderr, err = snapshotGUIDValue(ctx, r, baseSnap)
+		if err != nil {
+			return "", fmt.Errorf("read base snapshot guid: %s", clean(stderr, err))
+		}
+		args = []string{"send", "-i", baseSnap, srcSnap}
 	} else if cfg.BootstrapMode != BootstrapDestroyTargetAndReceiveFull {
 		return "", fmt.Errorf("no base snapshot and destructive bootstrap disabled")
 	}
@@ -94,6 +101,10 @@ func RunSender(ctx context.Context, cfg SenderConfig, r CommandRunner, client *h
 	req.Header.Set("X-ZFSRep-Run-ID", cfg.RunID)
 	req.Header.Set("X-ZFSRep-Snapshot", cfg.SnapshotName)
 	req.Header.Set("X-ZFSRep-Mode", mode)
+	if mode == "incremental" {
+		req.Header.Set("X-ZFSRep-Base-Snapshot", cfg.BaseSnapshot)
+		req.Header.Set("X-ZFSRep-Base-GUID", baseGUID)
+	}
 	req.Header.Set("Content-Type", "application/octet-stream")
 
 	resp, err := client.Do(req)
