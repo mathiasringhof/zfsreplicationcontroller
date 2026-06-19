@@ -11,6 +11,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/client-go/kubernetes"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
@@ -18,10 +19,11 @@ import (
 )
 
 func main() {
-	var metricsAddr, probeAddr, image string
+	var metricsAddr, probeAddr, image, simulatorStateHostPath string
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "metrics bind address")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "probe bind address")
 	flag.StringVar(&image, "datamover-image", os.Getenv("DATA_MOVER_IMAGE"), "sender/receiver image")
+	flag.StringVar(&simulatorStateHostPath, "simulator-state-hostpath", os.Getenv("ZFS_SIMULATOR_STATE_HOSTPATH"), "optional host path mounted into datamover pods as ZFS_SIM_ROOT")
 	flag.Parse()
 
 	scheme := runtime.NewScheme()
@@ -31,7 +33,8 @@ func main() {
 	utilruntime.Must(coordinationv1.AddToScheme(scheme))
 	utilruntime.Must(zfsv1.AddToScheme(scheme))
 
-	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
+	config := ctrl.GetConfigOrDie()
+	mgr, err := ctrl.NewManager(config, ctrl.Options{
 		Scheme:                 scheme,
 		HealthProbeBindAddress: probeAddr,
 		Metrics:                metricsserver.Options{BindAddress: metricsAddr},
@@ -39,7 +42,18 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	reconciler := &controller.ZFSReplicationReconciler{Client: mgr.GetClient(), Scheme: scheme, DataMoverImage: image}
+	clientset, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		panic(err)
+	}
+	reconciler := &controller.ZFSReplicationReconciler{
+		Client:                 mgr.GetClient(),
+		APIReader:              mgr.GetAPIReader(),
+		Scheme:                 scheme,
+		DataMoverImage:         image,
+		PodLogs:                controller.KubernetesPodLogReader{Client: clientset},
+		SimulatorStateHostPath: simulatorStateHostPath,
+	}
 	if err := reconciler.SetupWithManager(mgr); err != nil {
 		panic(err)
 	}

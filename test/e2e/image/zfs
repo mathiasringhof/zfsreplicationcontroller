@@ -92,6 +92,11 @@ case "${cmd}" in
       printf 'missing snapshot name\n' >&2
       exit 1
     fi
+    if [[ "${ZFS_SIM_FAIL_SNAPSHOT:-}" == "1" ]]; then
+      event snapshot "${snap}" 0 "" "forced failure"
+      printf 'forced snapshot failure\n' >&2
+      exit 1
+    fi
     remember_snapshot "${snap}"
     event snapshot "${snap}"
     exit 0
@@ -125,6 +130,11 @@ case "${cmd}" in
     if ! snapshot_exists "${snap}"; then
       event send "${snap}" 0 "" "missing snapshot"
       printf 'cannot open %s: dataset does not exist\n' "${snap}" >&2
+      exit 1
+    fi
+    if [[ "${ZFS_SIM_FAIL_SEND:-}" == "1" ]]; then
+      event send "${snap}" 0 "" "forced failure"
+      printf 'forced send failure\n' >&2
       exit 1
     fi
     payload="$(mktemp "${ROOT}/send.XXXXXX")"
@@ -167,11 +177,22 @@ case "${cmd}" in
       printf 'missing receive dataset\n' >&2
       exit 1
     fi
+    if [[ "${ZFS_SIM_FAIL_RECEIVE:-}" == "1" ]]; then
+      event receive "${dataset}@${SNAPSHOT_NAME:-received}" 0 "" "forced failure"
+      printf 'forced receive failure\n' >&2
+      exit 1
+    fi
     payload="$(mktemp "${ROOT}/receive.XXXXXX")"
     cat > "${payload}"
     bytes="$(bytes_file "${payload}")"
     sha="$(sha_file "${payload}")"
     snap="${dataset}@${SNAPSHOT_NAME:-received}"
+    if ! head -n 1 "${payload}" | grep -qx 'ZFS_SIM_V1'; then
+      rm -f "${payload}"
+      event receive "${snap}" "${bytes}" "${sha}" "invalid stream"
+      printf 'invalid simulated zfs stream\n' >&2
+      exit 1
+    fi
     remember_snapshot "${snap}"
     cp "${payload}" "${PAYLOAD_DIR}/$(snapshot_id "${snap}").stream"
     rm -f "${payload}"
@@ -181,6 +202,11 @@ case "${cmd}" in
   destroy)
     if [[ "${2:-}" == "-r" ]]; then
       dataset="${3:-}"
+      if [[ "${ZFS_SIM_FAIL_DESTROY:-}" == "1" ]]; then
+        event destroy "${dataset}" 0 "" "forced failure"
+        printf 'forced destroy failure\n' >&2
+        exit 1
+      fi
       event destroy "${dataset}"
       exit 0
     fi

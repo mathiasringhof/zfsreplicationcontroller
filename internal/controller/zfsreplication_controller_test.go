@@ -164,6 +164,43 @@ func TestReconcileSucceededUpdatesStatus(t *testing.T) {
 	assertMissing[*corev1.Secret](t, r.Client, "zfsrep-rep-manual-1-token")
 }
 
+func TestReconcileSucceededStoresSnapshotGUIDFromSenderLogs(t *testing.T) {
+	rep := replication("manual-1")
+	r := newReconciler(t, rep, receiverReadyPod(rep), senderPod(rep), succeededJob("zfsrep-rep-manual-1-receiver"), succeededJob("zfsrep-rep-manual-1-sender"))
+	r.PodLogs = fakePodLogs{logs: map[string]string{"sender-pod": "noise\nsnapshot_guid=guid-123\n"}}
+	if _, err := r.Reconcile(context.Background(), request("rep")); err != nil {
+		t.Fatal(err)
+	}
+	var got zfsv1.ZFSReplication
+	if err := r.Get(context.Background(), types.NamespacedName{Name: "rep", Namespace: "storage"}, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Status.LastSuccessfulSnapshotGUID != "guid-123" {
+		t.Fatalf("LastSuccessfulSnapshotGUID = %q, want guid-123", got.Status.LastSuccessfulSnapshotGUID)
+	}
+}
+
+func TestDataMoverJobsIncludeSimulatorStateWhenConfigured(t *testing.T) {
+	rep := replication("manual-1")
+	rep.Annotations = map[string]string{
+		labelPrefix + "/sim-env-ZFS_SIM_FAIL_SEND": "1",
+	}
+	r := newReconciler(t, rep)
+	r.SimulatorStateHostPath = "/var/lib/zfs-sim"
+	if _, err := r.Reconcile(context.Background(), request("rep")); err != nil {
+		t.Fatal(err)
+	}
+	receiver := getJob(t, r.Client, "zfsrep-rep-manual-1-receiver")
+	if got := envValue(receiver, "ZFS_SIM_ROOT"); got != "/var/lib/zfs-sim" {
+		t.Fatalf("ZFS_SIM_ROOT = %q", got)
+	}
+	if got := envValue(receiver, "ZFS_SIM_FAIL_SEND"); got != "1" {
+		t.Fatalf("ZFS_SIM_FAIL_SEND = %q", got)
+	}
+	assertHasVolume(t, receiver, "zfs-sim", "/var/lib/zfs-sim")
+	assertHasVolumeMount(t, receiver, "zfs-sim", "/var/lib/zfs-sim")
+}
+
 func TestReconcileSenderFailedDoesNotUpdateSuccess(t *testing.T) {
 	rep := replication("manual-1")
 	r := newReconciler(t, rep, receiverReadyPod(rep), succeededJob("zfsrep-rep-manual-1-receiver"), failedJob("zfsrep-rep-manual-1-sender"))
@@ -176,6 +213,25 @@ func TestReconcileSenderFailedDoesNotUpdateSuccess(t *testing.T) {
 	}
 	if got.Status.Phase != zfsv1.PhaseFailed || got.Status.LastSuccessfulRunID != "" {
 		t.Fatalf("status = %#v", got.Status)
+	}
+}
+
+func TestReconcileSenderFailedUsesPodLogMessage(t *testing.T) {
+	rep := replication("manual-1")
+	pod := senderPod(rep)
+	pod.Labels["job-name"] = "zfsrep-rep-manual-1-sender"
+	pod.Labels["batch.kubernetes.io/job-name"] = "zfsrep-rep-manual-1-sender"
+	r := newReconciler(t, rep, receiverReadyPod(rep), pod, succeededJob("zfsrep-rep-manual-1-receiver"), failedJob("zfsrep-rep-manual-1-sender"))
+	r.PodLogs = fakePodLogs{logs: map[string]string{"sender-pod": "zfs-sim-event {}\nzfs send failed: forced send failure\n"}}
+	if _, err := r.Reconcile(context.Background(), request("rep")); err != nil {
+		t.Fatal(err)
+	}
+	var got zfsv1.ZFSReplication
+	if err := r.Get(context.Background(), types.NamespacedName{Name: "rep", Namespace: "storage"}, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Status.LastError != "zfs send failed: forced send failure" {
+		t.Fatalf("LastError = %q", got.Status.LastError)
 	}
 }
 
@@ -274,6 +330,16 @@ func receiverReadyPod(rep *zfsv1.ZFSReplication) *corev1.Pod {
 	return receiverPod(rep, corev1.PodRunning, "10.244.3.27", true)
 }
 
+func senderPod(rep *zfsv1.ZFSReplication) *corev1.Pod {
+	names := objectNames(rep)
+	labels := cloneLabels(names.Labels)
+	labels[labelPrefix+"/role"] = "sender"
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "sender-pod", Namespace: "storage", Labels: labels},
+		Status:     corev1.PodStatus{Phase: corev1.PodSucceeded},
+	}
+}
+
 func receiverPod(rep *zfsv1.ZFSReplication, phase corev1.PodPhase, podIP string, ready bool) *corev1.Pod {
 	names := objectNames(rep)
 	labels := cloneLabels(names.Labels)
@@ -354,6 +420,26 @@ func assertJobPlacement(t *testing.T, job *batchv1.Job, nodeName string) {
 	}
 }
 
+func assertHasVolume(t *testing.T, job *batchv1.Job, name, path string) {
+	t.Helper()
+	for _, volume := range job.Spec.Template.Spec.Volumes {
+		if volume.Name == name && volume.HostPath != nil && volume.HostPath.Path == path {
+			return
+		}
+	}
+	t.Fatalf("%s volume %s with hostPath %s missing: %#v", job.Name, name, path, job.Spec.Template.Spec.Volumes)
+}
+
+func assertHasVolumeMount(t *testing.T, job *batchv1.Job, name, path string) {
+	t.Helper()
+	for _, mount := range job.Spec.Template.Spec.Containers[0].VolumeMounts {
+		if mount.Name == name && mount.MountPath == path {
+			return
+		}
+	}
+	t.Fatalf("%s volumeMount %s at %s missing: %#v", job.Name, name, path, job.Spec.Template.Spec.Containers[0].VolumeMounts)
+}
+
 func assertExists[T client.Object](t *testing.T, c client.Client, name string) {
 	t.Helper()
 	obj := newObject[T]()
@@ -400,4 +486,12 @@ func newObject[T client.Object]() T {
 	default:
 		panic("unsupported type")
 	}
+}
+
+type fakePodLogs struct {
+	logs map[string]string
+}
+
+func (f fakePodLogs) Logs(_ context.Context, _, podName string) (string, error) {
+	return f.logs[podName], nil
 }

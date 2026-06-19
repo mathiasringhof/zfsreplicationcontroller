@@ -8,7 +8,7 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-func TestControllerClusterRoleCanWatchLeases(t *testing.T) {
+func TestControllerClusterRoleHasRequiredPermissions(t *testing.T) {
 	t.Helper()
 
 	rolePath := filepath.Join("..", "..", "config", "rbac", "role.yaml")
@@ -33,6 +33,11 @@ func TestControllerClusterRoleCanWatchLeases(t *testing.T) {
 		if !contains(verbs, verb) {
 			t.Fatalf("leases RBAC verbs = %v, missing %q", verbs, verb)
 		}
+	}
+
+	verbs = verbsForResource(role.Rules, "", "pods/log")
+	if !contains(verbs, "get") {
+		t.Fatalf("pods/log RBAC verbs = %v, missing get", verbs)
 	}
 }
 

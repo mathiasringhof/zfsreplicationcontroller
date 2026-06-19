@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	zfsv1 "github.com/mathias/zfsreplicationcontroller/api/v1alpha1"
@@ -21,8 +22,11 @@ import (
 
 type ZFSReplicationReconciler struct {
 	client.Client
-	Scheme         *runtime.Scheme
-	DataMoverImage string
+	APIReader              client.Reader
+	Scheme                 *runtime.Scheme
+	DataMoverImage         string
+	PodLogs                PodLogReader
+	SimulatorStateHostPath string
 }
 
 func (r *ZFSReplicationReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -126,13 +130,18 @@ func (r *ZFSReplicationReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		return ctrl.Result{}, err
 	}
 	if senderDone && receiverDone {
+		guid, err := r.senderSnapshotGUID(ctx, &rep, names)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
 		now := metav1.Now()
-		err := r.patchStatus(ctx, &rep, func(st *zfsv1.ZFSReplicationStatus) {
+		err = r.patchStatus(ctx, &rep, func(st *zfsv1.ZFSReplicationStatus) {
 			st.Phase = zfsv1.PhaseSucceeded
 			st.ObservedRunID = rep.Spec.RunID
 			st.LastAttemptedRunID = rep.Spec.RunID
 			st.LastSuccessfulRunID = rep.Spec.RunID
 			st.LastSuccessfulSnapshot = names.SnapshotName
+			st.LastSuccessfulSnapshotGUID = guid
 			st.ReceiverPodName = receiverPodName
 			st.ReceiverPodIP = receiverPodIP
 			st.CompletedAt = &now
@@ -191,11 +200,11 @@ func (r *ZFSReplicationReconciler) ensureSecret(ctx context.Context, rep *zfsv1.
 }
 
 func (r *ZFSReplicationReconciler) ensureReceiverJob(ctx context.Context, rep *zfsv1.ZFSReplication, names runObjects) error {
-	return r.ensureJob(ctx, rep, receiverJob(rep, names, r.image()))
+	return r.ensureJob(ctx, rep, receiverJob(rep, names, r.image(), r.SimulatorStateHostPath))
 }
 
 func (r *ZFSReplicationReconciler) ensureSenderJob(ctx context.Context, rep *zfsv1.ZFSReplication, names runObjects, receiverPodIP string) error {
-	return r.ensureJob(ctx, rep, senderJob(rep, names, r.image(), receiverPodIP))
+	return r.ensureJob(ctx, rep, senderJob(rep, names, r.image(), receiverPodIP, r.SimulatorStateHostPath))
 }
 
 func (r *ZFSReplicationReconciler) ensureJob(ctx context.Context, rep *zfsv1.ZFSReplication, job *batchv1.Job) error {
@@ -296,12 +305,84 @@ func (r *ZFSReplicationReconciler) jobFailed(ctx context.Context, ns, name, fall
 	if job.Status.Failed == 0 {
 		return false, "", nil
 	}
+	if msg := r.failedJobLogMessage(ctx, ns, name); msg != "" {
+		return true, msg, nil
+	}
 	for _, cond := range job.Status.Conditions {
 		if cond.Type == batchv1.JobFailed && cond.Status == corev1.ConditionTrue && cond.Message != "" {
 			return true, cond.Message, nil
 		}
 	}
 	return true, fallback, nil
+}
+
+func (r *ZFSReplicationReconciler) failedJobLogMessage(ctx context.Context, ns, jobName string) string {
+	if r.PodLogs == nil {
+		return ""
+	}
+	var last string
+	seen := map[string]bool{}
+	for _, label := range []string{"job-name", "batch.kubernetes.io/job-name"} {
+		var pods corev1.PodList
+		if err := r.podReader().List(ctx, &pods, client.InNamespace(ns), client.MatchingLabels{label: jobName}); err != nil {
+			continue
+		}
+		for _, pod := range pods.Items {
+			if seen[pod.Name] {
+				continue
+			}
+			seen[pod.Name] = true
+			logs, err := r.PodLogs.Logs(ctx, ns, pod.Name)
+			if err != nil {
+				continue
+			}
+			if msg := failureMessageFromLogs(logs); msg != "" {
+				last = msg
+			}
+		}
+	}
+	return last
+}
+
+func failureMessageFromLogs(logs string) string {
+	var last string
+	for _, line := range strings.Split(logs, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.Contains(line, "zfs-sim-event ") {
+			continue
+		}
+		last = line
+	}
+	return last
+}
+
+func (r *ZFSReplicationReconciler) senderSnapshotGUID(ctx context.Context, rep *zfsv1.ZFSReplication, names runObjects) (string, error) {
+	if r.PodLogs == nil {
+		return "", nil
+	}
+	var pods corev1.PodList
+	labels := cloneLabels(names.Labels)
+	labels[labelPrefix+"/role"] = "sender"
+	if err := r.podReader().List(ctx, &pods, client.InNamespace(rep.Namespace), client.MatchingLabels(labels)); err != nil {
+		return "", err
+	}
+	for _, pod := range pods.Items {
+		logs, err := r.PodLogs.Logs(ctx, rep.Namespace, pod.Name)
+		if err != nil {
+			return "", err
+		}
+		if guid := snapshotGUIDFromLogs(logs); guid != "" {
+			return guid, nil
+		}
+	}
+	return "", nil
+}
+
+func (r *ZFSReplicationReconciler) podReader() client.Reader {
+	if r.APIReader != nil {
+		return r.APIReader
+	}
+	return r.Client
 }
 
 func (r *ZFSReplicationReconciler) fail(ctx context.Context, rep *zfsv1.ZFSReplication, msg string) error {
