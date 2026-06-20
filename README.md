@@ -1,24 +1,34 @@
 # ZFS Replication Controller
 
-MVP1 is a Kubernetes-native ZFS replication controller for one explicit source dataset on one node to one explicit target dataset on another node.
+ZFS Replication Controller is a Kubernetes-native Syncoid orchestrator.
 
-Replication is delegated to pinned upstream `syncoid` 2.3.0 from a privileged per-run sender Job. The target side is a short-lived privileged SSH receiver Job, so `syncoid` can use its normal remote ZFS workflow without relying on node SSH accounts.
+It creates the temporary connection between two Kubernetes nodes, then runs
+`syncoid` in a privileged per-run sender Job. Snapshot policy stays outside the
+controller: Syncoid can create its own sync snapshots, or external tools such as
+SnapScheduler or Sanoid can create snapshots and the run can pass
+`--no-sync-snap` with include/exclude filters.
 
 ## What It Does
 
-- Watches `ZFSReplication` objects.
+- Watches `ZFSReplicationRun` objects for one-shot Syncoid invocations.
+- Watches `ZFSReplicationSchedule` objects and creates `ZFSReplicationRun`
+  objects on cron ticks.
 - Creates a per-run SSH `Secret`.
-- Starts a privileged receiver `Job` on the target node that accepts only the per-run key.
-- Starts a privileged sender `Job` on the source node after the receiver pod is ready.
-- Creates the run snapshot if it does not already exist.
-- Runs `syncoid --no-sync-snap` against `root@<receiver-pod-ip>:targetDataset` with include filters for the run snapshot and, on incremental runs, the previous successful snapshot.
-- Updates basic status after the sender Job succeeds.
+- Starts a privileged receiver `Job` on the target node that accepts only the
+  per-run key.
+- Starts a privileged sender `Job` on the source node after the receiver pod is
+  ready.
+- Passes structured Syncoid options from YAML to the sender.
+- Updates basic status after the sender Job succeeds or fails.
 
-MVP1 does not create a Kubernetes `Service` or use long-lived node SSH credentials. The per-run SSH Secret and receiver Job are removed after the run finishes.
+The controller does not create a Kubernetes `Service` or use long-lived node SSH
+credentials. The per-run SSH Secret and receiver Job are removed after the run
+finishes.
 
 ## Install
 
-Build and push an image that includes `zfsutils-linux`, pinned upstream `syncoid` 2.3.0, and the controller binaries:
+Build and push an image that includes `zfsutils-linux`, pinned upstream
+`syncoid` 2.3.0, and the controller binaries:
 
 ```sh
 docker build -t registry.example.com/zfsreplicationcontroller:latest .
@@ -31,68 +41,98 @@ Set that image in `config/manager/deployment.yaml`, then install:
 kubectl apply -k config
 ```
 
-## Example
+## One-Shot Run
 
 ```yaml
 apiVersion: zfsreplication.example.com/v1alpha1
-kind: ZFSReplication
+kind: ZFSReplicationRun
 metadata:
-  name: pg-a-to-b
+  name: pg-a-to-b-manual-001
   namespace: storage
 spec:
-  runID: manual-0001
   source:
     nodeName: worker-a
     dataset: tank/pvc-source
   target:
     nodeName: worker-b
     dataset: tank/pvc-target
-  snapshotPrefix: zsync
-  bootstrap:
-    mode: FailIfNoBase
-  receive:
+  syncoid:
+    noSyncSnap: true
+    noRollback: true
+    compress: none
     receiveUnmounted: true
-    resumable: true
+    receiveResumable: true
+    includeSnaps:
+      - "^snap-.*"
 ```
 
-Trigger a new run by changing `spec.runID`:
+With `noSyncSnap: true`, the controller does not create snapshots. Syncoid lists
+source and target snapshots, applies include/exclude filters, finds the newest
+common GUID-compatible base, and replicates forward.
 
-```sh
-kubectl patch zfsreplication pg-a-to-b -n storage --type merge -p '{"spec":{"runID":"manual-0002"}}'
-```
+Omit `noSyncSnap` or set it to `false` when Syncoid should create its own sync
+snapshot.
 
-`runID` and `snapshotPrefix` are used to derive Kubernetes object names and ZFS snapshot names. Use lowercase letters, numbers, and dashes; `runID` may be up to 40 characters, and `snapshotPrefix` may be up to 32 characters.
-
-Inspect status:
-
-```sh
-kubectl get zfsreplication pg-a-to-b -n storage -o yaml
-kubectl get jobs -n storage -l zfsreplication.example.com/name=pg-a-to-b
-```
-
-While a run is active, status includes the sender and receiver objects:
+## Scheduled Runs
 
 ```yaml
-status:
-  phase: Running
-  receiverJobName: zfsrep-pg-a-to-b-manual-0002-receiver
-  receiverPodName: zfsrep-pg-a-to-b-manual-0002-receiver-k9r5w
-  receiverPodIP: 10.42.3.12
-  senderJobName: zfsrep-pg-a-to-b-manual-0002-sender
-  sshSecretName: zfsrep-pg-a-to-b-manual-0002-ssh
+apiVersion: zfsreplication.example.com/v1alpha1
+kind: ZFSReplicationSchedule
+metadata:
+  name: pg-a-to-b-hourly
+  namespace: storage
+spec:
+  schedule: "10 * * * *"
+  concurrencyPolicy: Forbid
+  runTemplate:
+    source:
+      nodeName: worker-a
+      dataset: tank/pvc-source
+    target:
+      nodeName: worker-b
+      dataset: tank/pvc-target
+    syncoid:
+      noSyncSnap: true
+      includeSnaps:
+        - "^snap-.*"
 ```
+
+Schedules use numeric five-field cron expressions. The built-in parser supports
+`*`, `*/n`, lists, ranges, and stepped ranges. `concurrencyPolicy: Forbid` is the
+default and skips a tick while a previous scheduled run is still active.
+
+## Syncoid Options
+
+The controller owns connection-sensitive options: source dataset, target
+dataset, SSH key, SSH port, and receiver address. The `syncoid` block exposes
+the replication behavior:
+
+- `noSyncSnap`: pass `--no-sync-snap`.
+- `noRollback`: pass `--no-rollback` when true. Defaults to true.
+- `forceDelete`: pass `--force-delete`.
+- `compress`: pass `--compress=<value>`.
+- `receiveUnmounted`: pass `--recvoptions=u` when true. Defaults to true.
+- `receiveResumable`: pass `--no-resume` when false. Defaults to true.
+- `includeSnaps`: one `--include-snaps=<regex>` per item.
+- `excludeSnaps`: one `--exclude-snaps=<regex>` per item.
 
 ## Operational Warnings
 
 The target dataset must be passive and suitable for `syncoid` to receive into.
 
-`DestroyTargetAndReceiveFull` is destructive. When the sender must perform a full replication and this mode is enabled, it passes `--force-delete` to `syncoid`.
+`forceDelete` is destructive. When enabled, the sender passes `--force-delete`
+to Syncoid.
 
-The controller does not discover PVCs, CSI snapshots, ZFS snapshots, or retention state. Dataset names and node names are explicit user input.
+When external snapshot tooling owns snapshots and retention, make sure retention
+does not prune the common source/target base before a scheduled replication run
+can complete.
 
-Sender and receiver Jobs are pinned with `spec.template.spec.nodeName`, not only a node selector. Each container verifies at startup that the actual node from the downward API matches the expected node and exits before running ZFS or SSH commands if it does not.
+Sender and receiver Jobs are pinned with `spec.template.spec.nodeName`, not only
+a node selector. Each container verifies at startup that the actual node from
+the downward API matches the expected node and exits before running ZFS or SSH
+commands if it does not.
 
-Jobs use `backoffLimit: 0` and `restartPolicy: Never`. Retry by changing `spec.runID`.
+Jobs use `backoffLimit: 0` and `restartPolicy: Never`.
 
 ## Development
 

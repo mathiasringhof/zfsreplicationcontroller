@@ -28,10 +28,24 @@ func TestControllerClusterRoleHasRequiredPermissions(t *testing.T) {
 		t.Fatalf("parse %s: %v", rolePath, err)
 	}
 
-	verbs := verbsForResource(role.Rules, "coordination.k8s.io", "leases")
-	for _, verb := range []string{"create", "get", "list", "watch", "update", "patch"} {
+	verbs := verbsForResource(role.Rules, "zfsreplication.example.com", "zfsreplicationruns")
+	for _, verb := range []string{"create", "get", "list", "watch"} {
 		if !contains(verbs, verb) {
-			t.Fatalf("leases RBAC verbs = %v, missing %q", verbs, verb)
+			t.Fatalf("zfsreplicationruns RBAC verbs = %v, missing %q", verbs, verb)
+		}
+	}
+
+	verbs = verbsForResource(role.Rules, "zfsreplication.example.com", "zfsreplicationruns/status")
+	for _, verb := range []string{"get", "update", "patch"} {
+		if !contains(verbs, verb) {
+			t.Fatalf("zfsreplicationruns/status RBAC verbs = %v, missing %q", verbs, verb)
+		}
+	}
+
+	verbs = verbsForResource(role.Rules, "zfsreplication.example.com", "zfsreplicationschedules/status")
+	for _, verb := range []string{"get", "update", "patch"} {
+		if !contains(verbs, verb) {
+			t.Fatalf("zfsreplicationschedules/status RBAC verbs = %v, missing %q", verbs, verb)
 		}
 	}
 
@@ -48,19 +62,20 @@ func TestControllerClusterRoleHasRequiredPermissions(t *testing.T) {
 	}
 }
 
-func TestCRDSchemaConstrainsRunIdentityFields(t *testing.T) {
+func TestCRDSchemaExposesSyncoidOptions(t *testing.T) {
 	t.Helper()
 
-	crdPath := filepath.Join("..", "..", "config", "crd", "zfsreplication.example.com_zfsreplications.yaml")
+	crdPath := filepath.Join("..", "..", "config", "crd", "zfsreplication.example.com_zfsreplicationruns.yaml")
 	data, err := os.ReadFile(crdPath)
 	if err != nil {
 		t.Fatalf("read %s: %v", crdPath, err)
 	}
 
 	type schemaNode struct {
-		MaxLength  int                   `yaml:"maxLength"`
-		Pattern    string                `yaml:"pattern"`
+		Default    any                   `yaml:"default"`
 		Properties map[string]schemaNode `yaml:"properties"`
+		Items      *schemaNode           `yaml:"items"`
+		Type       string                `yaml:"type"`
 	}
 	var crd struct {
 		Spec struct {
@@ -78,14 +93,16 @@ func TestCRDSchemaConstrainsRunIdentityFields(t *testing.T) {
 		t.Fatalf("%s has no versions", crdPath)
 	}
 	specProps := crd.Spec.Versions[0].Schema.OpenAPIV3Schema.Properties["spec"].Properties
+	syncoidProps := specProps["syncoid"].Properties
 
-	runID := specProps["runID"]
-	if runID.MaxLength != 40 || runID.Pattern == "" {
-		t.Fatalf("runID schema = %#v", runID)
+	if syncoidProps["noSyncSnap"].Type != "boolean" {
+		t.Fatalf("noSyncSnap schema = %#v", syncoidProps["noSyncSnap"])
 	}
-	snapshotPrefix := specProps["snapshotPrefix"]
-	if snapshotPrefix.MaxLength != 32 || snapshotPrefix.Pattern == "" {
-		t.Fatalf("snapshotPrefix schema = %#v", snapshotPrefix)
+	if syncoidProps["includeSnaps"].Type != "array" || syncoidProps["includeSnaps"].Items == nil || syncoidProps["includeSnaps"].Items.Type != "string" {
+		t.Fatalf("includeSnaps schema = %#v", syncoidProps["includeSnaps"])
+	}
+	if syncoidProps["excludeSnaps"].Type != "array" || syncoidProps["excludeSnaps"].Items == nil || syncoidProps["excludeSnaps"].Items.Type != "string" {
+		t.Fatalf("excludeSnaps schema = %#v", syncoidProps["excludeSnaps"])
 	}
 }
 

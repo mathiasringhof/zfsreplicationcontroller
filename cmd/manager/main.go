@@ -45,14 +45,21 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	reconciler := &controller.ZFSReplicationReconciler{
+	runReconciler := &controller.ZFSReplicationRunReconciler{
 		Client:         mgr.GetClient(),
 		APIReader:      mgr.GetAPIReader(),
 		Scheme:         scheme,
 		DataMoverImage: image,
 		PodLogs:        controller.KubernetesPodLogReader{Client: clientset},
 	}
-	if err := reconciler.SetupWithManager(mgr); err != nil {
+	if err := runReconciler.SetupWithManager(mgr); err != nil {
+		panic(err)
+	}
+	scheduleReconciler := &controller.ZFSReplicationScheduleReconciler{
+		Client: mgr.GetClient(),
+		Scheme: scheme,
+	}
+	if err := scheduleReconciler.SetupWithManager(mgr); err != nil {
 		panic(err)
 	}
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {

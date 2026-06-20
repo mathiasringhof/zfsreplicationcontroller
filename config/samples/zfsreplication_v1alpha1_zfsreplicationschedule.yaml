@@ -1,0 +1,23 @@
+apiVersion: zfsreplication.example.com/v1alpha1
+kind: ZFSReplicationSchedule
+metadata:
+  name: pg-a-to-b-hourly
+  namespace: storage
+spec:
+  schedule: "10 * * * *"
+  concurrencyPolicy: Forbid
+  runTemplate:
+    source:
+      nodeName: worker-a
+      dataset: tank/pvc-source
+    target:
+      nodeName: worker-b
+      dataset: tank/pvc-target
+    syncoid:
+      noSyncSnap: true
+      noRollback: true
+      compress: none
+      receiveUnmounted: true
+      receiveResumable: true
+      includeSnaps:
+        - "^snap-.*"

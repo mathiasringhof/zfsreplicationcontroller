@@ -21,10 +21,7 @@ const (
 	e2eSourceNode = "worker-a"
 	e2eTargetNode = "worker-b"
 
-	e2eLabelPrefix           = "zfsreplication.example.com"
-	e2eLeaseStateAnnotation  = e2eLabelPrefix + "/state"
-	e2eBootstrapFailIfNoBase = "FailIfNoBase"
-	e2eBootstrapDestroyFull  = "DestroyTargetAndReceiveFull"
+	e2eLabelPrefix = "zfsreplication.example.com"
 )
 
 func TestE2EFullAndIncrementalReplication(t *testing.T) {
@@ -33,17 +30,15 @@ func TestE2EFullAndIncrementalReplication(t *testing.T) {
 	pool := realZFSPool()
 	name := "e2e-repl-" + suffix
 	first := replicationCase{
-		Name:           name,
-		RunID:          "r-" + suffix + "-1",
-		SourceNode:     e2eSourceNode,
-		TargetNode:     e2eTargetNode,
-		SourceDataset:  pool + "/src-" + suffix,
-		TargetDataset:  pool + "/dst-" + suffix,
-		SnapshotPrefix: "zsync",
-		BootstrapMode:  e2eBootstrapDestroyFull,
+		Name:          name + "-1",
+		SourceNode:    e2eSourceNode,
+		TargetNode:    e2eTargetNode,
+		SourceDataset: pool + "/src-" + suffix,
+		TargetDataset: pool + "/dst-" + suffix,
+		ForceDelete:   true,
 	}
-	k.cleanupReplicationOnExit(name)
-	k.cleanupReplication(name)
+	k.cleanupReplicationOnExit(first.Name)
+	k.cleanupReplication(first.Name)
 	k.cleanupRealZFSDatasetOnExit(first.SourceNode, "zfs-cln-src-"+suffix, first.SourceDataset)
 	k.cleanupRealZFSDatasetOnExit(first.TargetNode, "zfs-cln-dst-"+suffix, first.TargetDataset)
 
@@ -51,46 +46,36 @@ func TestE2EFullAndIncrementalReplication(t *testing.T) {
 	k.runRealZFS(first.TargetNode, "zfs-dst-"+suffix, realZFSSetupTargetScript(pool, first.TargetDataset))
 
 	k.applyReplication(first)
-	firstStatus := k.waitForSuccess(first, 4*time.Minute)
-	assertSucceededStatus(t, first, firstStatus, firstStatus.LastSuccessfulSnapshotGUID)
-	if firstStatus.LastSuccessfulSnapshotGUID == "" {
-		t.Fatalf("lastSuccessfulSnapshotGUID is empty after full replication: %#v", firstStatus)
-	}
-	k.assertRealZFSSnapshotGUID(first.SourceNode, "zfs-src-g1-"+suffix, first.sourceSnapshot(), firstStatus.LastSuccessfulSnapshotGUID)
-	k.assertRealZFSSnapshotGUID(first.TargetNode, "zfs-dst-g1-"+suffix, first.targetSnapshot(), firstStatus.LastSuccessfulSnapshotGUID)
+	assertSucceededStatus(t, first, k.waitForSuccess(first, 4*time.Minute))
+	k.assertRealZFSProperty(first.TargetNode, "zfs-dst-p1-"+suffix, first.TargetDataset, "first-"+suffix)
 	k.assertNoSecrets(first.Name)
-	k.assertLeaseState(first.Name, "succeeded")
 
 	second := first
-	second.RunID = "r-" + suffix + "-2"
-	second.BootstrapMode = e2eBootstrapFailIfNoBase
+	second.Name = name + "-2"
+	second.ForceDelete = false
+	k.cleanupReplicationOnExit(second.Name)
+	k.cleanupReplication(second.Name)
 	k.runRealZFS(second.SourceNode, "zfs-mut-"+suffix, realZFSMutateSourceScript(pool, second.SourceDataset, "second-"+suffix))
 
 	k.applyReplication(second)
-	secondStatus := k.waitForSuccess(second, 4*time.Minute)
-	assertSucceededStatus(t, second, secondStatus, secondStatus.LastSuccessfulSnapshotGUID)
-	if secondStatus.LastSuccessfulSnapshotGUID == "" {
-		t.Fatalf("lastSuccessfulSnapshotGUID is empty after incremental replication: %#v", secondStatus)
-	}
-	k.assertRealZFSSnapshotGUID(second.SourceNode, "zfs-src-g2-"+suffix, second.sourceSnapshot(), secondStatus.LastSuccessfulSnapshotGUID)
-	k.assertRealZFSSnapshotGUID(second.TargetNode, "zfs-dst-g2-"+suffix, second.targetSnapshot(), secondStatus.LastSuccessfulSnapshotGUID)
+	assertSucceededStatus(t, second, k.waitForSuccess(second, 4*time.Minute))
+	k.assertRealZFSProperty(second.TargetNode, "zfs-dst-p2-"+suffix, second.TargetDataset, "second-"+suffix)
 	k.assertNoSecrets(second.Name)
-	k.assertLeaseState(second.Name, "succeeded")
 }
 
-func TestE2EFailIfNoBase(t *testing.T) {
+func TestE2EExternalSnapshotsWithoutCommonBaseFails(t *testing.T) {
 	k := newKubectlRunner(t)
 	suffix := uniqueSuffix()
 	pool := realZFSPool()
 	sc := replicationCase{
-		Name:           "e2e-no-base-" + suffix,
-		RunID:          "r-" + suffix,
-		SourceNode:     e2eSourceNode,
-		TargetNode:     e2eTargetNode,
-		SourceDataset:  pool + "/src-no-base-" + suffix,
-		TargetDataset:  pool + "/dst-no-base-" + suffix,
-		SnapshotPrefix: "zsync",
-		BootstrapMode:  e2eBootstrapFailIfNoBase,
+		Name:          "e2e-no-base-" + suffix,
+		SourceNode:    e2eSourceNode,
+		TargetNode:    e2eTargetNode,
+		SourceDataset: pool + "/src-no-base-" + suffix,
+		TargetDataset: pool + "/dst-no-base-" + suffix,
+		SnapshotName:  "snap-" + suffix,
+		NoSyncSnap:    true,
+		IncludeSnaps:  []string{"^snap-" + suffix + "$"},
 	}
 	k.cleanupReplicationOnExit(sc.Name)
 	k.cleanupReplication(sc.Name)
@@ -98,12 +83,13 @@ func TestE2EFailIfNoBase(t *testing.T) {
 	k.cleanupRealZFSDatasetOnExit(sc.TargetNode, "zfs-cln-no-base-dst-"+suffix, sc.TargetDataset)
 
 	k.runRealZFS(sc.SourceNode, "zfs-src-no-base-"+suffix, realZFSSetupSourceScript(pool, sc.SourceDataset, "no-base-"+suffix))
+	k.runRealZFS(sc.SourceNode, "zfs-snap-no-base-"+suffix, "zfs snapshot "+sc.sourceSnapshot())
+	k.runRealZFS(sc.TargetNode, "zfs-dst-no-base-"+suffix, realZFSSetupTargetScript(pool, sc.TargetDataset))
 
 	k.applyReplication(sc)
 	status := k.waitForFailed(sc, 4*time.Minute)
-	assertFailedStatus(t, sc, status, "no base snapshot")
+	assertFailedStatus(t, sc, status, "")
 	k.assertRealZFSSnapshotExists(sc.SourceNode, "zfs-src-snap-no-base-"+suffix, sc.sourceSnapshot())
-	k.assertLeaseState(sc.Name, "failed")
 }
 
 func TestE2ESameDatasetRejectedBeforeJobs(t *testing.T) {
@@ -111,14 +97,11 @@ func TestE2ESameDatasetRejectedBeforeJobs(t *testing.T) {
 	suffix := uniqueSuffix()
 	pool := realZFSPool()
 	sc := replicationCase{
-		Name:           "e2e-same-ds-" + suffix,
-		RunID:          "r-" + suffix,
-		SourceNode:     e2eSourceNode,
-		TargetNode:     e2eTargetNode,
-		SourceDataset:  pool + "/same-" + suffix,
-		TargetDataset:  pool + "/same-" + suffix,
-		SnapshotPrefix: "zsync",
-		BootstrapMode:  e2eBootstrapDestroyFull,
+		Name:          "e2e-same-ds-" + suffix,
+		SourceNode:    e2eSourceNode,
+		TargetNode:    e2eTargetNode,
+		SourceDataset: pool + "/same-" + suffix,
+		TargetDataset: pool + "/same-" + suffix,
 	}
 	k.cleanupReplicationOnExit(sc.Name)
 	k.cleanupReplication(sc.Name)
@@ -127,7 +110,6 @@ func TestE2ESameDatasetRejectedBeforeJobs(t *testing.T) {
 	status := k.waitForFailed(sc, 2*time.Minute)
 	assertFailedStatus(t, sc, status, "source and target datasets must differ")
 	k.assertNoJobsOrSecrets(sc.Name)
-	k.assertNoLease(sc.Name)
 }
 
 func TestE2ESyncoidFailure(t *testing.T) {
@@ -135,14 +117,12 @@ func TestE2ESyncoidFailure(t *testing.T) {
 	suffix := uniqueSuffix()
 	pool := realZFSPool()
 	sc := replicationCase{
-		Name:           "e2e-sync-fail-" + suffix,
-		RunID:          "r-" + suffix,
-		SourceNode:     e2eSourceNode,
-		TargetNode:     e2eTargetNode,
-		SourceDataset:  pool + "/src-sync-fail-" + suffix,
-		TargetDataset:  "missingpool/dst-sync-fail-" + suffix,
-		SnapshotPrefix: "zsync",
-		BootstrapMode:  e2eBootstrapDestroyFull,
+		Name:          "e2e-sync-fail-" + suffix,
+		SourceNode:    e2eSourceNode,
+		TargetNode:    e2eTargetNode,
+		SourceDataset: pool + "/src-sync-fail-" + suffix,
+		TargetDataset: "missingpool/dst-sync-fail-" + suffix,
+		ForceDelete:   true,
 	}
 	k.cleanupReplicationOnExit(sc.Name)
 	k.cleanupReplication(sc.Name)
@@ -156,35 +136,28 @@ func TestE2ESyncoidFailure(t *testing.T) {
 	if !strings.Contains(status.LastError, sc.TargetDataset) {
 		t.Fatalf("lastError = %q, want to mention target dataset %q", status.LastError, sc.TargetDataset)
 	}
-	k.assertLeaseState(sc.Name, "failed")
 }
 
 type replicationCase struct {
-	Name           string
-	RunID          string
-	SourceNode     string
-	TargetNode     string
-	SourceDataset  string
-	TargetDataset  string
-	SnapshotPrefix string
-	BootstrapMode  string
-	Annotations    map[string]string
+	Name          string
+	SourceNode    string
+	TargetNode    string
+	SourceDataset string
+	TargetDataset string
+	SnapshotName  string
+	NoSyncSnap    bool
+	ForceDelete   bool
+	IncludeSnaps  []string
+	ExcludeSnaps  []string
+	Annotations   map[string]string
 }
 
 func (c replicationCase) snapshotName() string {
-	prefix := c.SnapshotPrefix
-	if prefix == "" {
-		prefix = "zsync"
-	}
-	return prefix + "-" + c.RunID
+	return c.SnapshotName
 }
 
 func (c replicationCase) sourceSnapshot() string {
 	return c.SourceDataset + "@" + c.snapshotName()
-}
-
-func (c replicationCase) targetSnapshot() string {
-	return c.TargetDataset + "@" + c.snapshotName()
 }
 
 func (c replicationCase) manifestJSON(t *testing.T) []byte {
@@ -198,10 +171,9 @@ func (c replicationCase) manifestJSON(t *testing.T) []byte {
 	}
 	doc := map[string]any{
 		"apiVersion": "zfsreplication.example.com/v1alpha1",
-		"kind":       "ZFSReplication",
+		"kind":       "ZFSReplicationRun",
 		"metadata":   metadata,
 		"spec": map[string]any{
-			"runID": c.RunID,
 			"source": map[string]any{
 				"nodeName": c.SourceNode,
 				"dataset":  c.SourceDataset,
@@ -210,13 +182,15 @@ func (c replicationCase) manifestJSON(t *testing.T) []byte {
 				"nodeName": c.TargetNode,
 				"dataset":  c.TargetDataset,
 			},
-			"snapshotPrefix": c.SnapshotPrefix,
-			"bootstrap": map[string]any{
-				"mode": c.BootstrapMode,
-			},
-			"receive": map[string]any{
+			"syncoid": map[string]any{
+				"noSyncSnap":       c.NoSyncSnap,
+				"noRollback":       true,
+				"forceDelete":      c.ForceDelete,
+				"compress":         "none",
 				"receiveUnmounted": true,
-				"resumable":        true,
+				"receiveResumable": true,
+				"includeSnaps":     c.IncludeSnaps,
+				"excludeSnaps":     c.ExcludeSnaps,
 			},
 		},
 	}
@@ -265,9 +239,8 @@ func (k kubectlRunner) ensureNamespace(namespace string) {
 }
 
 func (k kubectlRunner) cleanupReplication(name string) {
-	k.run(75*time.Second, "delete", "zfsreplication", name, "-n", e2eNamespace, "--ignore-not-found=true", "--wait=true", "--timeout=60s")
-	k.run(75*time.Second, "delete", "jobs,pods,secrets", "-n", e2eNamespace, "-l", e2eLabelPrefix+"/name="+name, "--ignore-not-found=true", "--wait=true", "--timeout=60s")
-	k.run(75*time.Second, "delete", "lease", "zfsrep-"+name, "-n", e2eNamespace, "--ignore-not-found=true", "--wait=true", "--timeout=60s")
+	k.run(75*time.Second, "delete", "zfsreplicationrun", name, "-n", e2eNamespace, "--ignore-not-found=true", "--wait=true", "--timeout=60s")
+	k.run(75*time.Second, "delete", "jobs,pods,secrets", "-n", e2eNamespace, "-l", e2eLabelPrefix+"/run="+name, "--ignore-not-found=true", "--wait=true", "--timeout=60s")
 }
 
 func (k kubectlRunner) cleanupReplicationOnExit(name string) {
@@ -289,14 +262,14 @@ func (k kubectlRunner) applyReplication(sc replicationCase) {
 
 func (k kubectlRunner) waitForSuccess(sc replicationCase, timeout time.Duration) replicationStatus {
 	return k.waitForStatus(sc, timeout, func(st replicationStatus) bool {
-		return st.Phase == "Succeeded" && st.LastSuccessfulRunID == sc.RunID
-	}, "Succeeded with lastSuccessfulRunID="+sc.RunID)
+		return st.Phase == "Succeeded"
+	}, "Succeeded")
 }
 
 func (k kubectlRunner) waitForFailed(sc replicationCase, timeout time.Duration) replicationStatus {
 	return k.waitForStatus(sc, timeout, func(st replicationStatus) bool {
-		return st.Phase == "Failed" && st.LastAttemptedRunID == sc.RunID
-	}, "Failed with lastAttemptedRunID="+sc.RunID)
+		return st.Phase == "Failed"
+	}, "Failed")
 }
 
 func (k kubectlRunner) waitForStatus(sc replicationCase, timeout time.Duration, ready func(replicationStatus) bool, want string) replicationStatus {
@@ -327,20 +300,20 @@ func (k kubectlRunner) waitForStatus(sc replicationCase, timeout time.Duration, 
 
 func (k kubectlRunner) getStatus(name string) (replicationStatus, error) {
 	k.t.Helper()
-	out, err := k.runOutput(20*time.Second, "get", "zfsreplication", name, "-n", e2eNamespace, "-o", "json")
+	out, err := k.runOutput(20*time.Second, "get", "zfsreplicationrun", name, "-n", e2eNamespace, "-o", "json")
 	if err != nil {
 		return replicationStatus{}, err
 	}
 	var obj replicationObject
 	if err := json.Unmarshal([]byte(out), &obj); err != nil {
-		return replicationStatus{}, fmt.Errorf("parse zfsreplication status: %w\n%s", err, out)
+		return replicationStatus{}, fmt.Errorf("parse zfsreplicationrun status: %w\n%s", err, out)
 	}
 	return obj.Status, nil
 }
 
 func (k kubectlRunner) collectDiagnostics(name string) {
 	for _, args := range [][]string{
-		{"get", "zfsreplication", name, "-n", e2eNamespace, "-o", "yaml"},
+		{"get", "zfsreplicationrun", name, "-n", e2eNamespace, "-o", "yaml"},
 		{"get", "pods,jobs,secrets,leases", "-n", e2eNamespace, "-o", "wide"},
 		{"get", "events", "-n", e2eNamespace, "--sort-by=.lastTimestamp"},
 		{"logs", "-n", "zfsreplication-system", "deployment/zfsreplication-controller"},
@@ -369,10 +342,7 @@ func (k kubectlRunner) collectDiagnostics(name string) {
 
 func (k kubectlRunner) podsForReplication(name, runID string) (podList, error) {
 	k.t.Helper()
-	selector := e2eLabelPrefix + "/name=" + name
-	if runID != "" {
-		selector += "," + e2eLabelPrefix + "/run-id=" + runID
-	}
+	selector := e2eLabelPrefix + "/run=" + name
 	out, err := k.runOutput(20*time.Second, "get", "pods", "-n", e2eNamespace, "-l", selector, "-o", "json")
 	if err != nil {
 		return podList{}, err
@@ -386,7 +356,7 @@ func (k kubectlRunner) podsForReplication(name, runID string) (podList, error) {
 
 func (k kubectlRunner) assertNoSecrets(name string) {
 	k.t.Helper()
-	out, err := k.runOutput(20*time.Second, "get", "secrets", "-n", e2eNamespace, "-l", e2eLabelPrefix+"/name="+name, "-o", "name")
+	out, err := k.runOutput(20*time.Second, "get", "secrets", "-n", e2eNamespace, "-l", e2eLabelPrefix+"/run="+name, "-o", "name")
 	if err != nil && !strings.Contains(err.Error(), "No resources found") {
 		k.t.Fatal(err)
 	}
@@ -397,36 +367,12 @@ func (k kubectlRunner) assertNoSecrets(name string) {
 
 func (k kubectlRunner) assertNoJobsOrSecrets(name string) {
 	k.t.Helper()
-	out, err := k.runOutput(20*time.Second, "get", "jobs,secrets", "-n", e2eNamespace, "-l", e2eLabelPrefix+"/name="+name, "-o", "name")
+	out, err := k.runOutput(20*time.Second, "get", "jobs,secrets", "-n", e2eNamespace, "-l", e2eLabelPrefix+"/run="+name, "-o", "name")
 	if err != nil && !strings.Contains(err.Error(), "No resources found") {
 		k.t.Fatal(err)
 	}
 	if strings.TrimSpace(out) != "" {
 		k.t.Fatalf("jobs/secrets exist for %s:\n%s", name, out)
-	}
-}
-
-func (k kubectlRunner) assertLeaseState(name, want string) {
-	k.t.Helper()
-	out, err := k.runOutput(20*time.Second, "get", "lease", "zfsrep-"+name, "-n", e2eNamespace, "-o", "json")
-	if err != nil {
-		k.t.Fatal(err)
-	}
-	var lease leaseObject
-	if err := json.Unmarshal([]byte(out), &lease); err != nil {
-		k.t.Fatalf("parse lease: %v\n%s", err, out)
-	}
-	if got := lease.Metadata.Annotations[e2eLeaseStateAnnotation]; got != want {
-		k.t.Fatalf("lease state = %q, want %q\n%s", got, want, out)
-	}
-}
-
-func (k kubectlRunner) assertNoLease(name string) {
-	k.t.Helper()
-	if out, err := k.runOutput(15*time.Second, "get", "lease", "zfsrep-"+name, "-n", e2eNamespace); err == nil {
-		k.t.Fatalf("lease for %s exists:\n%s", name, out)
-	} else if !strings.Contains(err.Error(), "NotFound") {
-		k.t.Fatalf("check lease for %s absence: %v", name, err)
 	}
 }
 
@@ -443,12 +389,12 @@ func (k kubectlRunner) cleanupRealZFSDatasetOnExit(node, jobName, dataset string
 	})
 }
 
-func (k kubectlRunner) assertRealZFSSnapshotGUID(node, jobName, snapshot, want string) {
+func (k kubectlRunner) assertRealZFSProperty(node, jobName, dataset, want string) {
 	k.t.Helper()
-	logs := k.runRealZFS(node, jobName, "zfs get -H -o value guid "+snapshot)
+	logs := k.runRealZFS(node, jobName, "zfs get -H -o value org.zfsreplicationcontroller:e2e "+dataset)
 	got := strings.TrimSpace(logs)
 	if got != want {
-		k.t.Fatalf("%s guid on %s = %q, want %q", snapshot, node, got, want)
+		k.t.Fatalf("%s property on %s = %q, want %q", dataset, node, got, want)
 	}
 }
 
@@ -576,26 +522,15 @@ type replicationObject struct {
 }
 
 type replicationStatus struct {
-	Phase                      string `json:"phase"`
-	ObservedRunID              string `json:"observedRunID"`
-	LastAttemptedRunID         string `json:"lastAttemptedRunID"`
-	LastSuccessfulRunID        string `json:"lastSuccessfulRunID"`
-	LastSuccessfulSnapshot     string `json:"lastSuccessfulSnapshot"`
-	LastSuccessfulSnapshotGUID string `json:"lastSuccessfulSnapshotGUID"`
-	SenderJobName              string `json:"senderJobName"`
-	ReceiverJobName            string `json:"receiverJobName"`
-	ReceiverPodName            string `json:"receiverPodName"`
-	ReceiverPodIP              string `json:"receiverPodIP"`
-	SSHSecretName              string `json:"sshSecretName"`
-	StartedAt                  string `json:"startedAt"`
-	CompletedAt                string `json:"completedAt"`
-	LastError                  string `json:"lastError"`
-}
-
-type leaseObject struct {
-	Metadata struct {
-		Annotations map[string]string `json:"annotations"`
-	} `json:"metadata"`
+	Phase           string `json:"phase"`
+	SenderJobName   string `json:"senderJobName"`
+	ReceiverJobName string `json:"receiverJobName"`
+	ReceiverPodName string `json:"receiverPodName"`
+	ReceiverPodIP   string `json:"receiverPodIP"`
+	SSHSecretName   string `json:"sshSecretName"`
+	StartedAt       string `json:"startedAt"`
+	CompletedAt     string `json:"completedAt"`
+	LastError       string `json:"lastError"`
 }
 
 type jobObject struct {
@@ -621,16 +556,10 @@ type podList struct {
 	} `json:"items"`
 }
 
-func assertSucceededStatus(t *testing.T, sc replicationCase, st replicationStatus, wantGUID string) {
+func assertSucceededStatus(t *testing.T, sc replicationCase, st replicationStatus) {
 	t.Helper()
-	if st.Phase != "Succeeded" || st.ObservedRunID != sc.RunID || st.LastAttemptedRunID != sc.RunID || st.LastSuccessfulRunID != sc.RunID {
-		t.Fatalf("unexpected success status for %s/%s: %#v", sc.Name, sc.RunID, st)
-	}
-	if st.LastSuccessfulSnapshot != sc.snapshotName() {
-		t.Fatalf("lastSuccessfulSnapshot = %q, want %q", st.LastSuccessfulSnapshot, sc.snapshotName())
-	}
-	if st.LastSuccessfulSnapshotGUID != wantGUID {
-		t.Fatalf("lastSuccessfulSnapshotGUID = %q, want %q", st.LastSuccessfulSnapshotGUID, wantGUID)
+	if st.Phase != "Succeeded" {
+		t.Fatalf("unexpected success status for %s: %#v", sc.Name, st)
 	}
 	if st.LastError != "" {
 		t.Fatalf("lastError = %q, want empty", st.LastError)
@@ -648,14 +577,14 @@ func assertSucceededStatus(t *testing.T, sc replicationCase, st replicationStatu
 
 func assertFailedStatus(t *testing.T, sc replicationCase, st replicationStatus, wantError string) {
 	t.Helper()
-	if st.Phase != "Failed" || st.ObservedRunID != sc.RunID || st.LastAttemptedRunID != sc.RunID {
-		t.Fatalf("unexpected failed status for %s/%s: %#v", sc.Name, sc.RunID, st)
+	if st.Phase != "Failed" {
+		t.Fatalf("unexpected failed status for %s: %#v", sc.Name, st)
 	}
-	if !strings.Contains(st.LastError, wantError) {
+	if wantError != "" && !strings.Contains(st.LastError, wantError) {
 		t.Fatalf("lastError = %q, want to contain %q", st.LastError, wantError)
 	}
-	if st.LastSuccessfulRunID != "" || st.LastSuccessfulSnapshot != "" || st.LastSuccessfulSnapshotGUID != "" {
-		t.Fatalf("failure should not update successful status fields: %#v", st)
+	if st.LastError == "" {
+		t.Fatalf("lastError is empty")
 	}
 	if st.StartedAt == "" || st.CompletedAt == "" {
 		t.Fatalf("failure timestamps missing: %#v", st)

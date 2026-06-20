@@ -6,7 +6,7 @@ rules:
   - apiGroups:
       - zfsreplication.example.com
     resources:
-      - zfsreplications
+      - zfsreplicationschedules
     verbs:
       - get
       - list
@@ -14,7 +14,17 @@ rules:
   - apiGroups:
       - zfsreplication.example.com
     resources:
-      - zfsreplications/status
+      - zfsreplicationruns
+    verbs:
+      - create
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - zfsreplication.example.com
+    resources:
+      - zfsreplicationruns/status
+      - zfsreplicationschedules/status
     verbs:
       - get
       - update
@@ -57,17 +67,6 @@ rules:
       - pods/log
     verbs:
       - get
-  - apiGroups:
-      - coordination.k8s.io
-    resources:
-      - leases
-    verbs:
-      - create
-      - get
-      - list
-      - watch
-      - update
-      - patch
   - apiGroups:
       - ""
     resources:

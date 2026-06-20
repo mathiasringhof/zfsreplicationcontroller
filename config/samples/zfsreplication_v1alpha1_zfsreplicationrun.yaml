@@ -1,19 +1,20 @@
 apiVersion: zfsreplication.example.com/v1alpha1
 kind: ZFSReplicationRun
 metadata:
-  name: e2e-full
+  name: pg-a-to-b-manual-001
   namespace: storage
 spec:
   source:
     nodeName: worker-a
-    dataset: tank/src
+    dataset: tank/pvc-source
   target:
     nodeName: worker-b
-    dataset: tank/dst
+    dataset: tank/pvc-target
   syncoid:
-    noSyncSnap: false
+    noSyncSnap: true
     noRollback: true
-    forceDelete: true
     compress: none
     receiveUnmounted: true
     receiveResumable: true
+    includeSnaps:
+      - "^snap-.*"

@@ -1,0 +1,182 @@
+package controller
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	zfsv1 "github.com/mathias/zfsreplicationcontroller/api/v1alpha1"
+	batchv1 "k8s.io/api/batch/v1"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+)
+
+func TestRunReconcileSenderJobUsesSyncoidOptions(t *testing.T) {
+	run := replicationRun("manual-1")
+	r := newRunReconciler(t, run, runReceiverPod(run, "10.0.0.42"))
+	if _, err := r.Reconcile(context.Background(), request("manual-1")); err != nil {
+		t.Fatal(err)
+	}
+	sender := getJob(t, r.Client, "zfsrep-manual-1-sender")
+	if got := envValue(sender, "SRC_DATASET"); got != "tank/src" {
+		t.Fatalf("SRC_DATASET = %q", got)
+	}
+	if got := envValue(sender, "DST_HOST"); got != "root@10.0.0.42" {
+		t.Fatalf("DST_HOST = %q", got)
+	}
+	if got := envValue(sender, "SYNCOID_NO_SYNC_SNAP"); got != "true" {
+		t.Fatalf("SYNCOID_NO_SYNC_SNAP = %q", got)
+	}
+	if got := envValue(sender, "SYNCOID_COMPRESS"); got != "zstd" {
+		t.Fatalf("SYNCOID_COMPRESS = %q", got)
+	}
+	if got := envValue(sender, "SYNCOID_INCLUDE_SNAPS"); got != "^snap-.*\n^manual$" {
+		t.Fatalf("SYNCOID_INCLUDE_SNAPS = %q", got)
+	}
+	if got := envValue(sender, "SYNCOID_EXCLUDE_SNAPS"); got != ".*-tmp$" {
+		t.Fatalf("SYNCOID_EXCLUDE_SNAPS = %q", got)
+	}
+}
+
+func TestScheduleReconcileCreatesRunForDueSchedule(t *testing.T) {
+	now := time.Date(2026, 6, 20, 10, 7, 0, 0, time.UTC)
+	schedule := replicationSchedule("hourly")
+	schedule.CreationTimestamp = metav1.NewTime(now.Add(-2 * time.Hour))
+	r := newScheduleReconciler(t, now, schedule)
+
+	if _, err := r.Reconcile(context.Background(), request("hourly")); err != nil {
+		t.Fatal(err)
+	}
+
+	runName := scheduledRunName("hourly", time.Date(2026, 6, 20, 10, 0, 0, 0, time.UTC))
+	var run zfsv1.ZFSReplicationRun
+	if err := r.Get(context.Background(), types.NamespacedName{Name: runName, Namespace: "storage"}, &run); err != nil {
+		t.Fatal(err)
+	}
+	if run.Spec.Source.Dataset != "tank/src" || run.Spec.Target.Dataset != "tank/dst" {
+		t.Fatalf("run spec = %#v", run.Spec)
+	}
+	if len(run.OwnerReferences) != 1 || run.OwnerReferences[0].Name != "hourly" {
+		t.Fatalf("ownerReferences = %#v", run.OwnerReferences)
+	}
+	if run.Labels[labelPrefix+"/schedule"] != "hourly" {
+		t.Fatalf("labels = %#v", run.Labels)
+	}
+	var got zfsv1.ZFSReplicationSchedule
+	if err := r.Get(context.Background(), types.NamespacedName{Name: "hourly", Namespace: "storage"}, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Status.LastScheduleTime == nil || !got.Status.LastScheduleTime.Time.Equal(time.Date(2026, 6, 20, 10, 0, 0, 0, time.UTC)) {
+		t.Fatalf("LastScheduleTime = %v", got.Status.LastScheduleTime)
+	}
+	if got.Status.LastRunName != runName {
+		t.Fatalf("LastRunName = %q, want %q", got.Status.LastRunName, runName)
+	}
+}
+
+func replicationRun(name string) *zfsv1.ZFSReplicationRun {
+	return &zfsv1.ZFSReplicationRun{
+		TypeMeta:   metav1.TypeMeta{APIVersion: zfsv1.Group + "/" + zfsv1.Version, Kind: "ZFSReplicationRun"},
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "storage"},
+		Spec: zfsv1.ZFSReplicationRunSpec{
+			Source: zfsv1.DatasetRef{NodeName: "worker-a", Dataset: "tank/src"},
+			Target: zfsv1.DatasetRef{NodeName: "worker-b", Dataset: "tank/dst"},
+			Syncoid: zfsv1.SyncoidSpec{
+				NoSyncSnap:       ptr(true),
+				NoRollback:       ptr(true),
+				Compress:         "zstd",
+				ReceiveUnmounted: ptr(false),
+				ReceiveResumable: ptr(false),
+				IncludeSnaps:     []string{"^snap-.*", "^manual$"},
+				ExcludeSnaps:     []string{".*-tmp$"},
+			},
+		},
+	}
+}
+
+func replicationSchedule(name string) *zfsv1.ZFSReplicationSchedule {
+	return &zfsv1.ZFSReplicationSchedule{
+		TypeMeta:   metav1.TypeMeta{APIVersion: zfsv1.Group + "/" + zfsv1.Version, Kind: "ZFSReplicationSchedule"},
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "storage"},
+		Spec: zfsv1.ZFSReplicationScheduleSpec{
+			Schedule:          "0 * * * *",
+			ConcurrencyPolicy: zfsv1.ConcurrencyPolicyForbid,
+			RunTemplate:       replicationRun("template").Spec,
+		},
+	}
+}
+
+func runReceiverPod(run *zfsv1.ZFSReplicationRun, ip string) *corev1.Pod {
+	names := objectNamesForRun(run.Name)
+	labels := cloneLabels(names.Labels)
+	labels[labelPrefix+"/role"] = "receiver"
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "receiver-pod", Namespace: "storage", Labels: labels},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+			PodIP: ip,
+			Conditions: []corev1.PodCondition{
+				{Type: corev1.PodReady, Status: corev1.ConditionTrue},
+			},
+		},
+	}
+}
+
+func newRunReconciler(t *testing.T, objs ...client.Object) *ZFSReplicationRunReconciler {
+	t.Helper()
+	scheme := newTestScheme(t)
+	c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&zfsv1.ZFSReplicationRun{}).WithObjects(objs...).Build()
+	return &ZFSReplicationRunReconciler{Client: c, Scheme: scheme, DataMoverImage: "datamover:test"}
+}
+
+func newScheduleReconciler(t *testing.T, now time.Time, objs ...client.Object) *ZFSReplicationScheduleReconciler {
+	t.Helper()
+	scheme := newTestScheme(t)
+	c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&zfsv1.ZFSReplicationSchedule{}).WithObjects(objs...).Build()
+	return &ZFSReplicationScheduleReconciler{Client: c, Scheme: scheme, Now: func() time.Time { return now }}
+}
+
+func newTestScheme(t *testing.T) *runtime.Scheme {
+	t.Helper()
+	scheme := runtime.NewScheme()
+	if err := clientgoscheme.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := zfsv1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := batchv1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	return scheme
+}
+
+func request(name string) ctrl.Request {
+	return ctrl.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: "storage"}}
+}
+
+func getJob(t *testing.T, c client.Client, name string) *batchv1.Job {
+	t.Helper()
+	var job batchv1.Job
+	if err := c.Get(context.Background(), types.NamespacedName{Name: name, Namespace: "storage"}, &job); err != nil {
+		t.Fatal(err)
+	}
+	return &job
+}
+
+func envValue(job *batchv1.Job, name string) string {
+	for _, env := range job.Spec.Template.Spec.Containers[0].Env {
+		if env.Name == name {
+			return env.Value
+		}
+	}
+	return ""
+}
+
+func ptr[T any](v T) *T { return &v }

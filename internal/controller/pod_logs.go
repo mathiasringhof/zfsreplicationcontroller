@@ -3,7 +3,6 @@ package controller
 import (
 	"context"
 	"io"
-	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/kubernetes"
@@ -31,13 +30,4 @@ func (r KubernetesPodLogReader) Logs(ctx context.Context, namespace, podName str
 		return "", closeErr
 	}
 	return string(data), nil
-}
-
-func snapshotGUIDFromLogs(logs string) string {
-	for _, line := range strings.Split(logs, "\n") {
-		if guid, ok := strings.CutPrefix(strings.TrimSpace(line), "snapshot_guid="); ok {
-			return strings.TrimSpace(guid)
-		}
-	}
-	return ""
 }

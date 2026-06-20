@@ -1,0 +1,128 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: zfsreplicationschedules.zfsreplication.example.com
+spec:
+  group: zfsreplication.example.com
+  names:
+    kind: ZFSReplicationSchedule
+    listKind: ZFSReplicationScheduleList
+    plural: zfsreplicationschedules
+    singular: zfsreplicationschedule
+    shortNames:
+      - zfsrepsched
+  scope: Namespaced
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      schema:
+        openAPIV3Schema:
+          type: object
+          required:
+            - spec
+          properties:
+            apiVersion:
+              type: string
+            kind:
+              type: string
+            metadata:
+              type: object
+            spec:
+              type: object
+              required:
+                - schedule
+                - runTemplate
+              properties:
+                schedule:
+                  type: string
+                  minLength: 1
+                suspend:
+                  type: boolean
+                  default: false
+                concurrencyPolicy:
+                  type: string
+                  default: Forbid
+                  enum:
+                    - Allow
+                    - Forbid
+                runTemplate:
+                  type: object
+                  required:
+                    - source
+                    - target
+                  properties:
+                    source:
+                      type: object
+                      required:
+                        - nodeName
+                        - dataset
+                      properties:
+                        nodeName:
+                          type: string
+                          minLength: 1
+                        dataset:
+                          type: string
+                          minLength: 1
+                    target:
+                      type: object
+                      required:
+                        - nodeName
+                        - dataset
+                      properties:
+                        nodeName:
+                          type: string
+                          minLength: 1
+                        dataset:
+                          type: string
+                          minLength: 1
+                    syncoid:
+                      type: object
+                      properties:
+                        noSyncSnap:
+                          type: boolean
+                          default: false
+                        noRollback:
+                          type: boolean
+                          default: true
+                        forceDelete:
+                          type: boolean
+                          default: false
+                        compress:
+                          type: string
+                        receiveUnmounted:
+                          type: boolean
+                          default: true
+                        receiveResumable:
+                          type: boolean
+                          default: true
+                        includeSnaps:
+                          type: array
+                          items:
+                            type: string
+                        excludeSnaps:
+                          type: array
+                          items:
+                            type: string
+            status:
+              type: object
+              properties:
+                lastScheduleTime:
+                  type: string
+                  format: date-time
+                lastRunName:
+                  type: string
+                lastError:
+                  type: string
+      additionalPrinterColumns:
+        - name: Schedule
+          type: string
+          jsonPath: .spec.schedule
+        - name: Last Run
+          type: string
+          jsonPath: .status.lastRunName
+        - name: Last Schedule
+          type: date
+          jsonPath: .status.lastScheduleTime

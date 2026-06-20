@@ -90,46 +90,56 @@ func (fakeErr) Error() string { return "fake error" }
 
 var errFake error = fakeErr{}
 
-func TestSenderRunsSyncoidForRunSnapshot(t *testing.T) {
-	runner := &fakeRunner{snapshots: map[string]bool{
-		"tank/src@zsync-run-1": true,
-		"tank/src@zsync-run-0": true,
-	}}
+func TestSenderRunsSyncoidWithConfiguredSnapshotOptions(t *testing.T) {
+	runner := &fakeRunner{snapshots: map[string]bool{}}
 	guid, err := RunSender(context.Background(), SenderConfig{
-		RunID:            "run-1",
-		SnapshotPrefix:   "zsync",
 		SrcDataset:       "tank/src",
 		DstHost:          "root@10.0.0.42",
 		DstDataset:       "tank/dst",
 		SSHKeyFile:       "/var/run/zfsrep/ssh/id_rsa",
 		SSHPort:          "2222",
-		BaseSnapshot:     "zsync-run-0",
-		BootstrapMode:    "FailIfNoBase",
-		ReceiveUnmounted: true,
-		ReceiveResumable: true,
+		NoSyncSnap:       true,
+		NoRollback:       true,
+		Compress:         "zstd",
+		ReceiveUnmounted: false,
+		ReceiveResumable: false,
+		IncludeSnaps:     []string{"^snap-.*", "^manual$"},
+		ExcludeSnaps:     []string{".*-tmp$"},
 	}, runner)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if guid != "123" {
-		t.Fatalf("guid = %q", guid)
+	if guid != "" {
+		t.Fatalf("guid = %q, want empty when syncoid owns snapshot selection", guid)
 	}
-	want := "--no-sync-snap --no-rollback --compress=none --sshoption=StrictHostKeyChecking=no --sshoption=UserKnownHostsFile=/dev/null --sshkey=/var/run/zfsrep/ssh/id_rsa --sshport=2222 --recvoptions=u --include-snaps=^zsync-run-1$ --include-snaps=^zsync-run-0$ tank/src root@10.0.0.42:tank/dst"
+	want := "--no-sync-snap --no-rollback --compress=zstd --sshoption=StrictHostKeyChecking=no --sshoption=UserKnownHostsFile=/dev/null --sshkey=/var/run/zfsrep/ssh/id_rsa --sshport=2222 --no-resume --include-snaps=^snap-.* --include-snaps=^manual$ --exclude-snaps=.*-tmp$ tank/src root@10.0.0.42:tank/dst"
 	if !hasNamedCall(runner.calls, "syncoid", want) {
 		t.Fatalf("syncoid was not called with %q: %#v", want, runner.calls)
 	}
-	if hasCall(runner.calls, "send -i tank/src@zsync-run-0 tank/src@zsync-run-1") {
-		t.Fatalf("zfs send should not be called directly when using syncoid: %#v", runner.calls)
+	if hasNamedCall(runner.calls, "zfs", "snapshot tank/src@") {
+		t.Fatalf("zfs snapshot should not be called when syncoid owns snapshot selection: %#v", runner.calls)
 	}
 }
 
 func TestSenderConfigFromEnvDefaults(t *testing.T) {
-	t.Setenv("SNAPSHOT_PREFIX", "")
+	t.Setenv("SYNCOID_NO_SYNC_SNAP", "")
+	t.Setenv("SYNCOID_NO_ROLLBACK", "")
+	t.Setenv("SYNCOID_FORCE_DELETE", "")
+	t.Setenv("SYNCOID_COMPRESS", "")
 	t.Setenv("RECEIVE_UNMOUNTED", "")
 	t.Setenv("RECEIVE_RESUMABLE", "")
 	cfg := SenderConfigFromEnv()
-	if cfg.SnapshotPrefix != "zsync" {
-		t.Fatalf("SnapshotPrefix = %q, want zsync", cfg.SnapshotPrefix)
+	if cfg.NoSyncSnap {
+		t.Fatalf("NoSyncSnap = true, want false")
+	}
+	if !cfg.NoRollback {
+		t.Fatalf("NoRollback = false, want true")
+	}
+	if cfg.ForceDelete {
+		t.Fatalf("ForceDelete = true, want false")
+	}
+	if cfg.Compress != "none" {
+		t.Fatalf("Compress = %q, want none", cfg.Compress)
 	}
 	if !cfg.ReceiveUnmounted {
 		t.Fatalf("ReceiveUnmounted = false, want true")
@@ -177,23 +187,39 @@ func TestExecRunnerMirrorsSuccessfulStderr(t *testing.T) {
 }
 
 func TestSenderConfigFromEnvExplicitValuesOverrideDefaults(t *testing.T) {
-	t.Setenv("SNAPSHOT_PREFIX", "nightly")
-	t.Setenv("BOOTSTRAP_MODE", BootstrapDestroyTargetAndReceiveFull)
+	t.Setenv("SYNCOID_NO_SYNC_SNAP", "true")
+	t.Setenv("SYNCOID_NO_ROLLBACK", "false")
+	t.Setenv("SYNCOID_FORCE_DELETE", "true")
+	t.Setenv("SYNCOID_COMPRESS", "zstd")
 	t.Setenv("RECEIVE_UNMOUNTED", "false")
 	t.Setenv("RECEIVE_RESUMABLE", "false")
+	t.Setenv("SYNCOID_INCLUDE_SNAPS", "^snap-.*\n^manual$")
+	t.Setenv("SYNCOID_EXCLUDE_SNAPS", ".*-tmp$")
 
 	sender := SenderConfigFromEnv()
-	if sender.SnapshotPrefix != "nightly" {
-		t.Fatalf("sender SnapshotPrefix = %q, want nightly", sender.SnapshotPrefix)
+	if !sender.NoSyncSnap {
+		t.Fatalf("sender NoSyncSnap = false, want true")
 	}
-	if sender.BootstrapMode != BootstrapDestroyTargetAndReceiveFull {
-		t.Fatalf("sender BootstrapMode = %q, want %s", sender.BootstrapMode, BootstrapDestroyTargetAndReceiveFull)
+	if sender.NoRollback {
+		t.Fatalf("sender NoRollback = true, want false")
+	}
+	if !sender.ForceDelete {
+		t.Fatalf("sender ForceDelete = false, want true")
+	}
+	if sender.Compress != "zstd" {
+		t.Fatalf("sender Compress = %q, want zstd", sender.Compress)
 	}
 	if sender.ReceiveUnmounted {
 		t.Fatalf("sender ReceiveUnmounted = true, want false")
 	}
 	if sender.ReceiveResumable {
 		t.Fatalf("sender ReceiveResumable = true, want false")
+	}
+	if strings.Join(sender.IncludeSnaps, " ") != "^snap-.* ^manual$" {
+		t.Fatalf("sender IncludeSnaps = %#v", sender.IncludeSnaps)
+	}
+	if strings.Join(sender.ExcludeSnaps, " ") != ".*-tmp$" {
+		t.Fatalf("sender ExcludeSnaps = %#v", sender.ExcludeSnaps)
 	}
 }
 
@@ -211,44 +237,27 @@ func TestSenderExitsBeforeWorkWhenNodeMismatch(t *testing.T) {
 	}
 }
 
-func TestSenderRefusesFullWhenBootstrapDisabled(t *testing.T) {
+func TestSenderPassesForceDelete(t *testing.T) {
 	runner := &fakeRunner{snapshots: map[string]bool{}}
 	_, err := RunSender(context.Background(), SenderConfig{
-		RunID:          "run-1",
-		SnapshotPrefix: "zsync",
-		SrcDataset:     "tank/src",
-		BootstrapMode:  "FailIfNoBase",
-	}, runner)
-	if err == nil || !strings.Contains(err.Error(), "no base snapshot") {
-		t.Fatalf("error = %v", err)
-	}
-}
-
-func TestSenderPassesForceDeleteForDestructiveBootstrap(t *testing.T) {
-	runner := &fakeRunner{snapshots: map[string]bool{}}
-	_, err := RunSender(context.Background(), SenderConfig{
-		RunID:            "run-1",
-		SnapshotPrefix:   "zsync",
 		SrcDataset:       "tank/src",
 		DstHost:          "root@10.0.0.42",
 		DstDataset:       "tank/dst",
 		SSHKeyFile:       "/var/run/zfsrep/ssh/id_rsa",
 		SSHPort:          "2222",
-		BootstrapMode:    BootstrapDestroyTargetAndReceiveFull,
+		NoRollback:       true,
+		Compress:         "none",
+		ForceDelete:      true,
 		ReceiveUnmounted: true,
 		ReceiveResumable: true,
 	}, runner)
 	if err != nil {
 		t.Fatalf("error = %v", err)
 	}
-	want := "--no-sync-snap --no-rollback --compress=none --sshoption=StrictHostKeyChecking=no --sshoption=UserKnownHostsFile=/dev/null --sshkey=/var/run/zfsrep/ssh/id_rsa --sshport=2222 --recvoptions=u --include-snaps=^zsync-run-1$ --force-delete tank/src root@10.0.0.42:tank/dst"
+	want := "--no-rollback --compress=none --sshoption=StrictHostKeyChecking=no --sshoption=UserKnownHostsFile=/dev/null --sshkey=/var/run/zfsrep/ssh/id_rsa --sshport=2222 --recvoptions=u --force-delete tank/src root@10.0.0.42:tank/dst"
 	if !hasNamedCall(runner.calls, "syncoid", want) {
-		t.Fatalf("destructive bootstrap syncoid call missing %q: %#v", want, runner.calls)
+		t.Fatalf("force-delete syncoid call missing %q: %#v", want, runner.calls)
 	}
-}
-
-func hasCall(calls []call, args string) bool {
-	return callIndexNamed(calls, "zfs", args) != -1
 }
 
 func hasNamedCall(calls []call, name, args string) bool {

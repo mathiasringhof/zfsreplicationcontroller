@@ -19,7 +19,12 @@ var (
 )
 
 func addKnownTypes(scheme *runtime.Scheme) error {
-	scheme.AddKnownTypes(SchemeGroupVersion, &ZFSReplication{}, &ZFSReplicationList{})
+	scheme.AddKnownTypes(SchemeGroupVersion,
+		&ZFSReplicationRun{},
+		&ZFSReplicationRunList{},
+		&ZFSReplicationSchedule{},
+		&ZFSReplicationScheduleList{},
+	)
 	metav1.AddToGroupVersion(scheme, SchemeGroupVersion)
 	return nil
 }

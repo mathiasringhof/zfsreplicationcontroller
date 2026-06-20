@@ -1,16 +1,16 @@
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
-  name: zfsreplications.zfsreplication.example.com
+  name: zfsreplicationruns.zfsreplication.example.com
 spec:
   group: zfsreplication.example.com
   names:
-    kind: ZFSReplication
-    listKind: ZFSReplicationList
-    plural: zfsreplications
-    singular: zfsreplication
+    kind: ZFSReplicationRun
+    listKind: ZFSReplicationRunList
+    plural: zfsreplicationruns
+    singular: zfsreplicationrun
     shortNames:
-      - zfsrep
+      - zfsreprun
   scope: Namespaced
   versions:
     - name: v1alpha1
@@ -36,10 +36,6 @@ spec:
                 - source
                 - target
               properties:
-                runID:
-                  type: string
-                  maxLength: 40
-                  pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
                 source:
                   type: object
                   required:
@@ -64,29 +60,34 @@ spec:
                     dataset:
                       type: string
                       minLength: 1
-                snapshotPrefix:
-                  type: string
-                  default: zsync
-                  maxLength: 32
-                  pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
-                bootstrap:
+                syncoid:
                   type: object
                   properties:
-                    mode:
+                    noSyncSnap:
+                      type: boolean
+                      default: false
+                    noRollback:
+                      type: boolean
+                      default: true
+                    forceDelete:
+                      type: boolean
+                      default: false
+                    compress:
                       type: string
-                      default: FailIfNoBase
-                      enum:
-                        - FailIfNoBase
-                        - DestroyTargetAndReceiveFull
-                receive:
-                  type: object
-                  properties:
                     receiveUnmounted:
                       type: boolean
                       default: true
-                    resumable:
+                    receiveResumable:
                       type: boolean
                       default: true
+                    includeSnaps:
+                      type: array
+                      items:
+                        type: string
+                    excludeSnaps:
+                      type: array
+                      items:
+                        type: string
             status:
               type: object
               properties:
@@ -99,18 +100,6 @@ spec:
                     - Running
                     - Succeeded
                     - Failed
-                observedRunID:
-                  type: string
-                observedSpecHash:
-                  type: string
-                lastAttemptedRunID:
-                  type: string
-                lastSuccessfulRunID:
-                  type: string
-                lastSuccessfulSnapshot:
-                  type: string
-                lastSuccessfulSnapshotGUID:
-                  type: string
                 senderJobName:
                   type: string
                 receiverJobName:
@@ -133,9 +122,9 @@ spec:
         - name: Phase
           type: string
           jsonPath: .status.phase
-        - name: Run
+        - name: Source
           type: string
-          jsonPath: .spec.runID
-        - name: Last Success
+          jsonPath: .spec.source.dataset
+        - name: Target
           type: string
-          jsonPath: .status.lastSuccessfulRunID
+          jsonPath: .spec.target.dataset

@@ -4,43 +4,42 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"regexp"
 	"strings"
 )
 
-const BootstrapDestroyTargetAndReceiveFull = "DestroyTargetAndReceiveFull"
-
 type SenderConfig struct {
-	RunID            string
-	SnapshotPrefix   string
-	SnapshotName     string
 	SrcDataset       string
 	DstHost          string
 	DstDataset       string
 	SSHKeyFile       string
 	SSHPort          string
-	BaseSnapshot     string
-	BootstrapMode    string
+	NoSyncSnap       bool
+	NoRollback       bool
+	ForceDelete      bool
+	Compress         string
 	ReceiveUnmounted bool
 	ReceiveResumable bool
+	IncludeSnaps     []string
+	ExcludeSnaps     []string
 	ExpectedNode     string
 	ActualNode       string
 }
 
 func SenderConfigFromEnv() SenderConfig {
 	return SenderConfig{
-		RunID:            os.Getenv("RUN_ID"),
-		SnapshotPrefix:   getenv("SNAPSHOT_PREFIX", "zsync"),
-		SnapshotName:     os.Getenv("SNAPSHOT_NAME"),
 		SrcDataset:       os.Getenv("SRC_DATASET"),
 		DstHost:          os.Getenv("DST_HOST"),
 		DstDataset:       os.Getenv("DST_DATASET"),
 		SSHKeyFile:       os.Getenv("SSH_KEY_FILE"),
 		SSHPort:          os.Getenv("SSH_PORT"),
-		BaseSnapshot:     os.Getenv("BASE_SNAPSHOT"),
-		BootstrapMode:    os.Getenv("BOOTSTRAP_MODE"),
+		NoSyncSnap:       boolEnvDefault("SYNCOID_NO_SYNC_SNAP", false),
+		NoRollback:       boolEnvDefault("SYNCOID_NO_ROLLBACK", true),
+		ForceDelete:      boolEnvDefault("SYNCOID_FORCE_DELETE", false),
+		Compress:         getenv("SYNCOID_COMPRESS", "none"),
 		ReceiveUnmounted: getenv("RECEIVE_UNMOUNTED", "true") == "true",
 		ReceiveResumable: getenv("RECEIVE_RESUMABLE", "true") == "true",
+		IncludeSnaps:     listEnv("SYNCOID_INCLUDE_SNAPS"),
+		ExcludeSnaps:     listEnv("SYNCOID_EXCLUDE_SNAPS"),
 		ExpectedNode:     os.Getenv("EXPECTED_NODE_NAME"),
 		ActualNode:       os.Getenv("ACTUAL_NODE_NAME"),
 	}
@@ -50,31 +49,20 @@ func RunSender(ctx context.Context, cfg SenderConfig, r CommandRunner) (guid str
 	if err := validateNode(cfg.ExpectedNode, cfg.ActualNode); err != nil {
 		return "", err
 	}
-	if cfg.SnapshotName == "" {
-		cfg.SnapshotName = cfg.SnapshotPrefix + "-" + cfg.RunID
+	var args []string
+	if cfg.NoSyncSnap {
+		args = append(args, "--no-sync-snap")
 	}
-	if cfg.BootstrapMode == "" {
-		cfg.BootstrapMode = "FailIfNoBase"
+	if cfg.NoRollback {
+		args = append(args, "--no-rollback")
 	}
-	srcSnap := cfg.SrcDataset + "@" + cfg.SnapshotName
-	if !snapshotExists(ctx, r, srcSnap) {
-		if _, stderr, err := r.Run(ctx, "zfs", "snapshot", srcSnap); err != nil {
-			return "", fmt.Errorf("zfs snapshot failed: %s", clean(stderr, err))
-		}
+	if cfg.Compress != "" {
+		args = append(args, "--compress="+cfg.Compress)
 	}
-
-	baseExists := cfg.BaseSnapshot != "" && snapshotExists(ctx, r, cfg.SrcDataset+"@"+cfg.BaseSnapshot)
-	if !baseExists && cfg.BootstrapMode != BootstrapDestroyTargetAndReceiveFull {
-		return "", fmt.Errorf("no base snapshot and destructive bootstrap disabled")
-	}
-
-	args := []string{
-		"--no-sync-snap",
-		"--no-rollback",
-		"--compress=none",
+	args = append(args,
 		"--sshoption=StrictHostKeyChecking=no",
 		"--sshoption=UserKnownHostsFile=/dev/null",
-	}
+	)
 	if cfg.SSHKeyFile != "" {
 		args = append(args, "--sshkey="+cfg.SSHKeyFile)
 	}
@@ -87,18 +75,20 @@ func RunSender(ctx context.Context, cfg SenderConfig, r CommandRunner) (guid str
 	if !cfg.ReceiveResumable {
 		args = append(args, "--no-resume")
 	}
-	args = append(args, "--include-snaps=^"+regexp.QuoteMeta(cfg.SnapshotName)+"$")
-	if baseExists {
-		args = append(args, "--include-snaps=^"+regexp.QuoteMeta(cfg.BaseSnapshot)+"$")
+	for _, include := range cfg.IncludeSnaps {
+		args = append(args, "--include-snaps="+include)
 	}
-	if cfg.BootstrapMode == BootstrapDestroyTargetAndReceiveFull {
+	for _, exclude := range cfg.ExcludeSnaps {
+		args = append(args, "--exclude-snaps="+exclude)
+	}
+	if cfg.ForceDelete {
 		args = append(args, "--force-delete")
 	}
 	args = append(args, cfg.SrcDataset, syncoidTarget(cfg.DstHost, cfg.DstDataset))
 	if _, stderr, err := r.Run(ctx, "syncoid", args...); err != nil {
 		return "", fmt.Errorf("syncoid failed: %s", clean(stderr, err))
 	}
-	return snapshotGUID(ctx, r, srcSnap), nil
+	return "", nil
 }
 
 func syncoidTarget(host, dataset string) string {
@@ -113,6 +103,25 @@ func getenv(key, def string) string {
 		return v
 	}
 	return def
+}
+
+func boolEnvDefault(key string, def bool) bool {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	return v == "true"
+}
+
+func listEnv(key string) []string {
+	var out []string
+	for _, line := range strings.Split(os.Getenv(key), "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			out = append(out, line)
+		}
+	}
+	return out
 }
 
 func clean(stderr string, err error) string {

@@ -8,4 +8,5 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/env.sh"
 kubectl_cmd get nodes -o wide
 kubectl_cmd get pods -A -o wide
 kubectl_cmd get jobs -A || true
-kubectl_cmd get zfsreplications -A || true
+kubectl_cmd get zfsreplicationruns -A || true
+kubectl_cmd get zfsreplicationschedules -A || true

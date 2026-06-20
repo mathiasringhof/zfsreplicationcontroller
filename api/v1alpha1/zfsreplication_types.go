@@ -13,65 +13,90 @@ const (
 	PhaseFailed           Phase = "Failed"
 )
 
-const (
-	BootstrapFailIfNoBase                = "FailIfNoBase"
-	BootstrapDestroyTargetAndReceiveFull = "DestroyTargetAndReceiveFull"
-)
-
 type DatasetRef struct {
 	NodeName string `json:"nodeName"`
 	Dataset  string `json:"dataset"`
 }
 
-type BootstrapSpec struct {
-	Mode string `json:"mode,omitempty"`
+type SyncoidSpec struct {
+	NoSyncSnap       *bool    `json:"noSyncSnap,omitempty"`
+	NoRollback       *bool    `json:"noRollback,omitempty"`
+	ForceDelete      *bool    `json:"forceDelete,omitempty"`
+	Compress         string   `json:"compress,omitempty"`
+	ReceiveUnmounted *bool    `json:"receiveUnmounted,omitempty"`
+	ReceiveResumable *bool    `json:"receiveResumable,omitempty"`
+	IncludeSnaps     []string `json:"includeSnaps,omitempty"`
+	ExcludeSnaps     []string `json:"excludeSnaps,omitempty"`
 }
 
-type ReceiveSpec struct {
-	ReceiveUnmounted *bool `json:"receiveUnmounted,omitempty"`
-	Resumable        *bool `json:"resumable,omitempty"`
+type ZFSReplicationRunSpec struct {
+	Source  DatasetRef  `json:"source"`
+	Target  DatasetRef  `json:"target"`
+	Syncoid SyncoidSpec `json:"syncoid,omitempty"`
 }
 
-type ZFSReplicationSpec struct {
-	RunID          string        `json:"runID,omitempty"`
-	Source         DatasetRef    `json:"source"`
-	Target         DatasetRef    `json:"target"`
-	SnapshotPrefix string        `json:"snapshotPrefix,omitempty"`
-	Bootstrap      BootstrapSpec `json:"bootstrap,omitempty"`
-	Receive        ReceiveSpec   `json:"receive,omitempty"`
-}
-
-type ZFSReplicationStatus struct {
-	Phase                      Phase        `json:"phase,omitempty"`
-	ObservedRunID              string       `json:"observedRunID,omitempty"`
-	ObservedSpecHash           string       `json:"observedSpecHash,omitempty"`
-	LastAttemptedRunID         string       `json:"lastAttemptedRunID,omitempty"`
-	LastSuccessfulRunID        string       `json:"lastSuccessfulRunID,omitempty"`
-	LastSuccessfulSnapshot     string       `json:"lastSuccessfulSnapshot,omitempty"`
-	LastSuccessfulSnapshotGUID string       `json:"lastSuccessfulSnapshotGUID,omitempty"`
-	SenderJobName              string       `json:"senderJobName,omitempty"`
-	ReceiverJobName            string       `json:"receiverJobName,omitempty"`
-	ReceiverPodName            string       `json:"receiverPodName,omitempty"`
-	ReceiverPodIP              string       `json:"receiverPodIP,omitempty"`
-	SSHSecretName              string       `json:"sshSecretName,omitempty"`
-	StartedAt                  *metav1.Time `json:"startedAt,omitempty"`
-	CompletedAt                *metav1.Time `json:"completedAt,omitempty"`
-	LastError                  string       `json:"lastError,omitempty"`
+type ZFSReplicationRunStatus struct {
+	Phase           Phase        `json:"phase,omitempty"`
+	SenderJobName   string       `json:"senderJobName,omitempty"`
+	ReceiverJobName string       `json:"receiverJobName,omitempty"`
+	ReceiverPodName string       `json:"receiverPodName,omitempty"`
+	ReceiverPodIP   string       `json:"receiverPodIP,omitempty"`
+	SSHSecretName   string       `json:"sshSecretName,omitempty"`
+	StartedAt       *metav1.Time `json:"startedAt,omitempty"`
+	CompletedAt     *metav1.Time `json:"completedAt,omitempty"`
+	LastError       string       `json:"lastError,omitempty"`
 }
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
-type ZFSReplication struct {
+type ZFSReplicationRun struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
 
-	Spec   ZFSReplicationSpec   `json:"spec,omitempty"`
-	Status ZFSReplicationStatus `json:"status,omitempty"`
+	Spec   ZFSReplicationRunSpec   `json:"spec,omitempty"`
+	Status ZFSReplicationRunStatus `json:"status,omitempty"`
 }
 
 // +kubebuilder:object:root=true
-type ZFSReplicationList struct {
+type ZFSReplicationRunList struct {
 	metav1.TypeMeta `json:",inline"`
 	metav1.ListMeta `json:"metadata,omitempty"`
-	Items           []ZFSReplication `json:"items"`
+	Items           []ZFSReplicationRun `json:"items"`
+}
+
+type ConcurrencyPolicy string
+
+const (
+	ConcurrencyPolicyAllow  ConcurrencyPolicy = "Allow"
+	ConcurrencyPolicyForbid ConcurrencyPolicy = "Forbid"
+)
+
+type ZFSReplicationScheduleSpec struct {
+	Schedule          string                `json:"schedule"`
+	Suspend           *bool                 `json:"suspend,omitempty"`
+	ConcurrencyPolicy ConcurrencyPolicy     `json:"concurrencyPolicy,omitempty"`
+	RunTemplate       ZFSReplicationRunSpec `json:"runTemplate"`
+}
+
+type ZFSReplicationScheduleStatus struct {
+	LastScheduleTime *metav1.Time `json:"lastScheduleTime,omitempty"`
+	LastRunName      string       `json:"lastRunName,omitempty"`
+	LastError        string       `json:"lastError,omitempty"`
+}
+
+// +kubebuilder:object:root=true
+// +kubebuilder:subresource:status
+type ZFSReplicationSchedule struct {
+	metav1.TypeMeta   `json:",inline"`
+	metav1.ObjectMeta `json:"metadata,omitempty"`
+
+	Spec   ZFSReplicationScheduleSpec   `json:"spec,omitempty"`
+	Status ZFSReplicationScheduleStatus `json:"status,omitempty"`
+}
+
+// +kubebuilder:object:root=true
+type ZFSReplicationScheduleList struct {
+	metav1.TypeMeta `json:",inline"`
+	metav1.ListMeta `json:"metadata,omitempty"`
+	Items           []ZFSReplicationSchedule `json:"items"`
 }

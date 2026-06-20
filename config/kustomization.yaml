@@ -1,6 +1,7 @@
 resources:
   - manager/namespace.yaml
-  - crd/zfsreplication.example.com_zfsreplications.yaml
+  - crd/zfsreplication.example.com_zfsreplicationruns.yaml
+  - crd/zfsreplication.example.com_zfsreplicationschedules.yaml
   - rbac/service_account.yaml
   - rbac/role.yaml
   - rbac/role_binding.yaml
