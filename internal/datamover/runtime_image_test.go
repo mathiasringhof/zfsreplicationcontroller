@@ -25,6 +25,14 @@ func TestRuntimeImagePinsSyncoid230(t *testing.T) {
 			t.Fatalf("Dockerfile missing %q", want)
 		}
 	}
+	for _, old := range []string{
+		"cmd/zfsrep-receiver",
+		"zfsrep-receiver",
+	} {
+		if strings.Contains(dockerfile, old) {
+			t.Fatalf("Dockerfile still references old HTTP receiver %q", old)
+		}
+	}
 	if strings.Contains(dockerfile, " zfsutils-linux sanoid ") {
 		t.Fatalf("Dockerfile still installs distro sanoid package")
 	}

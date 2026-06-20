@@ -71,12 +71,6 @@ func TestReconcileSenderJobUsesSyncoidSSHReceiverEnv(t *testing.T) {
 	if got := envValue(sender, "RECEIVE_RESUMABLE"); got != "true" {
 		t.Fatalf("RECEIVE_RESUMABLE = %q", got)
 	}
-	if got := envValue(sender, "RECEIVER_URL"); got != "" {
-		t.Fatalf("RECEIVER_URL = %q, want empty for syncoid replication", got)
-	}
-	if got := envValue(sender, "TOKEN_FILE"); got != "" {
-		t.Fatalf("TOKEN_FILE = %q, want empty for syncoid replication", got)
-	}
 	assertHasSecretMount(t, sender, "zfsrep-rep-manual-1-ssh")
 	var got zfsv1.ZFSReplication
 	if err := r.Get(context.Background(), types.NamespacedName{Name: "rep", Namespace: "storage"}, &got); err != nil {
@@ -118,7 +112,7 @@ func TestReconcileSucceededUpdatesStatus(t *testing.T) {
 	if got.Status.Phase != zfsv1.PhaseSucceeded || got.Status.LastSuccessfulRunID != "manual-1" {
 		t.Fatalf("status = %#v", got.Status)
 	}
-	if got.Status.ReceiverJobName != "zfsrep-rep-manual-1-receiver" || got.Status.ReceiverPodName != "receiver-pod" || got.Status.ReceiverPodIP != "10.0.0.42" || got.Status.TokenSecretName != "zfsrep-rep-manual-1-ssh" {
+	if got.Status.ReceiverJobName != "zfsrep-rep-manual-1-receiver" || got.Status.ReceiverPodName != "receiver-pod" || got.Status.ReceiverPodIP != "10.0.0.42" || got.Status.SSHSecretName != "zfsrep-rep-manual-1-ssh" {
 		t.Fatalf("receiver/ssh status missing: %#v", got.Status)
 	}
 	assertMissing[*batchv1.Job](t, r.Client, "zfsrep-rep-manual-1-receiver")
@@ -139,27 +133,6 @@ func TestReconcileSucceededStoresSnapshotGUIDFromSenderLogs(t *testing.T) {
 	if got.Status.LastSuccessfulSnapshotGUID != "guid-123" {
 		t.Fatalf("LastSuccessfulSnapshotGUID = %q, want guid-123", got.Status.LastSuccessfulSnapshotGUID)
 	}
-}
-
-func TestDataMoverJobsIncludeSimulatorStateWhenConfigured(t *testing.T) {
-	rep := replication("manual-1")
-	rep.Annotations = map[string]string{
-		labelPrefix + "/sim-env-ZFS_SIM_FAIL_SEND": "1",
-	}
-	r := newReconciler(t, rep, receiverPod(rep, "10.0.0.42"))
-	r.SimulatorStateHostPath = "/var/lib/zfs-sim"
-	if _, err := r.Reconcile(context.Background(), request("rep")); err != nil {
-		t.Fatal(err)
-	}
-	sender := getJob(t, r.Client, "zfsrep-rep-manual-1-sender")
-	if got := envValue(sender, "ZFS_SIM_ROOT"); got != "/var/lib/zfs-sim" {
-		t.Fatalf("ZFS_SIM_ROOT = %q", got)
-	}
-	if got := envValue(sender, "ZFS_SIM_FAIL_SEND"); got != "1" {
-		t.Fatalf("ZFS_SIM_FAIL_SEND = %q", got)
-	}
-	assertHasVolume(t, sender, "zfs-sim", "/var/lib/zfs-sim")
-	assertHasVolumeMount(t, sender, "zfs-sim", "/var/lib/zfs-sim")
 }
 
 func TestReconcileSenderFailedDoesNotUpdateSuccess(t *testing.T) {
@@ -394,26 +367,6 @@ func assertJobPlacement(t *testing.T, job *batchv1.Job, nodeName string) {
 	if !foundActual {
 		t.Fatalf("%s ACTUAL_NODE_NAME downward API env missing", job.Name)
 	}
-}
-
-func assertHasVolume(t *testing.T, job *batchv1.Job, name, path string) {
-	t.Helper()
-	for _, volume := range job.Spec.Template.Spec.Volumes {
-		if volume.Name == name && volume.HostPath != nil && volume.HostPath.Path == path {
-			return
-		}
-	}
-	t.Fatalf("%s volume %s with hostPath %s missing: %#v", job.Name, name, path, job.Spec.Template.Spec.Volumes)
-}
-
-func assertHasVolumeMount(t *testing.T, job *batchv1.Job, name, path string) {
-	t.Helper()
-	for _, mount := range job.Spec.Template.Spec.Containers[0].VolumeMounts {
-		if mount.Name == name && mount.MountPath == path {
-			return
-		}
-	}
-	t.Fatalf("%s volumeMount %s at %s missing: %#v", job.Name, name, path, job.Spec.Template.Spec.Containers[0].VolumeMounts)
 }
 
 func assertHasSecretMount(t *testing.T, job *batchv1.Job, secretName string) {

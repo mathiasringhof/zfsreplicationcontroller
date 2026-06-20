@@ -586,7 +586,7 @@ type replicationStatus struct {
 	ReceiverJobName            string `json:"receiverJobName"`
 	ReceiverPodName            string `json:"receiverPodName"`
 	ReceiverPodIP              string `json:"receiverPodIP"`
-	TokenSecretName            string `json:"tokenSecretName"`
+	SSHSecretName              string `json:"sshSecretName"`
 	StartedAt                  string `json:"startedAt"`
 	CompletedAt                string `json:"completedAt"`
 	LastError                  string `json:"lastError"`
@@ -638,7 +638,7 @@ func assertSucceededStatus(t *testing.T, sc replicationCase, st replicationStatu
 	if st.SenderJobName == "" {
 		t.Fatalf("status object names missing: %#v", st)
 	}
-	if st.ReceiverJobName == "" || st.ReceiverPodName == "" || st.ReceiverPodIP == "" || st.TokenSecretName == "" {
+	if st.ReceiverJobName == "" || st.ReceiverPodName == "" || st.ReceiverPodIP == "" || st.SSHSecretName == "" {
 		t.Fatalf("receiver/ssh status names missing: %#v", st)
 	}
 	if st.StartedAt == "" || st.CompletedAt == "" {

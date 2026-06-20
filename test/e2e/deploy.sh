@@ -11,7 +11,6 @@ kubectl_cmd apply -k "${REPO_ROOT}/config"
 log "using image ${IMAGE_TAG}"
 kubectl_cmd -n zfsreplication-system set image deployment/zfsreplication-controller "manager=${IMAGE_TAG}"
 kubectl_cmd -n zfsreplication-system set env deployment/zfsreplication-controller "DATA_MOVER_IMAGE=${IMAGE_TAG}"
-kubectl_cmd -n zfsreplication-system set env deployment/zfsreplication-controller "ZFS_SIMULATOR_STATE_HOSTPATH-"
 kubectl_cmd -n zfsreplication-system rollout restart deployment/zfsreplication-controller
 
 log "waiting for controller rollout"

@@ -77,7 +77,7 @@ status:
   receiverPodName: zfsrep-pg-a-to-b-manual-0002-receiver-k9r5w
   receiverPodIP: 10.42.3.12
   senderJobName: zfsrep-pg-a-to-b-manual-0002-sender
-  tokenSecretName: zfsrep-pg-a-to-b-manual-0002-ssh
+  sshSecretName: zfsrep-pg-a-to-b-manual-0002-ssh
 ```
 
 ## Operational Warnings

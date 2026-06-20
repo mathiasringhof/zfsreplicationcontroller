@@ -3,7 +3,6 @@ package datamover
 import (
 	"context"
 	"fmt"
-	"net/http"
 	"os"
 	"regexp"
 	"strings"
@@ -21,8 +20,6 @@ type SenderConfig struct {
 	SSHKeyFile       string
 	SSHPort          string
 	BaseSnapshot     string
-	ReceiverURL      string
-	TokenFile        string
 	BootstrapMode    string
 	ReceiveUnmounted bool
 	ReceiveResumable bool
@@ -41,8 +38,6 @@ func SenderConfigFromEnv() SenderConfig {
 		SSHKeyFile:       os.Getenv("SSH_KEY_FILE"),
 		SSHPort:          os.Getenv("SSH_PORT"),
 		BaseSnapshot:     os.Getenv("BASE_SNAPSHOT"),
-		ReceiverURL:      os.Getenv("RECEIVER_URL"),
-		TokenFile:        os.Getenv("TOKEN_FILE"),
 		BootstrapMode:    os.Getenv("BOOTSTRAP_MODE"),
 		ReceiveUnmounted: getenv("RECEIVE_UNMOUNTED", "true") == "true",
 		ReceiveResumable: getenv("RECEIVE_RESUMABLE", "true") == "true",
@@ -51,7 +46,7 @@ func SenderConfigFromEnv() SenderConfig {
 	}
 }
 
-func RunSender(ctx context.Context, cfg SenderConfig, r CommandRunner, _ *http.Client) (guid string, err error) {
+func RunSender(ctx context.Context, cfg SenderConfig, r CommandRunner) (guid string, err error) {
 	if err := validateNode(cfg.ExpectedNode, cfg.ActualNode); err != nil {
 		return "", err
 	}

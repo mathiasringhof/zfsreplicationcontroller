@@ -113,7 +113,7 @@ spec:
                   type: string
                 receiverPodIP:
                   type: string
-                tokenSecretName:
+                sshSecretName:
                   type: string
                 startedAt:
                   type: string

@@ -19,11 +19,10 @@ import (
 )
 
 func main() {
-	var metricsAddr, probeAddr, image, simulatorStateHostPath string
+	var metricsAddr, probeAddr, image string
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "metrics bind address")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "probe bind address")
-	flag.StringVar(&image, "datamover-image", os.Getenv("DATA_MOVER_IMAGE"), "sender/receiver image")
-	flag.StringVar(&simulatorStateHostPath, "simulator-state-hostpath", os.Getenv("ZFS_SIMULATOR_STATE_HOSTPATH"), "optional host path mounted into datamover pods as ZFS_SIM_ROOT")
+	flag.StringVar(&image, "datamover-image", os.Getenv("DATA_MOVER_IMAGE"), "datamover image")
 	flag.Parse()
 
 	scheme := runtime.NewScheme()
@@ -47,12 +46,11 @@ func main() {
 		panic(err)
 	}
 	reconciler := &controller.ZFSReplicationReconciler{
-		Client:                 mgr.GetClient(),
-		APIReader:              mgr.GetAPIReader(),
-		Scheme:                 scheme,
-		DataMoverImage:         image,
-		PodLogs:                controller.KubernetesPodLogReader{Client: clientset},
-		SimulatorStateHostPath: simulatorStateHostPath,
+		Client:         mgr.GetClient(),
+		APIReader:      mgr.GetAPIReader(),
+		Scheme:         scheme,
+		DataMoverImage: image,
+		PodLogs:        controller.KubernetesPodLogReader{Client: clientset},
 	}
 	if err := reconciler.SetupWithManager(mgr); err != nil {
 		panic(err)

@@ -3,7 +3,6 @@ package controller
 import (
 	"fmt"
 	"strconv"
-	"strings"
 
 	zfsv1 "github.com/mathias/zfsreplicationcontroller/api/v1alpha1"
 	batchv1 "k8s.io/api/batch/v1"
@@ -55,7 +54,7 @@ func sshSecret(rep *zfsv1.ZFSReplication, names runObjects, key sshKeyMaterial) 
 	}
 }
 
-func receiverJob(rep *zfsv1.ZFSReplication, names runObjects, image, simulatorStateHostPath string) *batchv1.Job {
+func receiverJob(rep *zfsv1.ZFSReplication, names runObjects, image string) *batchv1.Job {
 	labels := cloneLabels(names.Labels)
 	labels[labelPrefix+"/role"] = "receiver"
 	env := []corev1.EnvVar{
@@ -64,10 +63,10 @@ func receiverJob(rep *zfsv1.ZFSReplication, names runObjects, image, simulatorSt
 		{Name: "SSH_AUTHORIZED_KEYS_FILE", Value: "/var/run/zfsrep/ssh/authorized_keys"},
 		{Name: "SSH_LISTEN_PORT", Value: "2222"},
 	}
-	return dataMoverJob(rep, names.ReceiverName, image, labels, rep.Spec.Target.NodeName, "/usr/local/bin/zfsrep-ssh-receiver", env, names.SecretName, true, simulatorStateHostPath)
+	return dataMoverJob(rep, names.ReceiverName, image, labels, rep.Spec.Target.NodeName, "/usr/local/bin/zfsrep-ssh-receiver", env, names.SecretName, true)
 }
 
-func senderJob(rep *zfsv1.ZFSReplication, names runObjects, image, receiverPodIP, simulatorStateHostPath string) *batchv1.Job {
+func senderJob(rep *zfsv1.ZFSReplication, names runObjects, image, receiverPodIP string) *batchv1.Job {
 	labels := cloneLabels(names.Labels)
 	labels[labelPrefix+"/role"] = "sender"
 	env := []corev1.EnvVar{
@@ -85,10 +84,10 @@ func senderJob(rep *zfsv1.ZFSReplication, names runObjects, image, receiverPodIP
 		{Name: "RECEIVE_UNMOUNTED", Value: strconv.FormatBool(boolDefault(rep.Spec.Receive.ReceiveUnmounted, true))},
 		{Name: "RECEIVE_RESUMABLE", Value: strconv.FormatBool(boolDefault(rep.Spec.Receive.Resumable, true))},
 	}
-	return dataMoverJob(rep, names.SenderName, image, labels, rep.Spec.Source.NodeName, "/usr/local/bin/zfsrep-sender", env, names.SecretName, false, simulatorStateHostPath)
+	return dataMoverJob(rep, names.SenderName, image, labels, rep.Spec.Source.NodeName, "/usr/local/bin/zfsrep-sender", env, names.SecretName, false)
 }
 
-func dataMoverJob(rep *zfsv1.ZFSReplication, name, image string, labels map[string]string, nodeName, command string, env []corev1.EnvVar, secretName string, readiness bool, simulatorStateHostPath string) *batchv1.Job {
+func dataMoverJob(rep *zfsv1.ZFSReplication, name, image string, labels map[string]string, nodeName, command string, env []corev1.EnvVar, secretName string, readiness bool) *batchv1.Job {
 	backoffLimit := int32(0)
 	ttl := int32(86400)
 	privileged := true
@@ -121,15 +120,6 @@ func dataMoverJob(rep *zfsv1.ZFSReplication, name, image string, labels map[stri
 		container.VolumeMounts = append(container.VolumeMounts, corev1.VolumeMount{Name: "ssh", MountPath: "/var/run/zfsrep/ssh", ReadOnly: true})
 		volumes = append(volumes, corev1.Volume{Name: "ssh", VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: secretName, DefaultMode: &mode}}})
 	}
-	if simulatorStateHostPath != "" {
-		env = append(env, corev1.EnvVar{Name: "ZFS_SIM_ROOT", Value: simulatorStateHostPath})
-		for key, value := range simulatorEnv(rep) {
-			env = append(env, corev1.EnvVar{Name: key, Value: value})
-		}
-		container.Env = env
-		container.VolumeMounts = append(container.VolumeMounts, corev1.VolumeMount{Name: "zfs-sim", MountPath: simulatorStateHostPath})
-		volumes = append(volumes, corev1.Volume{Name: "zfs-sim", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: simulatorStateHostPath}}})
-	}
 	if readiness {
 		container.ReadinessProbe = &corev1.Probe{
 			ProbeHandler: corev1.ProbeHandler{
@@ -160,18 +150,6 @@ func cloneLabels(in map[string]string) map[string]string {
 	out := make(map[string]string, len(in))
 	for k, v := range in {
 		out[k] = v
-	}
-	return out
-}
-
-func simulatorEnv(rep *zfsv1.ZFSReplication) map[string]string {
-	const prefix = labelPrefix + "/sim-env-"
-	out := map[string]string{}
-	for key, value := range rep.Annotations {
-		name, ok := strings.CutPrefix(key, prefix)
-		if ok && name != "" {
-			out[name] = value
-		}
 	}
 	return out
 }

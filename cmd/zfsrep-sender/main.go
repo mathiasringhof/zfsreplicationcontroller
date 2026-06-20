@@ -9,7 +9,7 @@ import (
 )
 
 func main() {
-	guid, err := datamover.RunSender(context.Background(), datamover.SenderConfigFromEnv(), datamover.ExecRunner{}, nil)
+	guid, err := datamover.RunSender(context.Background(), datamover.SenderConfigFromEnv(), datamover.ExecRunner{})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)

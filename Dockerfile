@@ -5,7 +5,6 @@ RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 go build -o /out/manager ./cmd/manager
 RUN CGO_ENABLED=0 go build -o /out/zfsrep-sender ./cmd/zfsrep-sender
-RUN CGO_ENABLED=0 go build -o /out/zfsrep-receiver ./cmd/zfsrep-receiver
 
 FROM ubuntu:24.04
 ARG SANOID_VERSION=2.3.0
@@ -30,7 +29,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 	&& rm -rf /tmp/sanoid.tar.gz "/tmp/sanoid-${SANOID_VERSION}" /var/lib/apt/lists/*
 COPY --from=build /out/manager /usr/local/bin/manager
 COPY --from=build /out/zfsrep-sender /usr/local/bin/zfsrep-sender
-COPY --from=build /out/zfsrep-receiver /usr/local/bin/zfsrep-receiver
 COPY hack/zfsrep-ssh-receiver /usr/local/bin/zfsrep-ssh-receiver
 RUN chmod +x /usr/local/bin/zfsrep-ssh-receiver
 ENTRYPOINT ["/usr/local/bin/manager"]

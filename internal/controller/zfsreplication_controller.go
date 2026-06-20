@@ -20,11 +20,10 @@ import (
 
 type ZFSReplicationReconciler struct {
 	client.Client
-	APIReader              client.Reader
-	Scheme                 *runtime.Scheme
-	DataMoverImage         string
-	PodLogs                PodLogReader
-	SimulatorStateHostPath string
+	APIReader      client.Reader
+	Scheme         *runtime.Scheme
+	DataMoverImage string
+	PodLogs        PodLogReader
 }
 
 func (r *ZFSReplicationReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -199,11 +198,11 @@ func (r *ZFSReplicationReconciler) ensureSecret(ctx context.Context, rep *zfsv1.
 }
 
 func (r *ZFSReplicationReconciler) ensureReceiverJob(ctx context.Context, rep *zfsv1.ZFSReplication, names runObjects) error {
-	return r.ensureJob(ctx, rep, receiverJob(rep, names, r.image(), r.SimulatorStateHostPath))
+	return r.ensureJob(ctx, rep, receiverJob(rep, names, r.image()))
 }
 
 func (r *ZFSReplicationReconciler) ensureSenderJob(ctx context.Context, rep *zfsv1.ZFSReplication, names runObjects, receiverPodIP string) error {
-	return r.ensureJob(ctx, rep, senderJob(rep, names, r.image(), receiverPodIP, r.SimulatorStateHostPath))
+	return r.ensureJob(ctx, rep, senderJob(rep, names, r.image(), receiverPodIP))
 }
 
 func (r *ZFSReplicationReconciler) ensureJob(ctx context.Context, rep *zfsv1.ZFSReplication, job *batchv1.Job) error {
@@ -434,5 +433,5 @@ func fillStatusNames(st *zfsv1.ZFSReplicationStatus, rep *zfsv1.ZFSReplication, 
 	}
 	st.SenderJobName = names.SenderName
 	st.ReceiverJobName = names.ReceiverName
-	st.TokenSecretName = names.SecretName
+	st.SSHSecretName = names.SecretName
 }
