@@ -13,6 +13,8 @@ import (
 
 const labelPrefix = "zfsreplication.example.com"
 
+const specHashAnnotation = labelPrefix + "/spec-hash"
+
 type runObjects struct {
 	BaseName     string
 	RunName      string
@@ -20,6 +22,7 @@ type runObjects struct {
 	SecretName   string
 	ReceiverName string
 	SenderName   string
+	SpecHash     string
 	Labels       map[string]string
 }
 
@@ -33,9 +36,10 @@ func objectNames(rep *zfsv1.ZFSReplication) runObjects {
 		BaseName:     baseName(rep.Name),
 		RunName:      rn,
 		SnapshotName: snapshotPrefix(rep.Spec.SnapshotPrefix) + "-" + rep.Spec.RunID,
-		SecretName:   sanitizeName(rn, "ssh"),
-		ReceiverName: sanitizeName(rn, "receiver"),
-		SenderName:   sanitizeName(rn, "sender"),
+		SecretName:   sanitizeName("zfsrep", rep.Name, rep.Spec.RunID, "ssh"),
+		ReceiverName: sanitizeName("zfsrep", rep.Name, rep.Spec.RunID, "receiver"),
+		SenderName:   sanitizeName("zfsrep", rep.Name, rep.Spec.RunID, "sender"),
+		SpecHash:     replicationSpecHash(rep.Spec),
 		Labels:       labels,
 	}
 }
@@ -44,8 +48,13 @@ func sshSecret(rep *zfsv1.ZFSReplication, names runObjects, key sshKeyMaterial) 
 	labels := cloneLabels(names.Labels)
 	labels[labelPrefix+"/role"] = "ssh"
 	return &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: names.SecretName, Namespace: rep.Namespace, Labels: labels},
-		Type:       corev1.SecretTypeOpaque,
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        names.SecretName,
+			Namespace:   rep.Namespace,
+			Labels:      labels,
+			Annotations: map[string]string{specHashAnnotation: names.SpecHash},
+		},
+		Type: corev1.SecretTypeOpaque,
 		Data: map[string][]byte{
 			"id_rsa":          key.PrivateKeyPEM,
 			"id_rsa.pub":      key.PublicKey,
@@ -63,7 +72,7 @@ func receiverJob(rep *zfsv1.ZFSReplication, names runObjects, image string) *bat
 		{Name: "SSH_AUTHORIZED_KEYS_FILE", Value: "/var/run/zfsrep/ssh/authorized_keys"},
 		{Name: "SSH_LISTEN_PORT", Value: "2222"},
 	}
-	return dataMoverJob(rep, names.ReceiverName, image, labels, rep.Spec.Target.NodeName, "/usr/local/bin/zfsrep-ssh-receiver", env, names.SecretName, true)
+	return dataMoverJob(rep, names.ReceiverName, image, labels, names.SpecHash, rep.Spec.Target.NodeName, "/usr/local/bin/zfsrep-ssh-receiver", env, names.SecretName, true)
 }
 
 func senderJob(rep *zfsv1.ZFSReplication, names runObjects, image, receiverPodIP string) *batchv1.Job {
@@ -84,10 +93,10 @@ func senderJob(rep *zfsv1.ZFSReplication, names runObjects, image, receiverPodIP
 		{Name: "RECEIVE_UNMOUNTED", Value: strconv.FormatBool(boolDefault(rep.Spec.Receive.ReceiveUnmounted, true))},
 		{Name: "RECEIVE_RESUMABLE", Value: strconv.FormatBool(boolDefault(rep.Spec.Receive.Resumable, true))},
 	}
-	return dataMoverJob(rep, names.SenderName, image, labels, rep.Spec.Source.NodeName, "/usr/local/bin/zfsrep-sender", env, names.SecretName, false)
+	return dataMoverJob(rep, names.SenderName, image, labels, names.SpecHash, rep.Spec.Source.NodeName, "/usr/local/bin/zfsrep-sender", env, names.SecretName, false)
 }
 
-func dataMoverJob(rep *zfsv1.ZFSReplication, name, image string, labels map[string]string, nodeName, command string, env []corev1.EnvVar, secretName string, readiness bool) *batchv1.Job {
+func dataMoverJob(rep *zfsv1.ZFSReplication, name, image string, labels map[string]string, specHash, nodeName, command string, env []corev1.EnvVar, secretName string, readiness bool) *batchv1.Job {
 	backoffLimit := int32(0)
 	ttl := int32(86400)
 	privileged := true
@@ -128,7 +137,12 @@ func dataMoverJob(rep *zfsv1.ZFSReplication, name, image string, labels map[stri
 		}
 	}
 	return &batchv1.Job{
-		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: rep.Namespace, Labels: labels},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        name,
+			Namespace:   rep.Namespace,
+			Labels:      labels,
+			Annotations: map[string]string{specHashAnnotation: specHash},
+		},
 		Spec: batchv1.JobSpec{
 			BackoffLimit:            &backoffLimit,
 			TTLSecondsAfterFinished: &ttl,

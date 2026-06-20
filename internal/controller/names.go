@@ -1,14 +1,19 @@
 package controller
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"regexp"
 	"strings"
 )
 
 var invalidDNSLabel = regexp.MustCompile(`[^a-z0-9-]+`)
 
+const dnsLabelMaxLength = 63
+
 func sanitizeName(parts ...string) string {
-	name := strings.ToLower(strings.Join(parts, "-"))
+	raw := strings.ToLower(strings.Join(parts, "-"))
+	name := raw
 	name = invalidDNSLabel.ReplaceAllString(name, "-")
 	name = strings.Trim(name, "-")
 	for strings.Contains(name, "--") {
@@ -17,8 +22,15 @@ func sanitizeName(parts ...string) string {
 	if name == "" {
 		name = "zfsrep"
 	}
-	if len(name) > 63 {
-		name = strings.Trim(name[:63], "-")
+	if len(name) > dnsLabelMaxLength {
+		sum := sha256.Sum256([]byte(raw))
+		suffix := hex.EncodeToString(sum[:])[:10]
+		prefixLength := dnsLabelMaxLength - len(suffix) - 1
+		prefix := strings.Trim(name[:prefixLength], "-")
+		if prefix == "" {
+			prefix = "zfsrep"
+		}
+		name = prefix + "-" + suffix
 	}
 	return name
 }

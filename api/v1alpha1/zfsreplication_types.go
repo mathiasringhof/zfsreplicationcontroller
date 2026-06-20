@@ -44,6 +44,7 @@ type ZFSReplicationSpec struct {
 type ZFSReplicationStatus struct {
 	Phase                      Phase        `json:"phase,omitempty"`
 	ObservedRunID              string       `json:"observedRunID,omitempty"`
+	ObservedSpecHash           string       `json:"observedSpecHash,omitempty"`
 	LastAttemptedRunID         string       `json:"lastAttemptedRunID,omitempty"`
 	LastSuccessfulRunID        string       `json:"lastSuccessfulRunID,omitempty"`
 	LastSuccessfulSnapshot     string       `json:"lastSuccessfulSnapshot,omitempty"`

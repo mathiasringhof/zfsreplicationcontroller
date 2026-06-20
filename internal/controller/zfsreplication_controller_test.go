@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -71,6 +72,9 @@ func TestReconcileSenderJobUsesSyncoidSSHReceiverEnv(t *testing.T) {
 	if got := envValue(sender, "RECEIVE_RESUMABLE"); got != "true" {
 		t.Fatalf("RECEIVE_RESUMABLE = %q", got)
 	}
+	if got := sender.Annotations[specHashAnnotation]; got == "" {
+		t.Fatalf("%s annotation is empty", specHashAnnotation)
+	}
 	assertHasSecretMount(t, sender, "zfsrep-rep-manual-1-ssh")
 	var got zfsv1.ZFSReplication
 	if err := r.Get(context.Background(), types.NamespacedName{Name: "rep", Namespace: "storage"}, &got); err != nil {
@@ -79,6 +83,19 @@ func TestReconcileSenderJobUsesSyncoidSSHReceiverEnv(t *testing.T) {
 	if got.Status.ReceiverPodName != "receiver-pod" || got.Status.ReceiverPodIP != "10.0.0.42" {
 		t.Fatalf("receiver pod status = name %q ip %q", got.Status.ReceiverPodName, got.Status.ReceiverPodIP)
 	}
+}
+
+func TestReconcileExistingJobForDifferentSpecReturnsError(t *testing.T) {
+	rep := replication("manual-1")
+	names := objectNames(rep)
+	receiver := receiverJob(rep, names, "datamover:test")
+	receiver.Annotations[specHashAnnotation] = "other-spec"
+	r := newReconciler(t, rep, receiver)
+	_, err := r.Reconcile(context.Background(), request("rep"))
+	if err == nil || !strings.Contains(err.Error(), "different spec") {
+		t.Fatalf("error = %v", err)
+	}
+	assertMissing[*batchv1.Job](t, r.Client, "zfsrep-rep-manual-1-sender")
 }
 
 func TestDataMoverJobsUseRequestedNodesAndNoRestarts(t *testing.T) {
@@ -180,6 +197,28 @@ func TestReconcileAlreadySucceededStartsNothing(t *testing.T) {
 	assertMissing[*corev1.Secret](t, r.Client, "zfsrep-rep-manual-1-ssh")
 }
 
+func TestReconcileSameRunIDWithChangedSpecFailsBeforeStartingWork(t *testing.T) {
+	rep := replication("manual-1")
+	rep.Status.Phase = zfsv1.PhaseSucceeded
+	rep.Status.ObservedRunID = "manual-1"
+	rep.Status.ObservedSpecHash = "old-spec"
+	rep.Status.LastSuccessfulRunID = "manual-1"
+	rep.Spec.Target.Dataset = "tank/changed"
+	r := newReconciler(t, rep)
+	if _, err := r.Reconcile(context.Background(), request("rep")); err != nil {
+		t.Fatal(err)
+	}
+	var got zfsv1.ZFSReplication
+	if err := r.Get(context.Background(), types.NamespacedName{Name: "rep", Namespace: "storage"}, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Status.Phase != zfsv1.PhaseFailed || !strings.Contains(got.Status.LastError, "spec changed for runID") {
+		t.Fatalf("status = %#v", got.Status)
+	}
+	assertMissing[*corev1.Secret](t, r.Client, "zfsrep-rep-manual-1-ssh")
+	assertMissing[*batchv1.Job](t, r.Client, "zfsrep-rep-manual-1-receiver")
+}
+
 func TestReconcileAlreadyFailedStartsNothing(t *testing.T) {
 	rep := replication("manual-1")
 	rep.Status.Phase = zfsv1.PhaseFailed
@@ -190,6 +229,24 @@ func TestReconcileAlreadyFailedStartsNothing(t *testing.T) {
 	}
 	assertMissing[*batchv1.Job](t, r.Client, "zfsrep-rep-manual-1-receiver")
 	assertMissing[*corev1.Secret](t, r.Client, "zfsrep-rep-manual-1-ssh")
+}
+
+func TestReconcileInvalidRunIDFailsBeforeStartingWork(t *testing.T) {
+	rep := replication("bad/run")
+	r := newReconciler(t, rep)
+	if _, err := r.Reconcile(context.Background(), request("rep")); err != nil {
+		t.Fatal(err)
+	}
+	var got zfsv1.ZFSReplication
+	if err := r.Get(context.Background(), types.NamespacedName{Name: "rep", Namespace: "storage"}, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Status.Phase != zfsv1.PhaseFailed || !strings.Contains(got.Status.LastError, "spec.runID") {
+		t.Fatalf("status = %#v", got.Status)
+	}
+	assertMissing[*coordinationv1.Lease](t, r.Client, "zfsrep-rep")
+	assertMissing[*corev1.Secret](t, r.Client, "zfsrep-rep-bad-run-ssh")
+	assertMissing[*batchv1.Job](t, r.Client, "zfsrep-rep-bad-run-receiver")
 }
 
 func TestReconcileActiveLeaseHeldByDifferentRunBlocksNewRun(t *testing.T) {
@@ -204,6 +261,17 @@ func TestReconcileActiveLeaseHeldByDifferentRunBlocksNewRun(t *testing.T) {
 	}
 	assertMissing[*corev1.Secret](t, r.Client, "zfsrep-rep-manual-2-ssh")
 	assertMissing[*batchv1.Job](t, r.Client, "zfsrep-rep-manual-2-receiver")
+	assertMissing[*batchv1.Job](t, r.Client, "zfsrep-rep-manual-2-sender")
+}
+
+func TestReconcileExpiredActiveLeaseCanBeReusedByNewRun(t *testing.T) {
+	rep := replication("manual-2")
+	r := newReconciler(t, rep, expiredLease("zfsrep-rep", "manual-1"))
+	if _, err := r.Reconcile(context.Background(), request("rep")); err != nil {
+		t.Fatal(err)
+	}
+	assertExists[*corev1.Secret](t, r.Client, "zfsrep-rep-manual-2-ssh")
+	assertExists[*batchv1.Job](t, r.Client, "zfsrep-rep-manual-2-receiver")
 	assertMissing[*batchv1.Job](t, r.Client, "zfsrep-rep-manual-2-sender")
 }
 
@@ -237,6 +305,43 @@ func TestReconcileNonActiveLeaseCanBeReusedByNewRun(t *testing.T) {
 				t.Fatalf("lease state = %q, want active", got.Annotations[leaseStateAnnotation])
 			}
 		})
+	}
+}
+
+func TestReconcileCreatesOwnedLease(t *testing.T) {
+	rep := replication("manual-1")
+	r := newReconciler(t, rep)
+	if _, err := r.Reconcile(context.Background(), request("rep")); err != nil {
+		t.Fatal(err)
+	}
+	var got coordinationv1.Lease
+	if err := r.Get(context.Background(), types.NamespacedName{Name: "zfsrep-rep", Namespace: "storage"}, &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.OwnerReferences) != 1 || got.OwnerReferences[0].Name != "rep" {
+		t.Fatalf("ownerReferences = %#v", got.OwnerReferences)
+	}
+}
+
+func TestObjectNamesAvoidCollisionsWhenTruncated(t *testing.T) {
+	left := replication("manual-1")
+	left.Name = "rep-" + strings.Repeat("a", 70) + "x"
+	right := replication("manual-1")
+	right.Name = "rep-" + strings.Repeat("a", 70) + "y"
+
+	leftNames := objectNames(left)
+	rightNames := objectNames(right)
+
+	for _, name := range []string{leftNames.BaseName, leftNames.SecretName, leftNames.ReceiverName, leftNames.SenderName, rightNames.BaseName, rightNames.SecretName, rightNames.ReceiverName, rightNames.SenderName} {
+		if len(name) > 63 {
+			t.Fatalf("name %q has length %d, want <= 63", name, len(name))
+		}
+	}
+	if leftNames.BaseName == rightNames.BaseName {
+		t.Fatalf("base names collided: %q", leftNames.BaseName)
+	}
+	if leftNames.SecretName == leftNames.ReceiverName || leftNames.SecretName == leftNames.SenderName || leftNames.ReceiverName == leftNames.SenderName {
+		t.Fatalf("run object names collided: %#v", leftNames)
 	}
 }
 
@@ -324,6 +429,15 @@ func lease(name, holder, state string) *coordinationv1.Lease {
 		},
 		Spec: coordinationv1.LeaseSpec{HolderIdentity: &holder},
 	}
+}
+
+func expiredLease(name, holder string) *coordinationv1.Lease {
+	lease := lease(name, holder, "active")
+	old := metav1.MicroTime{Time: time.Now().Add(-2 * time.Hour)}
+	lease.Spec.AcquireTime = &old
+	lease.Spec.RenewTime = &old
+	lease.Spec.LeaseDurationSeconds = ptr(int32(60))
+	return lease
 }
 
 func getJob(t *testing.T, c client.Client, name string) *batchv1.Job {

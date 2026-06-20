@@ -48,6 +48,47 @@ func TestControllerClusterRoleHasRequiredPermissions(t *testing.T) {
 	}
 }
 
+func TestCRDSchemaConstrainsRunIdentityFields(t *testing.T) {
+	t.Helper()
+
+	crdPath := filepath.Join("..", "..", "config", "crd", "zfsreplication.example.com_zfsreplications.yaml")
+	data, err := os.ReadFile(crdPath)
+	if err != nil {
+		t.Fatalf("read %s: %v", crdPath, err)
+	}
+
+	type schemaNode struct {
+		MaxLength  int                   `yaml:"maxLength"`
+		Pattern    string                `yaml:"pattern"`
+		Properties map[string]schemaNode `yaml:"properties"`
+	}
+	var crd struct {
+		Spec struct {
+			Versions []struct {
+				Schema struct {
+					OpenAPIV3Schema schemaNode `yaml:"openAPIV3Schema"`
+				} `yaml:"schema"`
+			} `yaml:"versions"`
+		} `yaml:"spec"`
+	}
+	if err := yaml.Unmarshal(data, &crd); err != nil {
+		t.Fatalf("parse %s: %v", crdPath, err)
+	}
+	if len(crd.Spec.Versions) == 0 {
+		t.Fatalf("%s has no versions", crdPath)
+	}
+	specProps := crd.Spec.Versions[0].Schema.OpenAPIV3Schema.Properties["spec"].Properties
+
+	runID := specProps["runID"]
+	if runID.MaxLength != 40 || runID.Pattern == "" {
+		t.Fatalf("runID schema = %#v", runID)
+	}
+	snapshotPrefix := specProps["snapshotPrefix"]
+	if snapshotPrefix.MaxLength != 32 || snapshotPrefix.Pattern == "" {
+		t.Fatalf("snapshotPrefix schema = %#v", snapshotPrefix)
+	}
+}
+
 func verbsForResource(rules []struct {
 	APIGroups []string `yaml:"apiGroups"`
 	Resources []string `yaml:"resources"`

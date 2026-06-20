@@ -9,6 +9,7 @@ import (
 
 	zfsv1 "github.com/mathias/zfsreplicationcontroller/api/v1alpha1"
 	batchv1 "k8s.io/api/batch/v1"
+	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -39,18 +40,25 @@ func (r *ZFSReplicationReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 			}
 		})
 	}
-	if rep.Status.LastSuccessfulRunID == rep.Spec.RunID {
+	specHash := replicationSpecHash(rep.Spec)
+	if err := validateReplicationSpec(rep.Spec); err != nil {
+		return ctrl.Result{}, r.failValidation(ctx, &rep, specHash, err.Error())
+	}
+	if sameRunSpecChanged(&rep, specHash) {
+		return ctrl.Result{}, r.failValidation(ctx, &rep, specHash, fmt.Sprintf("spec changed for runID %q; change spec.runID to start a new run", rep.Spec.RunID))
+	}
+	if rep.Status.LastSuccessfulRunID == rep.Spec.RunID && rep.Status.Phase != zfsv1.PhaseFailed && statusSpecMatches(rep.Status.ObservedSpecHash, specHash) {
 		return ctrl.Result{}, nil
 	}
-	if rep.Status.Phase == zfsv1.PhaseFailed && rep.Status.LastAttemptedRunID == rep.Spec.RunID {
+	if rep.Status.Phase == zfsv1.PhaseFailed && rep.Status.LastAttemptedRunID == rep.Spec.RunID && statusSpecMatches(rep.Status.ObservedSpecHash, specHash) {
 		return ctrl.Result{}, nil
 	}
 	if rep.Spec.Source.Dataset == rep.Spec.Target.Dataset {
-		return ctrl.Result{}, r.fail(ctx, &rep, "source and target datasets must differ")
+		return ctrl.Result{}, r.failValidation(ctx, &rep, specHash, "source and target datasets must differ")
 	}
 
 	names := objectNames(&rep)
-	ok, err := acquireLease(ctx, r.Client, &rep, names)
+	ok, err := acquireLease(ctx, r.Client, r.Scheme, &rep, names)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -166,6 +174,7 @@ func (r *ZFSReplicationReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&zfsv1.ZFSReplication{}).
 		Owns(&batchv1.Job{}).
+		Owns(&coordinationv1.Lease{}).
 		Owns(&corev1.Secret{}).
 		Complete(r)
 }
@@ -209,6 +218,9 @@ func (r *ZFSReplicationReconciler) ensureJob(ctx context.Context, rep *zfsv1.ZFS
 	var existing batchv1.Job
 	err := r.Get(ctx, types.NamespacedName{Name: job.Name, Namespace: job.Namespace}, &existing)
 	if err == nil {
+		if !sameObjectSpecHash(existing.Annotations, job.Annotations) {
+			return fmt.Errorf("existing Job %s/%s was created for a different spec", job.Namespace, job.Name)
+		}
 		return nil
 	}
 	if !apierrors.IsNotFound(err) {
@@ -399,11 +411,6 @@ func (r *ZFSReplicationReconciler) podReader() client.Reader {
 	return r.Client
 }
 
-func (r *ZFSReplicationReconciler) fail(ctx context.Context, rep *zfsv1.ZFSReplication, msg string) error {
-	names := objectNames(rep)
-	return r.failRun(ctx, rep, names, msg)
-}
-
 func (r *ZFSReplicationReconciler) failRun(ctx context.Context, rep *zfsv1.ZFSReplication, names runObjects, msg string) error {
 	now := metav1.Now()
 	err := r.patchStatus(ctx, rep, func(st *zfsv1.ZFSReplicationStatus) {
@@ -420,6 +427,21 @@ func (r *ZFSReplicationReconciler) failRun(ctx context.Context, rep *zfsv1.ZFSRe
 	return r.cleanupFailedRun(ctx, rep, names)
 }
 
+func (r *ZFSReplicationReconciler) failValidation(ctx context.Context, rep *zfsv1.ZFSReplication, specHash, msg string) error {
+	now := metav1.Now()
+	return r.patchStatus(ctx, rep, func(st *zfsv1.ZFSReplicationStatus) {
+		st.Phase = zfsv1.PhaseFailed
+		st.ObservedRunID = rep.Spec.RunID
+		st.ObservedSpecHash = specHash
+		st.LastAttemptedRunID = rep.Spec.RunID
+		st.CompletedAt = &now
+		st.LastError = msg
+		if st.StartedAt == nil {
+			st.StartedAt = &now
+		}
+	})
+}
+
 func (r *ZFSReplicationReconciler) patchStatus(ctx context.Context, rep *zfsv1.ZFSReplication, mutate func(*zfsv1.ZFSReplicationStatus)) error {
 	copy := rep.DeepCopy()
 	mutate(&copy.Status)
@@ -431,7 +453,27 @@ func fillStatusNames(st *zfsv1.ZFSReplicationStatus, rep *zfsv1.ZFSReplication, 
 		now := metav1.Now()
 		st.StartedAt = &now
 	}
+	st.ObservedSpecHash = replicationSpecHash(rep.Spec)
 	st.SenderJobName = names.SenderName
 	st.ReceiverJobName = names.ReceiverName
 	st.SSHSecretName = names.SecretName
+}
+
+func sameRunSpecChanged(rep *zfsv1.ZFSReplication, specHash string) bool {
+	if rep.Status.ObservedSpecHash == "" || rep.Status.ObservedSpecHash == specHash {
+		return false
+	}
+	return rep.Status.ObservedRunID == rep.Spec.RunID ||
+		rep.Status.LastAttemptedRunID == rep.Spec.RunID ||
+		rep.Status.LastSuccessfulRunID == rep.Spec.RunID
+}
+
+func statusSpecMatches(observed, current string) bool {
+	return observed == "" || observed == current
+}
+
+func sameObjectSpecHash(existing, desired map[string]string) bool {
+	existingHash := existing[specHashAnnotation]
+	desiredHash := desired[specHashAnnotation]
+	return existingHash == "" || existingHash == desiredHash
 }

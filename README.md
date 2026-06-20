@@ -61,6 +61,8 @@ Trigger a new run by changing `spec.runID`:
 kubectl patch zfsreplication pg-a-to-b -n storage --type merge -p '{"spec":{"runID":"manual-0002"}}'
 ```
 
+`runID` and `snapshotPrefix` are used to derive Kubernetes object names and ZFS snapshot names. Use lowercase letters, numbers, and dashes; `runID` may be up to 40 characters, and `snapshotPrefix` may be up to 32 characters.
+
 Inspect status:
 
 ```sh
