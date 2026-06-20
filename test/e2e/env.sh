@@ -17,23 +17,9 @@ LIMA_NETWORK="${E2E_LIMA_NETWORK:-lima:user-v2}"
 HOST_APISERVER_PORT="${E2E_HOST_APISERVER_PORT:-16443}"
 K3S_SERVER_URL="${E2E_K3S_SERVER_URL:-https://lima-${CONTROL_PLANE}.internal:6443}"
 
-E2E_ZFS_MODE="${E2E_ZFS_MODE:-sim}"
-case "${E2E_ZFS_MODE}" in
-  sim)
-    DEFAULT_IMAGE_TAG="zfsreplicationcontroller:e2e"
-    DEFAULT_IMAGE_TAR="${ARTIFACT_DIR}/zfsreplicationcontroller-e2e.tar"
-    DEFAULT_IMAGE_DOCKERFILE="${E2E_DIR}/image/Dockerfile.e2e"
-    ;;
-  real)
-    DEFAULT_IMAGE_TAG="zfsreplicationcontroller:e2e-real"
-    DEFAULT_IMAGE_TAR="${ARTIFACT_DIR}/zfsreplicationcontroller-e2e-real.tar"
-    DEFAULT_IMAGE_DOCKERFILE="${REPO_ROOT}/Dockerfile"
-    ;;
-  *)
-    printf '[e2e] error: E2E_ZFS_MODE must be sim or real, got %s\n' "${E2E_ZFS_MODE}" >&2
-    exit 1
-    ;;
-esac
+DEFAULT_IMAGE_TAG="zfsreplicationcontroller:e2e"
+DEFAULT_IMAGE_TAR="${ARTIFACT_DIR}/zfsreplicationcontroller-e2e.tar"
+DEFAULT_IMAGE_DOCKERFILE="${REPO_ROOT}/Dockerfile"
 
 IMAGE_TAG="${E2E_IMAGE_TAG:-${DEFAULT_IMAGE_TAG}}"
 IMAGE_TAR="${E2E_IMAGE_TAR:-${DEFAULT_IMAGE_TAR}}"

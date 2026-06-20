@@ -2,8 +2,6 @@ package controller
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/base64"
 	"errors"
 	"fmt"
 	"strings"
@@ -45,6 +43,9 @@ func (r *ZFSReplicationReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	if rep.Status.LastSuccessfulRunID == rep.Spec.RunID {
 		return ctrl.Result{}, nil
 	}
+	if rep.Status.Phase == zfsv1.PhaseFailed && rep.Status.LastAttemptedRunID == rep.Spec.RunID {
+		return ctrl.Result{}, nil
+	}
 	if rep.Spec.Source.Dataset == rep.Spec.Target.Dataset {
 		return ctrl.Result{}, r.fail(ctx, &rep, "source and target datasets must differ")
 	}
@@ -64,13 +65,13 @@ func (r *ZFSReplicationReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	if err := r.ensureReceiverJob(ctx, &rep, names); err != nil {
 		return ctrl.Result{}, err
 	}
-
 	if failed, msg, err := r.jobFailed(ctx, rep.Namespace, names.ReceiverName, "receiver Job failed"); err != nil || failed {
 		if err != nil {
 			return ctrl.Result{}, err
 		}
 		return ctrl.Result{}, r.failRun(ctx, &rep, names, msg)
 	}
+
 	senderExists, err := r.jobExists(ctx, rep.Namespace, names.SenderName)
 	if err != nil {
 		return ctrl.Result{}, err
@@ -88,6 +89,8 @@ func (r *ZFSReplicationReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		if !ready {
 			return ctrl.Result{RequeueAfter: 5 * time.Second}, r.patchStatus(ctx, &rep, func(st *zfsv1.ZFSReplicationStatus) {
 				st.Phase = zfsv1.PhaseStartingReceiver
+				st.ObservedRunID = rep.Spec.RunID
+				st.LastAttemptedRunID = rep.Spec.RunID
 				fillStatusNames(st, &rep, names)
 			})
 		}
@@ -125,11 +128,7 @@ func (r *ZFSReplicationReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	receiverDone, err := r.jobSucceeded(ctx, rep.Namespace, names.ReceiverName)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-	if senderDone && receiverDone {
+	if senderDone {
 		guid, err := r.senderSnapshotGUID(ctx, &rep, names)
 		if err != nil {
 			return ctrl.Result{}, err
@@ -188,11 +187,11 @@ func (r *ZFSReplicationReconciler) ensureSecret(ctx context.Context, rep *zfsv1.
 	if !apierrors.IsNotFound(err) {
 		return err
 	}
-	token, err := randomToken()
+	key, err := generateSSHKeyMaterial()
 	if err != nil {
 		return err
 	}
-	secretObj := tokenSecret(rep, names, token)
+	secretObj := sshSecret(rep, names, key)
 	if err := ctrl.SetControllerReference(rep, secretObj, r.Scheme); err != nil {
 		return err
 	}
@@ -239,33 +238,49 @@ func (r *ZFSReplicationReconciler) cleanupSucceededRun(ctx context.Context, rep 
 	if err := finishLease(ctx, r.Client, rep, names, "succeeded"); err != nil {
 		errs = append(errs, fmt.Errorf("finish lease: %w", err))
 	}
+	errs = append(errs, r.cleanupEphemeralObjects(ctx, rep, names)...)
+	return errors.Join(errs...)
+}
+
+func (r *ZFSReplicationReconciler) cleanupFailedRun(ctx context.Context, rep *zfsv1.ZFSReplication, names runObjects) error {
+	var errs []error
+	if err := finishLease(ctx, r.Client, rep, names, "failed"); err != nil {
+		errs = append(errs, fmt.Errorf("finish lease: %w", err))
+	}
+	errs = append(errs, r.cleanupEphemeralObjects(ctx, rep, names)...)
+	return errors.Join(errs...)
+}
+
+func (r *ZFSReplicationReconciler) cleanupEphemeralObjects(ctx context.Context, rep *zfsv1.ZFSReplication, names runObjects) []error {
+	var errs []error
 	for _, obj := range []client.Object{
+		&batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: names.ReceiverName, Namespace: rep.Namespace}},
 		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: names.SecretName, Namespace: rep.Namespace}},
 	} {
 		if err := r.Delete(ctx, obj); client.IgnoreNotFound(err) != nil {
 			errs = append(errs, fmt.Errorf("delete %s/%s: %w", obj.GetNamespace(), obj.GetName(), err))
 		}
 	}
-	return errors.Join(errs...)
+	return errs
 }
 
 func (r *ZFSReplicationReconciler) usableReceiverPod(ctx context.Context, rep *zfsv1.ZFSReplication, names runObjects) (*corev1.Pod, bool, string, error) {
 	var pods corev1.PodList
 	labels := cloneLabels(names.Labels)
 	labels[labelPrefix+"/role"] = "receiver"
-	if err := r.List(ctx, &pods, client.InNamespace(rep.Namespace), client.MatchingLabels(labels)); err != nil {
+	if err := r.podReader().List(ctx, &pods, client.InNamespace(rep.Namespace), client.MatchingLabels(labels)); err != nil {
 		return nil, false, "", err
 	}
 	var usable []*corev1.Pod
 	hasTerminal := false
-	for _, pod := range pods.Items {
-		pod := pod
+	for i := range pods.Items {
+		pod := &pods.Items[i]
 		if pod.Status.Phase == corev1.PodFailed || pod.Status.Phase == corev1.PodSucceeded {
 			hasTerminal = true
 			continue
 		}
-		if pod.Status.Phase == corev1.PodRunning && pod.Status.PodIP != "" && podReady(&pod) {
-			usable = append(usable, &pod)
+		if pod.Status.Phase == corev1.PodRunning && pod.Status.PodIP != "" && podReady(pod) {
+			usable = append(usable, pod)
 		}
 	}
 	if len(usable) > 1 {
@@ -403,7 +418,7 @@ func (r *ZFSReplicationReconciler) failRun(ctx context.Context, rep *zfsv1.ZFSRe
 	if err != nil {
 		return err
 	}
-	return finishLease(ctx, r.Client, rep, names, "failed")
+	return r.cleanupFailedRun(ctx, rep, names)
 }
 
 func (r *ZFSReplicationReconciler) patchStatus(ctx context.Context, rep *zfsv1.ZFSReplication, mutate func(*zfsv1.ZFSReplicationStatus)) error {
@@ -420,12 +435,4 @@ func fillStatusNames(st *zfsv1.ZFSReplicationStatus, rep *zfsv1.ZFSReplication, 
 	st.SenderJobName = names.SenderName
 	st.ReceiverJobName = names.ReceiverName
 	st.TokenSecretName = names.SecretName
-}
-
-func randomToken() (string, error) {
-	buf := make([]byte, 32)
-	if _, err := rand.Read(buf); err != nil {
-		return "", fmt.Errorf("generate token: %w", err)
-	}
-	return base64.RawURLEncoding.EncodeToString(buf), nil
 }

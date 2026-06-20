@@ -39,6 +39,13 @@ func TestControllerClusterRoleHasRequiredPermissions(t *testing.T) {
 	if !contains(verbs, "get") {
 		t.Fatalf("pods/log RBAC verbs = %v, missing get", verbs)
 	}
+
+	verbs = verbsForResource(role.Rules, "", "secrets")
+	for _, verb := range []string{"create", "get", "list", "watch", "update", "patch", "delete"} {
+		if !contains(verbs, verb) {
+			t.Fatalf("secrets RBAC verbs = %v, missing %q", verbs, verb)
+		}
+	}
 }
 
 func verbsForResource(rules []struct {

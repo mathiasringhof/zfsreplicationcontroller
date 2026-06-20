@@ -34,20 +34,24 @@ func objectNames(rep *zfsv1.ZFSReplication) runObjects {
 		BaseName:     baseName(rep.Name),
 		RunName:      rn,
 		SnapshotName: snapshotPrefix(rep.Spec.SnapshotPrefix) + "-" + rep.Spec.RunID,
-		SecretName:   sanitizeName(rn, "token"),
+		SecretName:   sanitizeName(rn, "ssh"),
 		ReceiverName: sanitizeName(rn, "receiver"),
 		SenderName:   sanitizeName(rn, "sender"),
 		Labels:       labels,
 	}
 }
 
-func tokenSecret(rep *zfsv1.ZFSReplication, names runObjects, token string) *corev1.Secret {
+func sshSecret(rep *zfsv1.ZFSReplication, names runObjects, key sshKeyMaterial) *corev1.Secret {
 	labels := cloneLabels(names.Labels)
-	labels[labelPrefix+"/role"] = "token"
+	labels[labelPrefix+"/role"] = "ssh"
 	return &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{Name: names.SecretName, Namespace: rep.Namespace, Labels: labels},
 		Type:       corev1.SecretTypeOpaque,
-		Data:       map[string][]byte{"token": []byte(token)},
+		Data: map[string][]byte{
+			"id_rsa":          key.PrivateKeyPEM,
+			"id_rsa.pub":      key.PublicKey,
+			"authorized_keys": key.AuthorizedKeys,
+		},
 	}
 }
 
@@ -57,32 +61,29 @@ func receiverJob(rep *zfsv1.ZFSReplication, names runObjects, image, simulatorSt
 	env := []corev1.EnvVar{
 		{Name: "ZFSREP_ROLE", Value: "receiver"},
 		{Name: "RUN_ID", Value: rep.Spec.RunID},
-		{Name: "SNAPSHOT_NAME", Value: names.SnapshotName},
-		{Name: "DST_DATASET", Value: rep.Spec.Target.Dataset},
-		{Name: "TOKEN_FILE", Value: "/var/run/zfsrep/token/token"},
-		{Name: "BOOTSTRAP_MODE", Value: bootstrapMode(rep.Spec.Bootstrap.Mode)},
-		{Name: "RECEIVE_UNMOUNTED", Value: strconv.FormatBool(boolDefault(rep.Spec.Receive.ReceiveUnmounted, true))},
-		{Name: "RECEIVE_RESUMABLE", Value: strconv.FormatBool(boolDefault(rep.Spec.Receive.Resumable, true))},
-		{Name: "LISTEN_ADDR", Value: ":8080"},
+		{Name: "SSH_AUTHORIZED_KEYS_FILE", Value: "/var/run/zfsrep/ssh/authorized_keys"},
+		{Name: "SSH_LISTEN_PORT", Value: "2222"},
 	}
-	return dataMoverJob(rep, names.ReceiverName, image, labels, rep.Spec.Target.NodeName, "/usr/local/bin/zfsrep-receiver", env, names.SecretName, true, simulatorStateHostPath)
+	return dataMoverJob(rep, names.ReceiverName, image, labels, rep.Spec.Target.NodeName, "/usr/local/bin/zfsrep-ssh-receiver", env, names.SecretName, true, simulatorStateHostPath)
 }
 
 func senderJob(rep *zfsv1.ZFSReplication, names runObjects, image, receiverPodIP, simulatorStateHostPath string) *batchv1.Job {
 	labels := cloneLabels(names.Labels)
 	labels[labelPrefix+"/role"] = "sender"
-	receiverURL := fmt.Sprintf("http://%s:8080/receive", receiverPodIP)
 	env := []corev1.EnvVar{
 		{Name: "ZFSREP_ROLE", Value: "sender"},
 		{Name: "RUN_ID", Value: rep.Spec.RunID},
 		{Name: "SNAPSHOT_PREFIX", Value: snapshotPrefix(rep.Spec.SnapshotPrefix)},
 		{Name: "SNAPSHOT_NAME", Value: names.SnapshotName},
 		{Name: "SRC_DATASET", Value: rep.Spec.Source.Dataset},
+		{Name: "DST_HOST", Value: fmt.Sprintf("root@%s", receiverPodIP)},
+		{Name: "SSH_KEY_FILE", Value: "/var/run/zfsrep/ssh/id_rsa"},
+		{Name: "SSH_PORT", Value: "2222"},
 		{Name: "DST_DATASET", Value: rep.Spec.Target.Dataset},
 		{Name: "BASE_SNAPSHOT", Value: rep.Status.LastSuccessfulSnapshot},
-		{Name: "RECEIVER_URL", Value: receiverURL},
-		{Name: "TOKEN_FILE", Value: "/var/run/zfsrep/token/token"},
 		{Name: "BOOTSTRAP_MODE", Value: bootstrapMode(rep.Spec.Bootstrap.Mode)},
+		{Name: "RECEIVE_UNMOUNTED", Value: strconv.FormatBool(boolDefault(rep.Spec.Receive.ReceiveUnmounted, true))},
+		{Name: "RECEIVE_RESUMABLE", Value: strconv.FormatBool(boolDefault(rep.Spec.Receive.Resumable, true))},
 	}
 	return dataMoverJob(rep, names.SenderName, image, labels, rep.Spec.Source.NodeName, "/usr/local/bin/zfsrep-sender", env, names.SecretName, false, simulatorStateHostPath)
 }
@@ -110,12 +111,15 @@ func dataMoverJob(rep *zfsv1.ZFSReplication, name, image string, labels map[stri
 		SecurityContext: &corev1.SecurityContext{Privileged: &privileged},
 		VolumeMounts: []corev1.VolumeMount{
 			{Name: "dev-zfs", MountPath: "/dev/zfs"},
-			{Name: "token", MountPath: "/var/run/zfsrep/token", ReadOnly: true},
 		},
 	}
 	volumes := []corev1.Volume{
 		{Name: "dev-zfs", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: "/dev/zfs"}}},
-		{Name: "token", VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: secretName}}},
+	}
+	if secretName != "" {
+		mode := int32(0400)
+		container.VolumeMounts = append(container.VolumeMounts, corev1.VolumeMount{Name: "ssh", MountPath: "/var/run/zfsrep/ssh", ReadOnly: true})
+		volumes = append(volumes, corev1.Volume{Name: "ssh", VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: secretName, DefaultMode: &mode}}})
 	}
 	if simulatorStateHostPath != "" {
 		env = append(env, corev1.EnvVar{Name: "ZFS_SIM_ROOT", Value: simulatorStateHostPath})
@@ -129,7 +133,7 @@ func dataMoverJob(rep *zfsv1.ZFSReplication, name, image string, labels map[stri
 	if readiness {
 		container.ReadinessProbe = &corev1.Probe{
 			ProbeHandler: corev1.ProbeHandler{
-				HTTPGet: &corev1.HTTPGetAction{Path: "/healthz", Port: intstrFrom8080()},
+				TCPSocket: &corev1.TCPSocketAction{Port: intstr.FromInt(2222)},
 			},
 		}
 	}
@@ -150,10 +154,6 @@ func dataMoverJob(rep *zfsv1.ZFSReplication, name, image string, labels map[stri
 			},
 		},
 	}
-}
-
-func intstrFrom8080() intstr.IntOrString {
-	return intstr.FromInt(8080)
 }
 
 func cloneLabels(in map[string]string) map[string]string {

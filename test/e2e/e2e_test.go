@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"os"
 	"os/exec"
@@ -22,208 +23,22 @@ const (
 
 	e2eLabelPrefix           = "zfsreplication.example.com"
 	e2eLeaseStateAnnotation  = e2eLabelPrefix + "/state"
-	e2eSimEnvAnnotation      = e2eLabelPrefix + "/sim-env-"
 	e2eBootstrapFailIfNoBase = "FailIfNoBase"
 	e2eBootstrapDestroyFull  = "DestroyTargetAndReceiveFull"
 )
 
 func TestE2EFullAndIncrementalReplication(t *testing.T) {
-	skipIfRealZFS(t)
-	k := newKubectlRunner(t)
-	suffix := uniqueSuffix()
-	name := "e2e-flow-" + suffix
-	first := replicationCase{
-		Name:           name,
-		RunID:          "r-" + suffix + "-1",
-		SourceNode:     e2eSourceNode,
-		TargetNode:     e2eTargetNode,
-		SourceDataset:  "tank/src-" + suffix,
-		TargetDataset:  "tank/dst-" + suffix,
-		SnapshotPrefix: "zsync",
-		BootstrapMode:  e2eBootstrapDestroyFull,
-	}
-	k.cleanupReplicationOnExit(name)
-	k.cleanupReplication(name)
-
-	k.applyReplication(first)
-	firstStatus := k.waitForSuccess(first, 4*time.Minute)
-	firstEvents := k.zfsSimEvents(first.Name, first.RunID)
-	assertRunTopology(t, first, firstEvents)
-	firstGUID := assertFullBootstrapZFSEvents(t, first, firstEvents)
-	assertSucceededStatus(t, first, firstStatus, firstGUID)
-	k.assertSecretDeleted(firstStatus.TokenSecretName)
-	k.assertLeaseState(first.Name, "succeeded")
-
-	second := first
-	second.RunID = "r-" + suffix + "-2"
-	second.BootstrapMode = e2eBootstrapFailIfNoBase
-	k.applyReplication(second)
-	secondStatus := k.waitForSuccess(second, 4*time.Minute)
-	secondEvents := k.zfsSimEvents(second.Name, second.RunID)
-	assertRunTopology(t, second, secondEvents)
-	secondGUID := assertIncrementalZFSEvents(t, second, first.snapshotName(), secondEvents)
-	assertSucceededStatus(t, second, secondStatus, secondGUID)
-	k.assertSecretDeleted(secondStatus.TokenSecretName)
-	k.assertLeaseState(second.Name, "succeeded")
-}
-
-func TestE2EFailIfNoBase(t *testing.T) {
-	skipIfRealZFS(t)
-	k := newKubectlRunner(t)
-	suffix := uniqueSuffix()
-	sc := replicationCase{
-		Name:           "e2e-no-base-" + suffix,
-		RunID:          "r-" + suffix,
-		SourceNode:     e2eSourceNode,
-		TargetNode:     e2eTargetNode,
-		SourceDataset:  "tank/src-no-base-" + suffix,
-		TargetDataset:  "tank/dst-no-base-" + suffix,
-		SnapshotPrefix: "zsync",
-		BootstrapMode:  e2eBootstrapFailIfNoBase,
-	}
-	k.cleanupReplicationOnExit(sc.Name)
-	k.cleanupReplication(sc.Name)
-
-	k.applyReplication(sc)
-	status := k.waitForFailed(sc, 4*time.Minute)
-	assertFailedStatus(t, sc, status, "no base snapshot")
-	k.assertLeaseState(sc.Name, "failed")
-
-	events := k.zfsSimEvents(sc.Name, sc.RunID)
-	assertRunTopology(t, sc, events)
-	assertFailIfNoBaseEvents(t, sc, events)
-}
-
-func TestE2ESameDatasetRejectedBeforeJobs(t *testing.T) {
-	skipIfRealZFS(t)
-	k := newKubectlRunner(t)
-	suffix := uniqueSuffix()
-	sc := replicationCase{
-		Name:           "e2e-same-ds-" + suffix,
-		RunID:          "r-" + suffix,
-		SourceNode:     e2eSourceNode,
-		TargetNode:     e2eTargetNode,
-		SourceDataset:  "tank/same-" + suffix,
-		TargetDataset:  "tank/same-" + suffix,
-		SnapshotPrefix: "zsync",
-		BootstrapMode:  e2eBootstrapDestroyFull,
-	}
-	k.cleanupReplicationOnExit(sc.Name)
-	k.cleanupReplication(sc.Name)
-
-	k.applyReplication(sc)
-	status := k.waitForFailed(sc, 2*time.Minute)
-	assertFailedStatus(t, sc, status, "source and target datasets must differ")
-	k.assertNoJobsOrSecrets(sc.Name)
-	k.assertNoLease(sc.Name)
-}
-
-func TestE2ESendFailure(t *testing.T) {
-	skipIfRealZFS(t)
-	k := newKubectlRunner(t)
-	suffix := uniqueSuffix()
-	sc := replicationCase{
-		Name:           "e2e-send-fail-" + suffix,
-		RunID:          "r-" + suffix,
-		SourceNode:     e2eSourceNode,
-		TargetNode:     e2eTargetNode,
-		SourceDataset:  "tank/src-send-fail-" + suffix,
-		TargetDataset:  "tank/dst-send-fail-" + suffix,
-		SnapshotPrefix: "zsync",
-		BootstrapMode:  e2eBootstrapDestroyFull,
-		Annotations: map[string]string{
-			e2eSimEnvAnnotation + "ZFS_SIM_FAIL_SEND": "1",
-		},
-	}
-	k.cleanupReplicationOnExit(sc.Name)
-	k.cleanupReplication(sc.Name)
-
-	k.applyReplication(sc)
-	status := k.waitForFailed(sc, 4*time.Minute)
-	assertFailedStatus(t, sc, status, "forced send failure")
-	k.assertLeaseState(sc.Name, "failed")
-
-	events := k.zfsSimEvents(sc.Name, sc.RunID)
-	assertRunTopology(t, sc, events)
-	assertSendFailureEvents(t, sc, events)
-}
-
-func TestE2EReceiveFailure(t *testing.T) {
-	skipIfRealZFS(t)
-	k := newKubectlRunner(t)
-	suffix := uniqueSuffix()
-	sc := replicationCase{
-		Name:           "e2e-recv-fail-" + suffix,
-		RunID:          "r-" + suffix,
-		SourceNode:     e2eSourceNode,
-		TargetNode:     e2eTargetNode,
-		SourceDataset:  "tank/src-recv-fail-" + suffix,
-		TargetDataset:  "tank/dst-recv-fail-" + suffix,
-		SnapshotPrefix: "zsync",
-		BootstrapMode:  e2eBootstrapDestroyFull,
-		Annotations: map[string]string{
-			e2eSimEnvAnnotation + "ZFS_SIM_FAIL_RECEIVE": "1",
-		},
-	}
-	k.cleanupReplicationOnExit(sc.Name)
-	k.cleanupReplication(sc.Name)
-
-	k.applyReplication(sc)
-	status := k.waitForFailed(sc, 4*time.Minute)
-	assertFailedStatus(t, sc, status, "forced receive failure")
-	k.assertLeaseState(sc.Name, "failed")
-
-	events := k.zfsSimEvents(sc.Name, sc.RunID)
-	assertRunTopology(t, sc, events)
-	assertReceiveFailureEvents(t, sc, events)
-}
-
-func TestE2EMountedTargetRejectedBeforeDestroy(t *testing.T) {
-	skipIfRealZFS(t)
-	k := newKubectlRunner(t)
-	suffix := uniqueSuffix()
-	sc := replicationCase{
-		Name:           "e2e-mounted-" + suffix,
-		RunID:          "r-" + suffix,
-		SourceNode:     e2eSourceNode,
-		TargetNode:     e2eTargetNode,
-		SourceDataset:  "tank/src-mounted-" + suffix,
-		TargetDataset:  "tank/dst-mounted-" + suffix,
-		SnapshotPrefix: "zsync",
-		BootstrapMode:  e2eBootstrapDestroyFull,
-		Annotations: map[string]string{
-			e2eSimEnvAnnotation + "ZFS_SIM_MOUNTED": "yes",
-		},
-	}
-	k.cleanupReplicationOnExit(sc.Name)
-	k.cleanupReplication(sc.Name)
-
-	k.applyReplication(sc)
-	status := k.waitForFailed(sc, 4*time.Minute)
-	assertFailedStatus(t, sc, status, "target dataset mounted")
-	k.assertLeaseState(sc.Name, "failed")
-
-	events := k.zfsSimEvents(sc.Name, sc.RunID)
-	assertRunTopology(t, sc, events)
-	assertMountedTargetEvents(t, sc, events)
-}
-
-func TestE2ERealZFSFullAndIncrementalReplication(t *testing.T) {
-	if !realZFSEnabled() {
-		t.Skip("set E2E_ZFS_MODE=real to run real ZFS e2e tests")
-	}
-
 	k := newKubectlRunner(t)
 	suffix := uniqueSuffix()
 	pool := realZFSPool()
-	name := "e2e-real-" + suffix
+	name := "e2e-repl-" + suffix
 	first := replicationCase{
 		Name:           name,
 		RunID:          "r-" + suffix + "-1",
 		SourceNode:     e2eSourceNode,
 		TargetNode:     e2eTargetNode,
-		SourceDataset:  pool + "/src-real-" + suffix,
-		TargetDataset:  pool + "/dst-real-" + suffix,
+		SourceDataset:  pool + "/src-" + suffix,
+		TargetDataset:  pool + "/dst-" + suffix,
 		SnapshotPrefix: "zsync",
 		BootstrapMode:  e2eBootstrapDestroyFull,
 	}
@@ -239,11 +54,11 @@ func TestE2ERealZFSFullAndIncrementalReplication(t *testing.T) {
 	firstStatus := k.waitForSuccess(first, 4*time.Minute)
 	assertSucceededStatus(t, first, firstStatus, firstStatus.LastSuccessfulSnapshotGUID)
 	if firstStatus.LastSuccessfulSnapshotGUID == "" {
-		t.Fatalf("lastSuccessfulSnapshotGUID is empty after real ZFS full send: %#v", firstStatus)
+		t.Fatalf("lastSuccessfulSnapshotGUID is empty after full replication: %#v", firstStatus)
 	}
 	k.assertRealZFSSnapshotGUID(first.SourceNode, "zfs-src-g1-"+suffix, first.sourceSnapshot(), firstStatus.LastSuccessfulSnapshotGUID)
 	k.assertRealZFSSnapshotGUID(first.TargetNode, "zfs-dst-g1-"+suffix, first.targetSnapshot(), firstStatus.LastSuccessfulSnapshotGUID)
-	k.assertSecretDeleted(firstStatus.TokenSecretName)
+	k.assertNoSecrets(first.Name)
 	k.assertLeaseState(first.Name, "succeeded")
 
 	second := first
@@ -255,12 +70,93 @@ func TestE2ERealZFSFullAndIncrementalReplication(t *testing.T) {
 	secondStatus := k.waitForSuccess(second, 4*time.Minute)
 	assertSucceededStatus(t, second, secondStatus, secondStatus.LastSuccessfulSnapshotGUID)
 	if secondStatus.LastSuccessfulSnapshotGUID == "" {
-		t.Fatalf("lastSuccessfulSnapshotGUID is empty after real ZFS incremental send: %#v", secondStatus)
+		t.Fatalf("lastSuccessfulSnapshotGUID is empty after incremental replication: %#v", secondStatus)
 	}
 	k.assertRealZFSSnapshotGUID(second.SourceNode, "zfs-src-g2-"+suffix, second.sourceSnapshot(), secondStatus.LastSuccessfulSnapshotGUID)
 	k.assertRealZFSSnapshotGUID(second.TargetNode, "zfs-dst-g2-"+suffix, second.targetSnapshot(), secondStatus.LastSuccessfulSnapshotGUID)
-	k.assertSecretDeleted(secondStatus.TokenSecretName)
+	k.assertNoSecrets(second.Name)
 	k.assertLeaseState(second.Name, "succeeded")
+}
+
+func TestE2EFailIfNoBase(t *testing.T) {
+	k := newKubectlRunner(t)
+	suffix := uniqueSuffix()
+	pool := realZFSPool()
+	sc := replicationCase{
+		Name:           "e2e-no-base-" + suffix,
+		RunID:          "r-" + suffix,
+		SourceNode:     e2eSourceNode,
+		TargetNode:     e2eTargetNode,
+		SourceDataset:  pool + "/src-no-base-" + suffix,
+		TargetDataset:  pool + "/dst-no-base-" + suffix,
+		SnapshotPrefix: "zsync",
+		BootstrapMode:  e2eBootstrapFailIfNoBase,
+	}
+	k.cleanupReplicationOnExit(sc.Name)
+	k.cleanupReplication(sc.Name)
+	k.cleanupRealZFSDatasetOnExit(sc.SourceNode, "zfs-cln-no-base-src-"+suffix, sc.SourceDataset)
+	k.cleanupRealZFSDatasetOnExit(sc.TargetNode, "zfs-cln-no-base-dst-"+suffix, sc.TargetDataset)
+
+	k.runRealZFS(sc.SourceNode, "zfs-src-no-base-"+suffix, realZFSSetupSourceScript(pool, sc.SourceDataset, "no-base-"+suffix))
+
+	k.applyReplication(sc)
+	status := k.waitForFailed(sc, 4*time.Minute)
+	assertFailedStatus(t, sc, status, "no base snapshot")
+	k.assertRealZFSSnapshotExists(sc.SourceNode, "zfs-src-snap-no-base-"+suffix, sc.sourceSnapshot())
+	k.assertLeaseState(sc.Name, "failed")
+}
+
+func TestE2ESameDatasetRejectedBeforeJobs(t *testing.T) {
+	k := newKubectlRunner(t)
+	suffix := uniqueSuffix()
+	pool := realZFSPool()
+	sc := replicationCase{
+		Name:           "e2e-same-ds-" + suffix,
+		RunID:          "r-" + suffix,
+		SourceNode:     e2eSourceNode,
+		TargetNode:     e2eTargetNode,
+		SourceDataset:  pool + "/same-" + suffix,
+		TargetDataset:  pool + "/same-" + suffix,
+		SnapshotPrefix: "zsync",
+		BootstrapMode:  e2eBootstrapDestroyFull,
+	}
+	k.cleanupReplicationOnExit(sc.Name)
+	k.cleanupReplication(sc.Name)
+
+	k.applyReplication(sc)
+	status := k.waitForFailed(sc, 2*time.Minute)
+	assertFailedStatus(t, sc, status, "source and target datasets must differ")
+	k.assertNoJobsOrSecrets(sc.Name)
+	k.assertNoLease(sc.Name)
+}
+
+func TestE2ESyncoidFailure(t *testing.T) {
+	k := newKubectlRunner(t)
+	suffix := uniqueSuffix()
+	pool := realZFSPool()
+	sc := replicationCase{
+		Name:           "e2e-sync-fail-" + suffix,
+		RunID:          "r-" + suffix,
+		SourceNode:     e2eSourceNode,
+		TargetNode:     e2eTargetNode,
+		SourceDataset:  pool + "/src-sync-fail-" + suffix,
+		TargetDataset:  "missingpool/dst-sync-fail-" + suffix,
+		SnapshotPrefix: "zsync",
+		BootstrapMode:  e2eBootstrapDestroyFull,
+	}
+	k.cleanupReplicationOnExit(sc.Name)
+	k.cleanupReplication(sc.Name)
+	k.cleanupRealZFSDatasetOnExit(sc.SourceNode, "zfs-cln-sync-fail-src-"+suffix, sc.SourceDataset)
+
+	k.runRealZFS(sc.SourceNode, "zfs-src-sync-fail-"+suffix, realZFSSetupSourceScript(pool, sc.SourceDataset, "sync-fail-"+suffix))
+
+	k.applyReplication(sc)
+	status := k.waitForFailed(sc, 4*time.Minute)
+	assertFailedStatus(t, sc, status, "CRITICAL ERROR")
+	if !strings.Contains(status.LastError, sc.TargetDataset) {
+		t.Fatalf("lastError = %q, want to mention target dataset %q", status.LastError, sc.TargetDataset)
+	}
+	k.assertLeaseState(sc.Name, "failed")
 }
 
 type replicationCase struct {
@@ -341,10 +237,14 @@ func newKubectlRunner(t *testing.T) kubectlRunner {
 	t.Helper()
 	kubeconfig := os.Getenv("KUBECONFIG")
 	if kubeconfig == "" {
-		t.Skip("KUBECONFIG is required for VM e2e tests")
+		runFlag := flag.Lookup("test.run")
+		if runFlag == nil || runFlag.Value.String() == "" {
+			t.Skip("KUBECONFIG is required for VM e2e tests; run test/e2e/run.sh, then go test ./test/e2e -run TestE2E")
+		}
+		kubeconfig = ".artifacts/kubeconfig"
 	}
 	if _, err := os.Stat(kubeconfig); err != nil {
-		t.Skipf("KUBECONFIG is not usable: %v", err)
+		t.Skipf("KUBECONFIG is not usable: set KUBECONFIG or run test/e2e/run.sh to create .artifacts/kubeconfig: %v", err)
 	}
 	kubectl, err := exec.LookPath("kubectl")
 	if err != nil {
@@ -467,30 +367,6 @@ func (k kubectlRunner) collectDiagnostics(name string) {
 	}
 }
 
-func (k kubectlRunner) zfsSimEvents(name, runID string) []zfsSimEvent {
-	k.t.Helper()
-	pods, err := k.podsForReplication(name, runID)
-	if err != nil {
-		k.t.Fatal(err)
-	}
-	if len(pods.Items) == 0 {
-		k.t.Fatalf("no datamover pods found for %s/%s", name, runID)
-	}
-
-	var events []zfsSimEvent
-	for _, pod := range pods.Items {
-		logs, err := k.runOutput(20*time.Second, "logs", "-n", e2eNamespace, "pod/"+pod.Metadata.Name, "--all-containers=true")
-		if err != nil {
-			k.t.Fatal(err)
-		}
-		events = append(events, parseZFSSimEvents(k.t, pod.Metadata.Name, logs)...)
-	}
-	if len(events) == 0 {
-		k.t.Fatalf("no zfs simulator events found in datamover pod logs for %s/%s", name, runID)
-	}
-	return events
-}
-
 func (k kubectlRunner) podsForReplication(name, runID string) (podList, error) {
 	k.t.Helper()
 	selector := e2eLabelPrefix + "/name=" + name
@@ -508,15 +384,14 @@ func (k kubectlRunner) podsForReplication(name, runID string) (podList, error) {
 	return pods, nil
 }
 
-func (k kubectlRunner) assertSecretDeleted(name string) {
+func (k kubectlRunner) assertNoSecrets(name string) {
 	k.t.Helper()
-	if name == "" {
-		k.t.Fatal("status tokenSecretName is empty")
+	out, err := k.runOutput(20*time.Second, "get", "secrets", "-n", e2eNamespace, "-l", e2eLabelPrefix+"/name="+name, "-o", "name")
+	if err != nil && !strings.Contains(err.Error(), "No resources found") {
+		k.t.Fatal(err)
 	}
-	if out, err := k.runOutput(15*time.Second, "get", "secret", name, "-n", e2eNamespace); err == nil {
-		k.t.Fatalf("token secret %s still exists:\n%s", name, out)
-	} else if !strings.Contains(err.Error(), "NotFound") {
-		k.t.Fatalf("check token secret %s deletion: %v", name, err)
+	if strings.TrimSpace(out) != "" {
+		k.t.Fatalf("secrets exist for %s:\n%s", name, out)
 	}
 }
 
@@ -575,6 +450,11 @@ func (k kubectlRunner) assertRealZFSSnapshotGUID(node, jobName, snapshot, want s
 	if got != want {
 		k.t.Fatalf("%s guid on %s = %q, want %q", snapshot, node, got, want)
 	}
+}
+
+func (k kubectlRunner) assertRealZFSSnapshotExists(node, jobName, snapshot string) {
+	k.t.Helper()
+	k.runRealZFS(node, jobName, "zfs list -H -t snapshot "+snapshot+" >/dev/null")
 }
 
 func (k kubectlRunner) runRealZFS(node, name, script string) string {
@@ -741,38 +621,6 @@ type podList struct {
 	} `json:"items"`
 }
 
-type zfsSimEvent struct {
-	Time    string `json:"time"`
-	Node    string `json:"node"`
-	Pod     string `json:"pod"`
-	Role    string `json:"role"`
-	RunID   string `json:"runID"`
-	Action  string `json:"action"`
-	Command string `json:"command"`
-	Target  string `json:"target"`
-	Bytes   int64  `json:"bytes"`
-	SHA256  string `json:"sha256"`
-	Detail  string `json:"detail"`
-}
-
-func parseZFSSimEvents(t *testing.T, podName, logs string) []zfsSimEvent {
-	t.Helper()
-
-	var events []zfsSimEvent
-	for _, line := range strings.Split(logs, "\n") {
-		raw, ok := strings.CutPrefix(strings.TrimSpace(line), "zfs-sim-event ")
-		if !ok {
-			continue
-		}
-		var event zfsSimEvent
-		if err := json.Unmarshal([]byte(raw), &event); err != nil {
-			t.Fatalf("parse zfs simulator event from %s: %v\nline: %s", podName, err, line)
-		}
-		events = append(events, event)
-	}
-	return events
-}
-
 func assertSucceededStatus(t *testing.T, sc replicationCase, st replicationStatus, wantGUID string) {
 	t.Helper()
 	if st.Phase != "Succeeded" || st.ObservedRunID != sc.RunID || st.LastAttemptedRunID != sc.RunID || st.LastSuccessfulRunID != sc.RunID {
@@ -787,11 +635,11 @@ func assertSucceededStatus(t *testing.T, sc replicationCase, st replicationStatu
 	if st.LastError != "" {
 		t.Fatalf("lastError = %q, want empty", st.LastError)
 	}
-	if st.SenderJobName == "" || st.ReceiverJobName == "" || st.TokenSecretName == "" {
+	if st.SenderJobName == "" {
 		t.Fatalf("status object names missing: %#v", st)
 	}
-	if st.ReceiverPodName == "" || st.ReceiverPodIP == "" {
-		t.Fatalf("receiver pod status missing: %#v", st)
+	if st.ReceiverJobName == "" || st.ReceiverPodName == "" || st.ReceiverPodIP == "" || st.TokenSecretName == "" {
+		t.Fatalf("receiver/ssh status names missing: %#v", st)
 	}
 	if st.StartedAt == "" || st.CompletedAt == "" {
 		t.Fatalf("status timestamps missing: %#v", st)
@@ -812,282 +660,6 @@ func assertFailedStatus(t *testing.T, sc replicationCase, st replicationStatus, 
 	if st.StartedAt == "" || st.CompletedAt == "" {
 		t.Fatalf("failure timestamps missing: %#v", st)
 	}
-}
-
-func assertRunTopology(t *testing.T, sc replicationCase, events []zfsSimEvent) {
-	t.Helper()
-	for _, event := range events {
-		if event.RunID != sc.RunID {
-			t.Fatalf("event runID = %q, want %q: %#v", event.RunID, sc.RunID, event)
-		}
-		if event.Action == "unsupported" {
-			t.Fatalf("unsupported zfs command reached simulator: %#v\nall events:\n%s", event, formatZFSEvents(events))
-		}
-		switch event.Role {
-		case "sender":
-			if event.Node != sc.SourceNode {
-				t.Fatalf("sender event ran on node %q, want %q: %#v", event.Node, sc.SourceNode, event)
-			}
-		case "receiver":
-			if event.Node != sc.TargetNode {
-				t.Fatalf("receiver event ran on node %q, want %q: %#v", event.Node, sc.TargetNode, event)
-			}
-		default:
-			t.Fatalf("event role = %q, want sender or receiver: %#v", event.Role, event)
-		}
-	}
-}
-
-func assertFullBootstrapZFSEvents(t *testing.T, sc replicationCase, events []zfsSimEvent) string {
-	t.Helper()
-	sourceSnap := sc.sourceSnapshot()
-	targetSnap := sc.targetSnapshot()
-
-	sourceList := requireSingleEvent(t, events, "sender", "list-snapshot", sourceSnap)
-	if sourceList.Detail != "missing" {
-		t.Fatalf("initial source snapshot lookup detail = %q, want missing: %#v", sourceList.Detail, sourceList)
-	}
-	requireSingleEvent(t, events, "sender", "snapshot", sourceSnap)
-	send := requireSingleEvent(t, events, "sender", "send", sourceSnap)
-	if send.Command != "zfs send "+sourceSnap {
-		t.Fatalf("send command = %q, want %q", send.Command, "zfs send "+sourceSnap)
-	}
-	if send.Detail != "base=" {
-		t.Fatalf("send detail = %q, want base=: %#v", send.Detail, send)
-	}
-	assertPayloadRecorded(t, send)
-	guid := requireSingleEvent(t, events, "sender", "get-guid", sourceSnap)
-	if guid.SHA256 == "" {
-		t.Fatalf("sender get-guid did not record a GUID: %#v", guid)
-	}
-
-	requireSingleEvent(t, events, "receiver", "get-mounted", sc.TargetDataset)
-	requireSingleEvent(t, events, "receiver", "destroy", sc.TargetDataset)
-	receive := requireSingleEvent(t, events, "receiver", "receive", targetSnap)
-	if receive.Command != "zfs receive -u -s "+sc.TargetDataset {
-		t.Fatalf("receive command = %q, want %q", receive.Command, "zfs receive -u -s "+sc.TargetDataset)
-	}
-	if receive.Detail != "args=-u -s" {
-		t.Fatalf("receive detail = %q, want args=-u -s: %#v", receive.Detail, receive)
-	}
-	targetList := requireSingleEvent(t, events, "receiver", "list-snapshot", targetSnap)
-	if targetList.Detail != "exists" {
-		t.Fatalf("target snapshot lookup detail = %q, want exists: %#v", targetList.Detail, targetList)
-	}
-	assertMatchingPayload(t, send, receive)
-	assertEventOrder(t, events, []eventMatch{
-		{role: "sender", action: "list-snapshot", target: sourceSnap},
-		{role: "sender", action: "snapshot", target: sourceSnap},
-		{role: "sender", action: "send", target: sourceSnap},
-		{role: "sender", action: "get-guid", target: sourceSnap},
-	})
-	assertEventOrder(t, events, []eventMatch{
-		{role: "receiver", action: "get-mounted", target: sc.TargetDataset},
-		{role: "receiver", action: "destroy", target: sc.TargetDataset},
-		{role: "receiver", action: "receive", target: targetSnap},
-		{role: "receiver", action: "list-snapshot", target: targetSnap},
-	})
-	return guid.SHA256
-}
-
-func assertIncrementalZFSEvents(t *testing.T, sc replicationCase, baseSnapshotName string, events []zfsSimEvent) string {
-	t.Helper()
-	sourceSnap := sc.sourceSnapshot()
-	baseSourceSnap := sc.SourceDataset + "@" + baseSnapshotName
-	baseTargetSnap := sc.TargetDataset + "@" + baseSnapshotName
-	targetSnap := sc.targetSnapshot()
-
-	sourceList := requireSingleEvent(t, events, "sender", "list-snapshot", sourceSnap)
-	if sourceList.Detail != "missing" {
-		t.Fatalf("current source snapshot lookup detail = %q, want missing: %#v", sourceList.Detail, sourceList)
-	}
-	requireSingleEvent(t, events, "sender", "snapshot", sourceSnap)
-	baseList := requireSingleEvent(t, events, "sender", "list-snapshot", baseSourceSnap)
-	if baseList.Detail != "exists" {
-		t.Fatalf("base source snapshot lookup detail = %q, want exists: %#v", baseList.Detail, baseList)
-	}
-	baseGUID := requireSingleEvent(t, events, "sender", "get-guid", baseSourceSnap)
-	if baseGUID.SHA256 == "" {
-		t.Fatalf("sender base get-guid did not record a GUID: %#v", baseGUID)
-	}
-	send := requireSingleEvent(t, events, "sender", "send", sourceSnap)
-	wantSend := "zfs send -i " + baseSourceSnap + " " + sourceSnap
-	if send.Command != wantSend {
-		t.Fatalf("incremental send command = %q, want %q", send.Command, wantSend)
-	}
-	if send.Detail != "base="+baseSourceSnap {
-		t.Fatalf("incremental send detail = %q, want base=%s: %#v", send.Detail, baseSourceSnap, send)
-	}
-	assertPayloadRecorded(t, send)
-	guid := requireSingleEvent(t, events, "sender", "get-guid", sourceSnap)
-	if guid.SHA256 == "" {
-		t.Fatalf("sender get-guid did not record a GUID: %#v", guid)
-	}
-
-	targetBaseGUID := requireSingleEvent(t, events, "receiver", "get-guid", baseTargetSnap)
-	if targetBaseGUID.SHA256 != baseGUID.SHA256 {
-		t.Fatalf("target base GUID = %q, want source base GUID %q", targetBaseGUID.SHA256, baseGUID.SHA256)
-	}
-	requireSingleEvent(t, events, "receiver", "get-mounted", sc.TargetDataset)
-	requireNoEvent(t, events, "receiver", "destroy", sc.TargetDataset)
-	receive := requireSingleEvent(t, events, "receiver", "receive", targetSnap)
-	if receive.Command != "zfs receive -u -s "+sc.TargetDataset {
-		t.Fatalf("receive command = %q, want %q", receive.Command, "zfs receive -u -s "+sc.TargetDataset)
-	}
-	if receive.Detail != "args=-u -s" {
-		t.Fatalf("receive detail = %q, want args=-u -s: %#v", receive.Detail, receive)
-	}
-	targetList := requireSingleEvent(t, events, "receiver", "list-snapshot", targetSnap)
-	if targetList.Detail != "exists" {
-		t.Fatalf("target snapshot lookup detail = %q, want exists: %#v", targetList.Detail, targetList)
-	}
-	assertMatchingPayload(t, send, receive)
-	assertEventOrder(t, events, []eventMatch{
-		{role: "sender", action: "list-snapshot", target: sourceSnap},
-		{role: "sender", action: "snapshot", target: sourceSnap},
-		{role: "sender", action: "list-snapshot", target: baseSourceSnap},
-		{role: "sender", action: "get-guid", target: baseSourceSnap},
-		{role: "sender", action: "send", target: sourceSnap},
-		{role: "sender", action: "get-guid", target: sourceSnap},
-	})
-	assertEventOrder(t, events, []eventMatch{
-		{role: "receiver", action: "get-guid", target: baseTargetSnap},
-		{role: "receiver", action: "get-mounted", target: sc.TargetDataset},
-		{role: "receiver", action: "receive", target: targetSnap},
-		{role: "receiver", action: "list-snapshot", target: targetSnap},
-	})
-	return guid.SHA256
-}
-
-func assertFailIfNoBaseEvents(t *testing.T, sc replicationCase, events []zfsSimEvent) {
-	t.Helper()
-	sourceSnap := sc.sourceSnapshot()
-	sourceList := requireSingleEvent(t, events, "sender", "list-snapshot", sourceSnap)
-	if sourceList.Detail != "missing" {
-		t.Fatalf("source snapshot lookup detail = %q, want missing: %#v", sourceList.Detail, sourceList)
-	}
-	requireSingleEvent(t, events, "sender", "snapshot", sourceSnap)
-	requireNoEvent(t, events, "sender", "send", "")
-	requireNoEvent(t, events, "sender", "get-guid", "")
-	requireNoEvent(t, events, "receiver", "destroy", "")
-	requireNoEvent(t, events, "receiver", "receive", "")
-}
-
-func assertSendFailureEvents(t *testing.T, sc replicationCase, events []zfsSimEvent) {
-	t.Helper()
-	sourceSnap := sc.sourceSnapshot()
-	requireSingleEvent(t, events, "sender", "snapshot", sourceSnap)
-	send := requireSingleEvent(t, events, "sender", "send", sourceSnap)
-	if send.Detail != "forced failure" {
-		t.Fatalf("send detail = %q, want forced failure: %#v", send.Detail, send)
-	}
-	requireNoEvent(t, events, "sender", "get-guid", "")
-	for _, receive := range matchingEvents(events, "receiver", "receive", "") {
-		if receive.Detail != "invalid stream" {
-			t.Fatalf("receiver receive detail = %q, want invalid stream after forced send failure: %#v\nall events:\n%s", receive.Detail, receive, formatZFSEvents(events))
-		}
-	}
-}
-
-func assertReceiveFailureEvents(t *testing.T, sc replicationCase, events []zfsSimEvent) {
-	t.Helper()
-	sourceSnap := sc.sourceSnapshot()
-	targetSnap := sc.targetSnapshot()
-	send := requireSingleEvent(t, events, "sender", "send", sourceSnap)
-	assertPayloadRecorded(t, send)
-	receive := requireSingleEvent(t, events, "receiver", "receive", targetSnap)
-	if receive.Detail != "forced failure" {
-		t.Fatalf("receive detail = %q, want forced failure: %#v", receive.Detail, receive)
-	}
-	requireNoEvent(t, events, "sender", "get-guid", "")
-	requireNoEvent(t, events, "receiver", "list-snapshot", targetSnap)
-}
-
-func assertMountedTargetEvents(t *testing.T, sc replicationCase, events []zfsSimEvent) {
-	t.Helper()
-	sourceSnap := sc.sourceSnapshot()
-	send := requireSingleEvent(t, events, "sender", "send", sourceSnap)
-	assertPayloadRecorded(t, send)
-	requireSingleEvent(t, events, "receiver", "get-mounted", sc.TargetDataset)
-	requireNoEvent(t, events, "receiver", "destroy", "")
-	requireNoEvent(t, events, "receiver", "receive", "")
-	requireNoEvent(t, events, "sender", "get-guid", "")
-}
-
-type eventMatch struct {
-	role   string
-	action string
-	target string
-}
-
-func requireSingleEvent(t *testing.T, events []zfsSimEvent, role, action, target string) zfsSimEvent {
-	t.Helper()
-	matches := matchingEvents(events, role, action, target)
-	if len(matches) != 1 {
-		t.Fatalf("found %d events for role=%s action=%s target=%s, want exactly 1\nall events:\n%s", len(matches), role, action, target, formatZFSEvents(events))
-	}
-	return matches[0]
-}
-
-func requireNoEvent(t *testing.T, events []zfsSimEvent, role, action, target string) {
-	t.Helper()
-	if matches := matchingEvents(events, role, action, target); len(matches) != 0 {
-		t.Fatalf("found %d unexpected events for role=%s action=%s target=%s\nmatches:\n%s\nall events:\n%s", len(matches), role, action, target, formatZFSEvents(matches), formatZFSEvents(events))
-	}
-}
-
-func matchingEvents(events []zfsSimEvent, role, action, target string) []zfsSimEvent {
-	var matches []zfsSimEvent
-	for _, event := range events {
-		if event.Role != role || event.Action != action {
-			continue
-		}
-		if target != "" && event.Target != target {
-			continue
-		}
-		matches = append(matches, event)
-	}
-	return matches
-}
-
-func assertPayloadRecorded(t *testing.T, event zfsSimEvent) {
-	t.Helper()
-	if event.Bytes <= 0 || event.SHA256 == "" {
-		t.Fatalf("%s did not record payload bytes and hash: %#v", event.Action, event)
-	}
-}
-
-func assertMatchingPayload(t *testing.T, send, receive zfsSimEvent) {
-	t.Helper()
-	if receive.Bytes != send.Bytes || receive.SHA256 != send.SHA256 {
-		t.Fatalf("receive payload = %d/%s, want send payload %d/%s", receive.Bytes, receive.SHA256, send.Bytes, send.SHA256)
-	}
-}
-
-func assertEventOrder(t *testing.T, events []zfsSimEvent, want []eventMatch) {
-	t.Helper()
-
-	next := 0
-	for _, event := range events {
-		if next >= len(want) {
-			return
-		}
-		match := want[next]
-		if event.Role == match.role && event.Action == match.action && event.Target == match.target {
-			next++
-		}
-	}
-	if next != len(want) {
-		t.Fatalf("events did not appear in expected order, matched %d of %d\nwant: %#v\nall events:\n%s", next, len(want), want, formatZFSEvents(events))
-	}
-}
-
-func formatZFSEvents(events []zfsSimEvent) string {
-	var b strings.Builder
-	for _, event := range events {
-		_, _ = fmt.Fprintf(&b, "%s %s %s %s run=%s %q bytes=%d sha=%s detail=%q\n", event.Role, event.Node, event.Action, event.Target, event.RunID, event.Command, event.Bytes, event.SHA256, event.Detail)
-	}
-	return b.String()
 }
 
 func realZFSJobManifest(t *testing.T, node, name, script string) []byte {
@@ -1175,17 +747,6 @@ func jobFailureMessage(job jobObject) string {
 	return "unknown failure"
 }
 
-func skipIfRealZFS(t *testing.T) {
-	t.Helper()
-	if realZFSEnabled() {
-		t.Skip("simulator e2e test is disabled in real ZFS mode")
-	}
-}
-
-func realZFSEnabled() bool {
-	return os.Getenv("E2E_ZFS_MODE") == "real" || os.Getenv("E2E_REAL_ZFS") == "1"
-}
-
 func realZFSPool() string {
 	if pool := os.Getenv("E2E_REAL_ZFS_POOL"); pool != "" {
 		return pool
@@ -1196,9 +757,6 @@ func realZFSPool() string {
 func e2eImageTag() string {
 	if image := os.Getenv("E2E_IMAGE_TAG"); image != "" {
 		return image
-	}
-	if realZFSEnabled() {
-		return "zfsreplicationcontroller:e2e-real"
 	}
 	return "zfsreplicationcontroller:e2e"
 }

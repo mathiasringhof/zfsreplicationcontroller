@@ -31,6 +31,10 @@ type fakeRunner struct {
 
 func (f *fakeRunner) Run(_ context.Context, name string, args ...string) (string, string, error) {
 	f.calls = append(f.calls, call{name: name, args: args})
+	if name == "syncoid" {
+		f.replicateSyncoid(args)
+		return "", "", nil
+	}
 	if strings.Join(args, " ") == "destroy -r tank/dst" {
 		return "", f.destroyStderr, f.destroyErr
 	}
@@ -61,6 +65,37 @@ func (f *fakeRunner) Run(_ context.Context, name string, args ...string) (string
 		return "123\n", "", nil
 	}
 	return "", "", nil
+}
+
+func (f *fakeRunner) replicateSyncoid(args []string) {
+	if len(args) < 2 {
+		return
+	}
+	srcDataset := args[len(args)-2]
+	dstDataset := args[len(args)-1]
+	if _, dataset, ok := strings.Cut(dstDataset, ":"); ok {
+		dstDataset = dataset
+	}
+	snapshotName := ""
+	for _, arg := range args {
+		if strings.HasPrefix(arg, "--include-snaps=^") && strings.HasSuffix(arg, "$") {
+			snapshotName = strings.TrimSuffix(strings.TrimPrefix(arg, "--include-snaps=^"), "$")
+			break
+		}
+	}
+	if snapshotName == "" {
+		return
+	}
+	srcSnap := srcDataset + "@" + snapshotName
+	if !f.snapshots[srcSnap] {
+		return
+	}
+	dstSnap := dstDataset + "@" + snapshotName
+	f.snapshots[dstSnap] = true
+	if f.guids == nil {
+		f.guids = map[string]string{}
+	}
+	f.guids[dstSnap] = f.guids[srcSnap]
 }
 
 func (f *fakeRunner) StartPipe(_ context.Context, name string, args ...string) (io.ReadCloser, <-chan error, error) {
@@ -98,13 +133,11 @@ func (c closeErrReadCloser) Close() error {
 	return c.err
 }
 
-func TestSenderUsesIncrementalWhenBaseExists(t *testing.T) {
+func TestSenderRunsSyncoidForRunSnapshot(t *testing.T) {
 	tokenFile := writeToken(t)
-	var headers http.Header
-	var gotURL string
+	httpRequests := 0
 	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
-		headers = r.Header.Clone()
-		gotURL = r.URL.String()
+		httpRequests++
 		if _, err := io.Copy(io.Discard, r.Body); err != nil {
 			return nil, err
 		}
@@ -121,8 +154,9 @@ func TestSenderUsesIncrementalWhenBaseExists(t *testing.T) {
 		"tank/src@zsync-run-0": true,
 	}}
 	guid, err := RunSender(context.Background(), SenderConfig{
-		RunID: "run-1", SnapshotPrefix: "zsync", SrcDataset: "tank/src", BaseSnapshot: "zsync-run-0",
+		RunID: "run-1", SnapshotPrefix: "zsync", SrcDataset: "tank/src", DstHost: "root@10.0.0.42", DstDataset: "tank/dst", SSHKeyFile: "/var/run/zfsrep/ssh/id_rsa", SSHPort: "2222", BaseSnapshot: "zsync-run-0",
 		ReceiverURL: "http://receiver/receive", TokenFile: tokenFile, BootstrapMode: "FailIfNoBase",
+		ReceiveUnmounted: true, ReceiveResumable: true,
 	}, runner, client)
 	if err != nil {
 		t.Fatal(err)
@@ -130,28 +164,31 @@ func TestSenderUsesIncrementalWhenBaseExists(t *testing.T) {
 	if guid != "123" {
 		t.Fatalf("guid = %q", guid)
 	}
-	if gotURL != "http://receiver/receive" {
-		t.Fatalf("receiver URL = %q", gotURL)
+	if httpRequests != 0 {
+		t.Fatalf("HTTP stream requests = %d, want syncoid to own replication", httpRequests)
 	}
-	if !hasCall(runner.calls, "send -i tank/src@zsync-run-0 tank/src@zsync-run-1") {
-		t.Fatalf("zfs send -i was not called: %#v", runner.calls)
+	want := "--no-sync-snap --no-rollback --compress=none --sshoption=StrictHostKeyChecking=no --sshoption=UserKnownHostsFile=/dev/null --sshkey=/var/run/zfsrep/ssh/id_rsa --sshport=2222 --recvoptions=u --include-snaps=^zsync-run-1$ --include-snaps=^zsync-run-0$ tank/src root@10.0.0.42:tank/dst"
+	if !hasNamedCall(runner.calls, "syncoid", want) {
+		t.Fatalf("syncoid was not called with %q: %#v", want, runner.calls)
 	}
-	if headers.Get("Authorization") != "Bearer secret-token" || headers.Get("X-ZFSRep-Mode") != "incremental" {
-		t.Fatalf("missing required headers: %#v", headers)
-	}
-	if headers.Get("X-ZFSRep-Base-Snapshot") != "zsync-run-0" {
-		t.Fatalf("base snapshot header = %q, want zsync-run-0", headers.Get("X-ZFSRep-Base-Snapshot"))
-	}
-	if headers.Get("X-ZFSRep-Base-GUID") != "123" {
-		t.Fatalf("base GUID header = %q, want 123", headers.Get("X-ZFSRep-Base-GUID"))
+	if hasCall(runner.calls, "send -i tank/src@zsync-run-0 tank/src@zsync-run-1") {
+		t.Fatalf("zfs send should not be called directly when using syncoid: %#v", runner.calls)
 	}
 }
 
-func TestSenderConfigFromEnvDefaultsSnapshotPrefix(t *testing.T) {
+func TestSenderConfigFromEnvDefaults(t *testing.T) {
 	t.Setenv("SNAPSHOT_PREFIX", "")
+	t.Setenv("RECEIVE_UNMOUNTED", "")
+	t.Setenv("RECEIVE_RESUMABLE", "")
 	cfg := SenderConfigFromEnv()
 	if cfg.SnapshotPrefix != "zsync" {
 		t.Fatalf("SnapshotPrefix = %q, want zsync", cfg.SnapshotPrefix)
+	}
+	if !cfg.ReceiveUnmounted {
+		t.Fatalf("ReceiveUnmounted = false, want true")
+	}
+	if !cfg.ReceiveResumable {
+		t.Fatalf("ReceiveResumable = false, want true")
 	}
 }
 
@@ -222,6 +259,12 @@ func TestConfigFromEnvExplicitValuesOverrideDefaults(t *testing.T) {
 	if sender.SnapshotPrefix != "nightly" {
 		t.Fatalf("sender SnapshotPrefix = %q, want nightly", sender.SnapshotPrefix)
 	}
+	if sender.ReceiveUnmounted {
+		t.Fatalf("sender ReceiveUnmounted = true, want false")
+	}
+	if sender.ReceiveResumable {
+		t.Fatalf("sender ReceiveResumable = true, want false")
+	}
 	receiver := ReceiverConfigFromEnv()
 	if receiver.BootstrapMode != BootstrapDestroyTargetAndReceiveFull {
 		t.Fatalf("receiver BootstrapMode = %q, want %s", receiver.BootstrapMode, BootstrapDestroyTargetAndReceiveFull)
@@ -268,89 +311,7 @@ func TestSenderRefusesFullWhenBootstrapDisabled(t *testing.T) {
 	}
 }
 
-func TestSenderHTTPNon2xxIncludesReceiverStatusAndBody(t *testing.T) {
-	tokenFile := writeToken(t)
-	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
-		if _, err := io.Copy(io.Discard, r.Body); err != nil {
-			return nil, err
-		}
-		return &http.Response{
-			StatusCode: http.StatusTeapot,
-			Status:     "418 I'm a teapot",
-			Body:       io.NopCloser(strings.NewReader("short and stout")),
-			Header:     http.Header{},
-		}, nil
-	})}
-	runner := &fakeRunner{snapshots: map[string]bool{
-		"tank/src@zsync-run-1": true,
-		"tank/src@zsync-run-0": true,
-	}}
-	_, err := RunSender(context.Background(), SenderConfig{
-		RunID: "run-1", SnapshotPrefix: "zsync", SrcDataset: "tank/src", BaseSnapshot: "zsync-run-0",
-		ReceiverURL: "http://receiver/receive", TokenFile: tokenFile, BootstrapMode: "FailIfNoBase",
-	}, runner, client)
-	if err == nil || !strings.Contains(err.Error(), "HTTP stream failed") || !strings.Contains(err.Error(), "418 I'm a teapot") || !strings.Contains(err.Error(), "short and stout") {
-		t.Fatalf("error = %v", err)
-	}
-}
-
-func TestSenderHTTPClientErrorIsWrappedAsStreamFailure(t *testing.T) {
-	tokenFile := writeToken(t)
-	clientErr := errors.New("connection reset")
-	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
-		if _, err := io.Copy(io.Discard, r.Body); err != nil {
-			return nil, err
-		}
-		return nil, clientErr
-	})}
-	runner := &fakeRunner{snapshots: map[string]bool{
-		"tank/src@zsync-run-1": true,
-		"tank/src@zsync-run-0": true,
-	}}
-	_, err := RunSender(context.Background(), SenderConfig{
-		RunID: "run-1", SnapshotPrefix: "zsync", SrcDataset: "tank/src", BaseSnapshot: "zsync-run-0",
-		ReceiverURL: "http://receiver/receive", TokenFile: tokenFile, BootstrapMode: "FailIfNoBase",
-	}, runner, client)
-	if err == nil || !strings.Contains(err.Error(), "HTTP stream failed") || !strings.Contains(err.Error(), "connection reset") {
-		t.Fatalf("error = %v", err)
-	}
-}
-
-func TestSenderSurfacesSendPipeCompletionErrorAfterHTTPRequest(t *testing.T) {
-	tokenFile := writeToken(t)
-	requested := false
-	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
-		requested = true
-		if _, err := io.Copy(io.Discard, r.Body); err != nil {
-			return nil, err
-		}
-		return &http.Response{
-			StatusCode: http.StatusOK,
-			Status:     "200 OK",
-			Body:       io.NopCloser(strings.NewReader("ok")),
-			Header:     http.Header{},
-		}, nil
-	})}
-	runner := &fakeRunner{
-		snapshots: map[string]bool{
-			"tank/src@zsync-run-1": true,
-			"tank/src@zsync-run-0": true,
-		},
-		pipeErr: errors.New("send exited 1"),
-	}
-	_, err := RunSender(context.Background(), SenderConfig{
-		RunID: "run-1", SnapshotPrefix: "zsync", SrcDataset: "tank/src", BaseSnapshot: "zsync-run-0",
-		ReceiverURL: "http://receiver/receive", TokenFile: tokenFile, BootstrapMode: "FailIfNoBase",
-	}, runner, client)
-	if !requested {
-		t.Fatalf("HTTP request was not attempted")
-	}
-	if err == nil || !strings.Contains(err.Error(), "zfs send failed") || !strings.Contains(err.Error(), "send exited 1") {
-		t.Fatalf("error = %v", err)
-	}
-}
-
-func TestSenderIgnoresAlreadyClosedSendPipe(t *testing.T) {
+func TestSenderPassesForceDeleteForDestructiveBootstrap(t *testing.T) {
 	tokenFile := writeToken(t)
 	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		if _, err := io.Copy(io.Discard, r.Body); err != nil {
@@ -363,18 +324,18 @@ func TestSenderIgnoresAlreadyClosedSendPipe(t *testing.T) {
 			Header:     http.Header{},
 		}, nil
 	})}
-	runner := &fakeRunner{
-		snapshots: map[string]bool{
-			"tank/src@zsync-run-1": true,
-		},
-		pipeCloseErr: os.ErrClosed,
-	}
+	runner := &fakeRunner{snapshots: map[string]bool{}}
 	_, err := RunSender(context.Background(), SenderConfig{
-		RunID: "run-1", SnapshotPrefix: "zsync", SrcDataset: "tank/src",
+		RunID: "run-1", SnapshotPrefix: "zsync", SrcDataset: "tank/src", DstHost: "root@10.0.0.42", DstDataset: "tank/dst", SSHKeyFile: "/var/run/zfsrep/ssh/id_rsa", SSHPort: "2222",
 		ReceiverURL: "http://receiver/receive", TokenFile: tokenFile, BootstrapMode: BootstrapDestroyTargetAndReceiveFull,
+		ReceiveUnmounted: true, ReceiveResumable: true,
 	}, runner, client)
 	if err != nil {
 		t.Fatalf("error = %v", err)
+	}
+	want := "--no-sync-snap --no-rollback --compress=none --sshoption=StrictHostKeyChecking=no --sshoption=UserKnownHostsFile=/dev/null --sshkey=/var/run/zfsrep/ssh/id_rsa --sshport=2222 --recvoptions=u --include-snaps=^zsync-run-1$ --force-delete tank/src root@10.0.0.42:tank/dst"
+	if !hasNamedCall(runner.calls, "syncoid", want) {
+		t.Fatalf("destructive bootstrap syncoid call missing %q: %#v", want, runner.calls)
 	}
 }
 
@@ -648,9 +609,17 @@ func hasCall(calls []call, args string) bool {
 	return callIndex(calls, args) != -1
 }
 
+func hasNamedCall(calls []call, name, args string) bool {
+	return callIndexNamed(calls, name, args) != -1
+}
+
 func callIndex(calls []call, args string) int {
+	return callIndexNamed(calls, "zfs", args)
+}
+
+func callIndexNamed(calls []call, name, args string) int {
 	for i, c := range calls {
-		if c.name == "zfs" && strings.Join(c.args, " ") == args {
+		if c.name == name && strings.Join(c.args, " ") == args {
 			return i
 		}
 	}

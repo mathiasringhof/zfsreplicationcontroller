@@ -22,14 +22,8 @@ fi
 if command -v limactl >/dev/null 2>&1; then
   for node in "${E2E_NODES[@]}"; do
     if instance_exists "${node}"; then
-      if [[ "${E2E_ZFS_MODE}" == "real" ]]; then
-        log "collecting real ZFS state from ${node}"
-        run_on_node "${node}" sh -lc "sudo zpool status || true; sudo zpool list || true; sudo zfs list -t all || true" > "${dest}/${node}-zfs-state.txt" || true
-      else
-        log "collecting zfs simulator events from ${node}"
-        run_on_node "${node}" sh -lc "sudo test -f /var/lib/zfs-sim/events.jsonl && sudo cat /var/lib/zfs-sim/events.jsonl || true" > "${dest}/${node}-zfs-events.jsonl" || true
-        run_on_node "${node}" sh -lc "sudo find /var/lib/zfs-sim -maxdepth 3 -type f -print 2>/dev/null || true" > "${dest}/${node}-zfs-files.txt" || true
-      fi
+      log "collecting real ZFS state from ${node}"
+      run_on_node "${node}" sh -lc "sudo zpool status || true; sudo zpool list || true; sudo zfs list -t all || true" > "${dest}/${node}-zfs-state.txt" || true
     fi
   done
 fi

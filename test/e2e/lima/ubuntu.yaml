@@ -21,8 +21,3 @@ provision:
       set -eu
       apt-get update
       apt-get install -y --no-install-recommends curl ca-certificates iproute2
-      if [ ! -e /dev/zfs ]; then
-        touch /dev/zfs
-      fi
-      mkdir -p /var/lib/zfs-sim
-      chmod 0777 /var/lib/zfs-sim

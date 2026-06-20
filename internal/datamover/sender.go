@@ -2,45 +2,56 @@ package datamover
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"os"
+	"regexp"
 	"strings"
 )
 
 const BootstrapDestroyTargetAndReceiveFull = "DestroyTargetAndReceiveFull"
 
 type SenderConfig struct {
-	RunID          string
-	SnapshotPrefix string
-	SnapshotName   string
-	SrcDataset     string
-	BaseSnapshot   string
-	ReceiverURL    string
-	TokenFile      string
-	BootstrapMode  string
-	ExpectedNode   string
-	ActualNode     string
+	RunID            string
+	SnapshotPrefix   string
+	SnapshotName     string
+	SrcDataset       string
+	DstHost          string
+	DstDataset       string
+	SSHKeyFile       string
+	SSHPort          string
+	BaseSnapshot     string
+	ReceiverURL      string
+	TokenFile        string
+	BootstrapMode    string
+	ReceiveUnmounted bool
+	ReceiveResumable bool
+	ExpectedNode     string
+	ActualNode       string
 }
 
 func SenderConfigFromEnv() SenderConfig {
 	return SenderConfig{
-		RunID:          os.Getenv("RUN_ID"),
-		SnapshotPrefix: getenv("SNAPSHOT_PREFIX", "zsync"),
-		SnapshotName:   os.Getenv("SNAPSHOT_NAME"),
-		SrcDataset:     os.Getenv("SRC_DATASET"),
-		BaseSnapshot:   os.Getenv("BASE_SNAPSHOT"),
-		ReceiverURL:    os.Getenv("RECEIVER_URL"),
-		TokenFile:      os.Getenv("TOKEN_FILE"),
-		BootstrapMode:  os.Getenv("BOOTSTRAP_MODE"),
-		ExpectedNode:   os.Getenv("EXPECTED_NODE_NAME"),
-		ActualNode:     os.Getenv("ACTUAL_NODE_NAME"),
+		RunID:            os.Getenv("RUN_ID"),
+		SnapshotPrefix:   getenv("SNAPSHOT_PREFIX", "zsync"),
+		SnapshotName:     os.Getenv("SNAPSHOT_NAME"),
+		SrcDataset:       os.Getenv("SRC_DATASET"),
+		DstHost:          os.Getenv("DST_HOST"),
+		DstDataset:       os.Getenv("DST_DATASET"),
+		SSHKeyFile:       os.Getenv("SSH_KEY_FILE"),
+		SSHPort:          os.Getenv("SSH_PORT"),
+		BaseSnapshot:     os.Getenv("BASE_SNAPSHOT"),
+		ReceiverURL:      os.Getenv("RECEIVER_URL"),
+		TokenFile:        os.Getenv("TOKEN_FILE"),
+		BootstrapMode:    os.Getenv("BOOTSTRAP_MODE"),
+		ReceiveUnmounted: getenv("RECEIVE_UNMOUNTED", "true") == "true",
+		ReceiveResumable: getenv("RECEIVE_RESUMABLE", "true") == "true",
+		ExpectedNode:     os.Getenv("EXPECTED_NODE_NAME"),
+		ActualNode:       os.Getenv("ACTUAL_NODE_NAME"),
 	}
 }
 
-func RunSender(ctx context.Context, cfg SenderConfig, r CommandRunner, client *http.Client) (guid string, err error) {
+func RunSender(ctx context.Context, cfg SenderConfig, r CommandRunner, _ *http.Client) (guid string, err error) {
 	if err := validateNode(cfg.ExpectedNode, cfg.ActualNode); err != nil {
 		return "", err
 	}
@@ -50,14 +61,6 @@ func RunSender(ctx context.Context, cfg SenderConfig, r CommandRunner, client *h
 	if cfg.BootstrapMode == "" {
 		cfg.BootstrapMode = "FailIfNoBase"
 	}
-	if client == nil {
-		client = http.DefaultClient
-	}
-	tokenBytes, err := os.ReadFile(cfg.TokenFile)
-	if err != nil {
-		return "", fmt.Errorf("read token: %w", err)
-	}
-	token := strings.TrimSpace(string(tokenBytes))
 	srcSnap := cfg.SrcDataset + "@" + cfg.SnapshotName
 	if !snapshotExists(ctx, r, srcSnap) {
 		if _, stderr, err := r.Run(ctx, "zfs", "snapshot", srcSnap); err != nil {
@@ -65,67 +68,49 @@ func RunSender(ctx context.Context, cfg SenderConfig, r CommandRunner, client *h
 		}
 	}
 
-	mode := "full"
-	args := []string{"send", srcSnap}
-	baseGUID := ""
-	if cfg.BaseSnapshot != "" && snapshotExists(ctx, r, cfg.SrcDataset+"@"+cfg.BaseSnapshot) {
-		var stderr string
-		mode = "incremental"
-		baseSnap := cfg.SrcDataset + "@" + cfg.BaseSnapshot
-		baseGUID, stderr, err = snapshotGUIDValue(ctx, r, baseSnap)
-		if err != nil {
-			return "", fmt.Errorf("read base snapshot guid: %s", clean(stderr, err))
-		}
-		args = []string{"send", "-i", baseSnap, srcSnap}
-	} else if cfg.BootstrapMode != BootstrapDestroyTargetAndReceiveFull {
+	baseExists := cfg.BaseSnapshot != "" && snapshotExists(ctx, r, cfg.SrcDataset+"@"+cfg.BaseSnapshot)
+	if !baseExists && cfg.BootstrapMode != BootstrapDestroyTargetAndReceiveFull {
 		return "", fmt.Errorf("no base snapshot and destructive bootstrap disabled")
 	}
 
-	body, done, err := r.StartPipe(ctx, "zfs", args...)
-	if err != nil {
-		return "", fmt.Errorf("zfs send failed: %w", err)
+	args := []string{
+		"--no-sync-snap",
+		"--no-rollback",
+		"--compress=none",
+		"--sshoption=StrictHostKeyChecking=no",
+		"--sshoption=UserKnownHostsFile=/dev/null",
 	}
-	defer func() {
-		if closeErr := body.Close(); closeErr != nil && err == nil {
-			if errors.Is(closeErr, os.ErrClosed) {
-				return
-			}
-			err = fmt.Errorf("close zfs send pipe: %w", closeErr)
-		}
-	}()
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, cfg.ReceiverURL, body)
-	if err != nil {
-		return "", err
+	if cfg.SSHKeyFile != "" {
+		args = append(args, "--sshkey="+cfg.SSHKeyFile)
 	}
-	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("X-ZFSRep-Run-ID", cfg.RunID)
-	req.Header.Set("X-ZFSRep-Snapshot", cfg.SnapshotName)
-	req.Header.Set("X-ZFSRep-Mode", mode)
-	if mode == "incremental" {
-		req.Header.Set("X-ZFSRep-Base-Snapshot", cfg.BaseSnapshot)
-		req.Header.Set("X-ZFSRep-Base-GUID", baseGUID)
+	if cfg.SSHPort != "" {
+		args = append(args, "--sshport="+cfg.SSHPort)
 	}
-	req.Header.Set("Content-Type", "application/octet-stream")
-
-	resp, err := client.Do(req)
-	if err != nil {
-		<-done
-		return "", fmt.Errorf("HTTP stream failed: %w", err)
+	if cfg.ReceiveUnmounted {
+		args = append(args, "--recvoptions=u")
 	}
-	respBody, readErr := io.ReadAll(io.LimitReader(resp.Body, 4096))
-	if closeErr := resp.Body.Close(); closeErr != nil {
-		return "", fmt.Errorf("close HTTP response body: %w", closeErr)
+	if !cfg.ReceiveResumable {
+		args = append(args, "--no-resume")
 	}
-	if readErr != nil {
-		return "", fmt.Errorf("read HTTP response body: %w", readErr)
+	args = append(args, "--include-snaps=^"+regexp.QuoteMeta(cfg.SnapshotName)+"$")
+	if baseExists {
+		args = append(args, "--include-snaps=^"+regexp.QuoteMeta(cfg.BaseSnapshot)+"$")
 	}
-	if err := <-done; err != nil {
-		return "", fmt.Errorf("zfs send failed: %w", err)
+	if cfg.BootstrapMode == BootstrapDestroyTargetAndReceiveFull {
+		args = append(args, "--force-delete")
 	}
-	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return "", fmt.Errorf("HTTP stream failed: %s: %s", resp.Status, strings.TrimSpace(string(respBody)))
+	args = append(args, cfg.SrcDataset, syncoidTarget(cfg.DstHost, cfg.DstDataset))
+	if _, stderr, err := r.Run(ctx, "syncoid", args...); err != nil {
+		return "", fmt.Errorf("syncoid failed: %s", clean(stderr, err))
 	}
 	return snapshotGUID(ctx, r, srcSnap), nil
+}
+
+func syncoidTarget(host, dataset string) string {
+	if host == "" {
+		return dataset
+	}
+	return host + ":" + dataset
 }
 
 func getenv(key, def string) string {

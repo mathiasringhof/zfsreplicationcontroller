@@ -1,0 +1,31 @@
+#!/bin/sh
+set -eu
+
+if [ "${EXPECTED_NODE_NAME:-}" != "" ] && [ "${ACTUAL_NODE_NAME:-}" != "${EXPECTED_NODE_NAME}" ]; then
+	printf 'node verification failed: expected %s, got %s\n' "${EXPECTED_NODE_NAME}" "${ACTUAL_NODE_NAME:-}" >&2
+	exit 1
+fi
+
+authorized_keys="${SSH_AUTHORIZED_KEYS_FILE:-/var/run/zfsrep/ssh/authorized_keys}"
+listen_port="${SSH_LISTEN_PORT:-2222}"
+
+mkdir -p /root/.ssh /run/sshd
+cp "${authorized_keys}" /root/.ssh/authorized_keys
+chmod 700 /root/.ssh
+chmod 600 /root/.ssh/authorized_keys
+ssh-keygen -A >/dev/null
+
+cat >/tmp/zfsrep-sshd_config <<EOF
+Port ${listen_port}
+ListenAddress 0.0.0.0
+PermitRootLogin prohibit-password
+PubkeyAuthentication yes
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+UsePAM no
+PidFile /run/sshd/zfsrep-sshd.pid
+AuthorizedKeysFile .ssh/authorized_keys
+Subsystem sftp internal-sftp
+EOF
+
+exec /usr/sbin/sshd -D -e -f /tmp/zfsrep-sshd_config

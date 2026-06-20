@@ -32,124 +32,82 @@ func TestReconcileNoRunIDCreatesNoJobs(t *testing.T) {
 	}
 }
 
-func TestReconcileNewRunCreatesReceiverSecretAndReceiverJobOnly(t *testing.T) {
+func TestReconcileNewRunStartsSSHReceiverBeforeSender(t *testing.T) {
 	r := newReconciler(t, replication("manual-1"))
 	if _, err := r.Reconcile(context.Background(), request("rep")); err != nil {
 		t.Fatal(err)
 	}
-	assertExists[*corev1.Secret](t, r.Client, "zfsrep-rep-manual-1-token")
+	assertExists[*corev1.Secret](t, r.Client, "zfsrep-rep-manual-1-ssh")
 	assertExists[*batchv1.Job](t, r.Client, "zfsrep-rep-manual-1-receiver")
 	assertMissing[*corev1.Service](t, r.Client, "zfsrep-rep-manual-1-receiver")
 	assertMissing[*batchv1.Job](t, r.Client, "zfsrep-rep-manual-1-sender")
 }
 
-func TestReconcileDoesNotCreateSenderBeforeReceiverPodExists(t *testing.T) {
+func TestReconcileSenderJobUsesSyncoidSSHReceiverEnv(t *testing.T) {
 	rep := replication("manual-1")
-	r := newReconciler(t, rep)
-	if _, err := r.Reconcile(context.Background(), request("rep")); err != nil {
-		t.Fatal(err)
-	}
-	assertMissing[*batchv1.Job](t, r.Client, "zfsrep-rep-manual-1-sender")
-}
-
-func TestReconcileDoesNotCreateSenderWhenReceiverPodHasNoIP(t *testing.T) {
-	rep := replication("manual-1")
-	pod := receiverPod(rep, corev1.PodRunning, "", true)
-	r := newReconciler(t, rep, pod)
-	if _, err := r.Reconcile(context.Background(), request("rep")); err != nil {
-		t.Fatal(err)
-	}
-	assertMissing[*batchv1.Job](t, r.Client, "zfsrep-rep-manual-1-sender")
-}
-
-func TestReconcileDoesNotCreateSenderWhenReceiverPodIsNotReady(t *testing.T) {
-	rep := replication("manual-1")
-	pod := receiverPod(rep, corev1.PodRunning, "10.244.3.27", false)
-	r := newReconciler(t, rep, pod)
-	if _, err := r.Reconcile(context.Background(), request("rep")); err != nil {
-		t.Fatal(err)
-	}
-	assertMissing[*batchv1.Job](t, r.Client, "zfsrep-rep-manual-1-sender")
-}
-
-func TestReconcileReceiverUsableCreatesSenderWithPodIP(t *testing.T) {
-	rep := replication("manual-1")
-	pod := receiverReadyPod(rep)
-	r := newReconciler(t, rep, pod)
+	r := newReconciler(t, rep, receiverPod(rep, "10.0.0.42"))
 	if _, err := r.Reconcile(context.Background(), request("rep")); err != nil {
 		t.Fatal(err)
 	}
 	sender := getJob(t, r.Client, "zfsrep-rep-manual-1-sender")
-	if got := envValue(sender, "RECEIVER_URL"); got != "http://10.244.3.27:8080/receive" {
-		t.Fatalf("RECEIVER_URL = %q", got)
+	if got := envValue(sender, "SRC_DATASET"); got != "tank/src" {
+		t.Fatalf("SRC_DATASET = %q", got)
 	}
+	if got := envValue(sender, "DST_HOST"); got != "root@10.0.0.42" {
+		t.Fatalf("DST_HOST = %q", got)
+	}
+	if got := envValue(sender, "SSH_KEY_FILE"); got != "/var/run/zfsrep/ssh/id_rsa" {
+		t.Fatalf("SSH_KEY_FILE = %q", got)
+	}
+	if got := envValue(sender, "SSH_PORT"); got != "2222" {
+		t.Fatalf("SSH_PORT = %q", got)
+	}
+	if got := envValue(sender, "DST_DATASET"); got != "tank/dst" {
+		t.Fatalf("DST_DATASET = %q", got)
+	}
+	if got := envValue(sender, "RECEIVE_UNMOUNTED"); got != "true" {
+		t.Fatalf("RECEIVE_UNMOUNTED = %q", got)
+	}
+	if got := envValue(sender, "RECEIVE_RESUMABLE"); got != "true" {
+		t.Fatalf("RECEIVE_RESUMABLE = %q", got)
+	}
+	if got := envValue(sender, "RECEIVER_URL"); got != "" {
+		t.Fatalf("RECEIVER_URL = %q, want empty for syncoid replication", got)
+	}
+	if got := envValue(sender, "TOKEN_FILE"); got != "" {
+		t.Fatalf("TOKEN_FILE = %q, want empty for syncoid replication", got)
+	}
+	assertHasSecretMount(t, sender, "zfsrep-rep-manual-1-ssh")
 	var got zfsv1.ZFSReplication
 	if err := r.Get(context.Background(), types.NamespacedName{Name: "rep", Namespace: "storage"}, &got); err != nil {
 		t.Fatal(err)
 	}
-	if got.Status.ReceiverPodName != "receiver-pod" || got.Status.ReceiverPodIP != "10.244.3.27" {
+	if got.Status.ReceiverPodName != "receiver-pod" || got.Status.ReceiverPodIP != "10.0.0.42" {
 		t.Fatalf("receiver pod status = name %q ip %q", got.Status.ReceiverPodName, got.Status.ReceiverPodIP)
 	}
 }
 
-func TestReconcileMultipleReadyReceiverPodsFails(t *testing.T) {
-	rep := replication("manual-1")
-	pod1 := receiverReadyPod(rep)
-	pod2 := receiverReadyPod(rep)
-	pod2.Name = "receiver-pod-2"
-	pod2.Status.PodIP = "10.244.3.28"
-	r := newReconciler(t, rep, pod1, pod2)
-	if _, err := r.Reconcile(context.Background(), request("rep")); err != nil {
-		t.Fatal(err)
-	}
-	var got zfsv1.ZFSReplication
-	if err := r.Get(context.Background(), types.NamespacedName{Name: "rep", Namespace: "storage"}, &got); err != nil {
-		t.Fatal(err)
-	}
-	if got.Status.Phase != zfsv1.PhaseFailed || got.Status.LastError != "multiple ready receiver Pods found" {
-		t.Fatalf("status = %#v", got.Status)
-	}
-	assertMissing[*batchv1.Job](t, r.Client, "zfsrep-rep-manual-1-sender")
-}
-
-func TestReconcileFailedReceiverPodBeforeSenderFails(t *testing.T) {
-	rep := replication("manual-1")
-	pod := receiverPod(rep, corev1.PodFailed, "", false)
-	r := newReconciler(t, rep, pod)
-	if _, err := r.Reconcile(context.Background(), request("rep")); err != nil {
-		t.Fatal(err)
-	}
-	var got zfsv1.ZFSReplication
-	if err := r.Get(context.Background(), types.NamespacedName{Name: "rep", Namespace: "storage"}, &got); err != nil {
-		t.Fatal(err)
-	}
-	if got.Status.Phase != zfsv1.PhaseFailed || got.Status.LastError == "" {
-		t.Fatalf("status = %#v", got.Status)
-	}
-	assertMissing[*batchv1.Job](t, r.Client, "zfsrep-rep-manual-1-sender")
-}
-
 func TestDataMoverJobsUseRequestedNodesAndNoRestarts(t *testing.T) {
 	rep := replication("manual-1")
-	r := newReconciler(t, rep, receiverReadyPod(rep))
+	r := newReconciler(t, rep, receiverPod(rep, "10.0.0.42"))
 	if _, err := r.Reconcile(context.Background(), request("rep")); err != nil {
 		t.Fatal(err)
 	}
 	receiver := getJob(t, r.Client, "zfsrep-rep-manual-1-receiver")
-	sender := getJob(t, r.Client, "zfsrep-rep-manual-1-sender")
 	assertJobPlacement(t, receiver, "worker-b")
-	assertJobPlacement(t, sender, "worker-a")
-	if receiver.Spec.Template.Spec.Containers[0].ReadinessProbe == nil {
-		t.Fatalf("receiver readiness probe missing")
+	if receiver.Spec.Template.Spec.Containers[0].ReadinessProbe == nil || receiver.Spec.Template.Spec.Containers[0].ReadinessProbe.TCPSocket == nil {
+		t.Fatalf("receiver TCP readiness probe missing")
 	}
+	sender := getJob(t, r.Client, "zfsrep-rep-manual-1-sender")
+	assertJobPlacement(t, sender, "worker-a")
 	if sender.Spec.Template.Spec.Containers[0].ReadinessProbe != nil {
 		t.Fatalf("sender readiness probe present")
 	}
 }
 
 func TestReconcileSucceededUpdatesStatus(t *testing.T) {
-	rep := replication("manual-1")
-	r := newReconciler(t, rep, receiverReadyPod(rep), succeededJob("zfsrep-rep-manual-1-receiver"), succeededJob("zfsrep-rep-manual-1-sender"))
+	rep := replicationWithReceiverStatus("manual-1")
+	r := newReconciler(t, rep, succeededJob("zfsrep-rep-manual-1-sender"))
 	if _, err := r.Reconcile(context.Background(), request("rep")); err != nil {
 		t.Fatal(err)
 	}
@@ -160,13 +118,16 @@ func TestReconcileSucceededUpdatesStatus(t *testing.T) {
 	if got.Status.Phase != zfsv1.PhaseSucceeded || got.Status.LastSuccessfulRunID != "manual-1" {
 		t.Fatalf("status = %#v", got.Status)
 	}
-	assertMissing[*corev1.Service](t, r.Client, "zfsrep-rep-manual-1-receiver")
-	assertMissing[*corev1.Secret](t, r.Client, "zfsrep-rep-manual-1-token")
+	if got.Status.ReceiverJobName != "zfsrep-rep-manual-1-receiver" || got.Status.ReceiverPodName != "receiver-pod" || got.Status.ReceiverPodIP != "10.0.0.42" || got.Status.TokenSecretName != "zfsrep-rep-manual-1-ssh" {
+		t.Fatalf("receiver/ssh status missing: %#v", got.Status)
+	}
+	assertMissing[*batchv1.Job](t, r.Client, "zfsrep-rep-manual-1-receiver")
+	assertMissing[*corev1.Secret](t, r.Client, "zfsrep-rep-manual-1-ssh")
 }
 
 func TestReconcileSucceededStoresSnapshotGUIDFromSenderLogs(t *testing.T) {
-	rep := replication("manual-1")
-	r := newReconciler(t, rep, receiverReadyPod(rep), senderPod(rep), succeededJob("zfsrep-rep-manual-1-receiver"), succeededJob("zfsrep-rep-manual-1-sender"))
+	rep := replicationWithReceiverStatus("manual-1")
+	r := newReconciler(t, rep, senderPod(rep), succeededJob("zfsrep-rep-manual-1-sender"))
 	r.PodLogs = fakePodLogs{logs: map[string]string{"sender-pod": "noise\nsnapshot_guid=guid-123\n"}}
 	if _, err := r.Reconcile(context.Background(), request("rep")); err != nil {
 		t.Fatal(err)
@@ -185,25 +146,25 @@ func TestDataMoverJobsIncludeSimulatorStateWhenConfigured(t *testing.T) {
 	rep.Annotations = map[string]string{
 		labelPrefix + "/sim-env-ZFS_SIM_FAIL_SEND": "1",
 	}
-	r := newReconciler(t, rep)
+	r := newReconciler(t, rep, receiverPod(rep, "10.0.0.42"))
 	r.SimulatorStateHostPath = "/var/lib/zfs-sim"
 	if _, err := r.Reconcile(context.Background(), request("rep")); err != nil {
 		t.Fatal(err)
 	}
-	receiver := getJob(t, r.Client, "zfsrep-rep-manual-1-receiver")
-	if got := envValue(receiver, "ZFS_SIM_ROOT"); got != "/var/lib/zfs-sim" {
+	sender := getJob(t, r.Client, "zfsrep-rep-manual-1-sender")
+	if got := envValue(sender, "ZFS_SIM_ROOT"); got != "/var/lib/zfs-sim" {
 		t.Fatalf("ZFS_SIM_ROOT = %q", got)
 	}
-	if got := envValue(receiver, "ZFS_SIM_FAIL_SEND"); got != "1" {
+	if got := envValue(sender, "ZFS_SIM_FAIL_SEND"); got != "1" {
 		t.Fatalf("ZFS_SIM_FAIL_SEND = %q", got)
 	}
-	assertHasVolume(t, receiver, "zfs-sim", "/var/lib/zfs-sim")
-	assertHasVolumeMount(t, receiver, "zfs-sim", "/var/lib/zfs-sim")
+	assertHasVolume(t, sender, "zfs-sim", "/var/lib/zfs-sim")
+	assertHasVolumeMount(t, sender, "zfs-sim", "/var/lib/zfs-sim")
 }
 
 func TestReconcileSenderFailedDoesNotUpdateSuccess(t *testing.T) {
 	rep := replication("manual-1")
-	r := newReconciler(t, rep, receiverReadyPod(rep), succeededJob("zfsrep-rep-manual-1-receiver"), failedJob("zfsrep-rep-manual-1-sender"))
+	r := newReconciler(t, rep, failedJob("zfsrep-rep-manual-1-sender"))
 	if _, err := r.Reconcile(context.Background(), request("rep")); err != nil {
 		t.Fatal(err)
 	}
@@ -221,8 +182,8 @@ func TestReconcileSenderFailedUsesPodLogMessage(t *testing.T) {
 	pod := senderPod(rep)
 	pod.Labels["job-name"] = "zfsrep-rep-manual-1-sender"
 	pod.Labels["batch.kubernetes.io/job-name"] = "zfsrep-rep-manual-1-sender"
-	r := newReconciler(t, rep, receiverReadyPod(rep), pod, succeededJob("zfsrep-rep-manual-1-receiver"), failedJob("zfsrep-rep-manual-1-sender"))
-	r.PodLogs = fakePodLogs{logs: map[string]string{"sender-pod": "zfs-sim-event {}\nzfs send failed: forced send failure\n"}}
+	r := newReconciler(t, rep, pod, failedJob("zfsrep-rep-manual-1-sender"))
+	r.PodLogs = fakePodLogs{logs: map[string]string{"sender-pod": "zfs-sim-event {}\nsyncoid failed: forced send failure\n"}}
 	if _, err := r.Reconcile(context.Background(), request("rep")); err != nil {
 		t.Fatal(err)
 	}
@@ -230,7 +191,7 @@ func TestReconcileSenderFailedUsesPodLogMessage(t *testing.T) {
 	if err := r.Get(context.Background(), types.NamespacedName{Name: "rep", Namespace: "storage"}, &got); err != nil {
 		t.Fatal(err)
 	}
-	if got.Status.LastError != "zfs send failed: forced send failure" {
+	if got.Status.LastError != "syncoid failed: forced send failure" {
 		t.Fatalf("LastError = %q", got.Status.LastError)
 	}
 }
@@ -243,6 +204,19 @@ func TestReconcileAlreadySucceededStartsNothing(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertMissing[*batchv1.Job](t, r.Client, "zfsrep-rep-manual-1-receiver")
+	assertMissing[*corev1.Secret](t, r.Client, "zfsrep-rep-manual-1-ssh")
+}
+
+func TestReconcileAlreadyFailedStartsNothing(t *testing.T) {
+	rep := replication("manual-1")
+	rep.Status.Phase = zfsv1.PhaseFailed
+	rep.Status.LastAttemptedRunID = "manual-1"
+	r := newReconciler(t, rep)
+	if _, err := r.Reconcile(context.Background(), request("rep")); err != nil {
+		t.Fatal(err)
+	}
+	assertMissing[*batchv1.Job](t, r.Client, "zfsrep-rep-manual-1-receiver")
+	assertMissing[*corev1.Secret](t, r.Client, "zfsrep-rep-manual-1-ssh")
 }
 
 func TestReconcileActiveLeaseHeldByDifferentRunBlocksNewRun(t *testing.T) {
@@ -255,7 +229,7 @@ func TestReconcileActiveLeaseHeldByDifferentRunBlocksNewRun(t *testing.T) {
 	if result.RequeueAfter < 14*time.Second || result.RequeueAfter > 16*time.Second {
 		t.Fatalf("RequeueAfter = %s, want around 15s", result.RequeueAfter)
 	}
-	assertMissing[*corev1.Secret](t, r.Client, "zfsrep-rep-manual-2-token")
+	assertMissing[*corev1.Secret](t, r.Client, "zfsrep-rep-manual-2-ssh")
 	assertMissing[*batchv1.Job](t, r.Client, "zfsrep-rep-manual-2-receiver")
 	assertMissing[*batchv1.Job](t, r.Client, "zfsrep-rep-manual-2-sender")
 }
@@ -275,8 +249,9 @@ func TestReconcileNonActiveLeaseCanBeReusedByNewRun(t *testing.T) {
 			if _, err := r.Reconcile(context.Background(), request("rep")); err != nil {
 				t.Fatal(err)
 			}
-			assertExists[*corev1.Secret](t, r.Client, "zfsrep-rep-manual-2-token")
+			assertExists[*corev1.Secret](t, r.Client, "zfsrep-rep-manual-2-ssh")
 			assertExists[*batchv1.Job](t, r.Client, "zfsrep-rep-manual-2-receiver")
+			assertMissing[*batchv1.Job](t, r.Client, "zfsrep-rep-manual-2-sender")
 
 			var got coordinationv1.Lease
 			if err := r.Get(context.Background(), types.NamespacedName{Name: "zfsrep-rep", Namespace: "storage"}, &got); err != nil {
@@ -322,12 +297,31 @@ func replication(runID string) *zfsv1.ZFSReplication {
 	}
 }
 
+func replicationWithReceiverStatus(runID string) *zfsv1.ZFSReplication {
+	rep := replication(runID)
+	rep.Status.ReceiverPodName = "receiver-pod"
+	rep.Status.ReceiverPodIP = "10.0.0.42"
+	return rep
+}
+
 func request(name string) ctrl.Request {
 	return ctrl.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: "storage"}}
 }
 
-func receiverReadyPod(rep *zfsv1.ZFSReplication) *corev1.Pod {
-	return receiverPod(rep, corev1.PodRunning, "10.244.3.27", true)
+func receiverPod(rep *zfsv1.ZFSReplication, ip string) *corev1.Pod {
+	names := objectNames(rep)
+	labels := cloneLabels(names.Labels)
+	labels[labelPrefix+"/role"] = "receiver"
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "receiver-pod", Namespace: "storage", Labels: labels},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+			PodIP: ip,
+			Conditions: []corev1.PodCondition{
+				{Type: corev1.PodReady, Status: corev1.ConditionTrue},
+			},
+		},
+	}
 }
 
 func senderPod(rep *zfsv1.ZFSReplication) *corev1.Pod {
@@ -337,24 +331,6 @@ func senderPod(rep *zfsv1.ZFSReplication) *corev1.Pod {
 	return &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Name: "sender-pod", Namespace: "storage", Labels: labels},
 		Status:     corev1.PodStatus{Phase: corev1.PodSucceeded},
-	}
-}
-
-func receiverPod(rep *zfsv1.ZFSReplication, phase corev1.PodPhase, podIP string, ready bool) *corev1.Pod {
-	names := objectNames(rep)
-	labels := cloneLabels(names.Labels)
-	labels[labelPrefix+"/role"] = "receiver"
-	conditionStatus := corev1.ConditionFalse
-	if ready {
-		conditionStatus = corev1.ConditionTrue
-	}
-	return &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{Name: "receiver-pod", Namespace: "storage", Labels: labels},
-		Status: corev1.PodStatus{
-			Phase:      phase,
-			PodIP:      podIP,
-			Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: conditionStatus}},
-		},
 	}
 }
 
@@ -438,6 +414,16 @@ func assertHasVolumeMount(t *testing.T, job *batchv1.Job, name, path string) {
 		}
 	}
 	t.Fatalf("%s volumeMount %s at %s missing: %#v", job.Name, name, path, job.Spec.Template.Spec.Containers[0].VolumeMounts)
+}
+
+func assertHasSecretMount(t *testing.T, job *batchv1.Job, secretName string) {
+	t.Helper()
+	for _, volume := range job.Spec.Template.Spec.Volumes {
+		if volume.Name == "ssh" && volume.Secret != nil && volume.Secret.SecretName == secretName && volume.Secret.DefaultMode != nil && *volume.Secret.DefaultMode == 0400 {
+			return
+		}
+	}
+	t.Fatalf("%s ssh secret mount for %s missing: %#v", job.Name, secretName, job.Spec.Template.Spec.Volumes)
 }
 
 func assertExists[T client.Object](t *testing.T, c client.Client, name string) {

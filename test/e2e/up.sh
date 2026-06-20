@@ -11,13 +11,6 @@ for node in "${E2E_NODES[@]}"; do
   start_instance "${node}"
 done
 
-log "preparing VM host paths"
-for node in "${E2E_NODES[@]}"; do
-  run_on_node "${node}" sh -lc "sudo test -e /dev/zfs || sudo touch /dev/zfs"
-  run_on_node "${node}" sudo mkdir -p /var/lib/zfs-sim
-  run_on_node "${node}" sudo chmod 0777 /var/lib/zfs-sim
-done
-
 prepare_real_zfs_worker() {
   local node="$1"
   log "preparing real ZFS pool ${REAL_ZFS_POOL} on ${node}"
@@ -41,11 +34,9 @@ prepare_real_zfs_worker() {
   "
 }
 
-if [[ "${E2E_ZFS_MODE}" == "real" ]]; then
-  for worker in "${E2E_WORKERS[@]}"; do
-    prepare_real_zfs_worker "${worker}"
-  done
-fi
+for worker in "${E2E_WORKERS[@]}"; do
+  prepare_real_zfs_worker "${worker}"
+done
 
 if ! run_on_node "${CONTROL_PLANE}" test -x /usr/local/bin/k3s; then
   log "installing k3s server on ${CONTROL_PLANE}"
