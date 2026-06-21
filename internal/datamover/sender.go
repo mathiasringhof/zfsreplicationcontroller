@@ -45,9 +45,9 @@ func SenderConfigFromEnv() SenderConfig {
 	}
 }
 
-func RunSender(ctx context.Context, cfg SenderConfig, r CommandRunner) (guid string, err error) {
+func RunSender(ctx context.Context, cfg SenderConfig, r CommandRunner) error {
 	if err := validateNode(cfg.ExpectedNode, cfg.ActualNode); err != nil {
-		return "", err
+		return err
 	}
 	var args []string
 	if cfg.NoSyncSnap {
@@ -86,9 +86,9 @@ func RunSender(ctx context.Context, cfg SenderConfig, r CommandRunner) (guid str
 	}
 	args = append(args, cfg.SrcDataset, syncoidTarget(cfg.DstHost, cfg.DstDataset))
 	if _, stderr, err := r.Run(ctx, "syncoid", args...); err != nil {
-		return "", fmt.Errorf("syncoid failed: %s", clean(stderr, err))
+		return fmt.Errorf("syncoid failed: %s", clean(stderr, err))
 	}
-	return "", nil
+	return nil
 }
 
 func syncoidTarget(host, dataset string) string {

@@ -12,11 +12,9 @@ const labelPrefix = "zfsreplication.example.com"
 type runObjects struct {
 	BaseName     string
 	RunName      string
-	SnapshotName string
 	SecretName   string
 	ReceiverName string
 	SenderName   string
-	SpecHash     string
 	Labels       map[string]string
 }
 

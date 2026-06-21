@@ -8,6 +8,11 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+type validationRule struct {
+	Rule    string `yaml:"rule"`
+	Message string `yaml:"message"`
+}
+
 func TestControllerClusterRoleHasRequiredPermissions(t *testing.T) {
 	t.Helper()
 
@@ -72,10 +77,11 @@ func TestCRDSchemaExposesSyncoidOptions(t *testing.T) {
 	}
 
 	type schemaNode struct {
-		Default    any                   `yaml:"default"`
-		Properties map[string]schemaNode `yaml:"properties"`
-		Items      *schemaNode           `yaml:"items"`
-		Type       string                `yaml:"type"`
+		Default                any                   `yaml:"default"`
+		Properties             map[string]schemaNode `yaml:"properties"`
+		Items                  *schemaNode           `yaml:"items"`
+		Type                   string                `yaml:"type"`
+		XKubernetesValidations []validationRule      `yaml:"x-kubernetes-validations"`
 	}
 	var crd struct {
 		Spec struct {
@@ -92,7 +98,8 @@ func TestCRDSchemaExposesSyncoidOptions(t *testing.T) {
 	if len(crd.Spec.Versions) == 0 {
 		t.Fatalf("%s has no versions", crdPath)
 	}
-	specProps := crd.Spec.Versions[0].Schema.OpenAPIV3Schema.Properties["spec"].Properties
+	runSpec := crd.Spec.Versions[0].Schema.OpenAPIV3Schema.Properties["spec"]
+	specProps := runSpec.Properties
 	syncoidProps := specProps["syncoid"].Properties
 
 	if syncoidProps["noSyncSnap"].Type != "boolean" {
@@ -103,6 +110,9 @@ func TestCRDSchemaExposesSyncoidOptions(t *testing.T) {
 	}
 	if syncoidProps["excludeSnaps"].Type != "array" || syncoidProps["excludeSnaps"].Items == nil || syncoidProps["excludeSnaps"].Items.Type != "string" {
 		t.Fatalf("excludeSnaps schema = %#v", syncoidProps["excludeSnaps"])
+	}
+	if !hasValidationRule(runSpec.XKubernetesValidations, "self == oldSelf", "spec is immutable") {
+		t.Fatalf("spec validations = %#v, want immutable spec rule", runSpec.XKubernetesValidations)
 	}
 }
 
@@ -122,6 +132,15 @@ func verbsForResource(rules []struct {
 func contains(items []string, needle string) bool {
 	for _, item := range items {
 		if item == needle {
+			return true
+		}
+	}
+	return false
+}
+
+func hasValidationRule(rules []validationRule, rule, message string) bool {
+	for _, candidate := range rules {
+		if candidate.Rule == rule && candidate.Message == message {
 			return true
 		}
 	}

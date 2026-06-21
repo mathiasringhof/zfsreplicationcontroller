@@ -92,14 +92,14 @@ func TestE2EExternalSnapshotsWithoutCommonBaseFails(t *testing.T) {
 	k.assertRealZFSSnapshotExists(sc.SourceNode, "zfs-src-snap-no-base-"+suffix, sc.sourceSnapshot())
 }
 
-func TestE2ESameDatasetRejectedBeforeJobs(t *testing.T) {
+func TestE2ESameNodeSameDatasetRejectedBeforeJobs(t *testing.T) {
 	k := newKubectlRunner(t)
 	suffix := uniqueSuffix()
 	pool := realZFSPool()
 	sc := replicationCase{
 		Name:          "e2e-same-ds-" + suffix,
 		SourceNode:    e2eSourceNode,
-		TargetNode:    e2eTargetNode,
+		TargetNode:    e2eSourceNode,
 		SourceDataset: pool + "/same-" + suffix,
 		TargetDataset: pool + "/same-" + suffix,
 	}
@@ -108,7 +108,7 @@ func TestE2ESameDatasetRejectedBeforeJobs(t *testing.T) {
 
 	k.applyReplication(sc)
 	status := k.waitForFailed(sc, 2*time.Minute)
-	assertFailedStatus(t, sc, status, "source and target datasets must differ")
+	assertFailedStatus(t, sc, status, "source and target must not reference the same dataset on the same node")
 	k.assertNoJobsOrSecrets(sc.Name)
 }
 

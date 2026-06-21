@@ -42,6 +42,9 @@ func TestRunReconcileSenderJobUsesSyncoidOptions(t *testing.T) {
 	if got := envValue(sender, "SYNCOID_EXCLUDE_SNAPS"); got != ".*-tmp$" {
 		t.Fatalf("SYNCOID_EXCLUDE_SNAPS = %q", got)
 	}
+	if hasEnv(sender, "ZFSREP_MANAGED_SNAPSHOT") {
+		t.Fatalf("sender still has stale ZFSREP_MANAGED_SNAPSHOT env")
+	}
 }
 
 func TestScheduleReconcileCreatesRunForDueSchedule(t *testing.T) {
@@ -77,6 +80,26 @@ func TestScheduleReconcileCreatesRunForDueSchedule(t *testing.T) {
 	}
 	if got.Status.LastRunName != runName {
 		t.Fatalf("LastRunName = %q, want %q", got.Status.LastRunName, runName)
+	}
+}
+
+func TestRunValidationAllowsSameDatasetOnDifferentNodes(t *testing.T) {
+	spec := replicationRun("manual-1").Spec
+	spec.Target.Dataset = spec.Source.Dataset
+
+	if err := validateRunSpec(spec); err != nil {
+		t.Fatalf("validateRunSpec() error = %v, want nil", err)
+	}
+}
+
+func TestRunValidationRejectsSameDatasetOnSameNode(t *testing.T) {
+	spec := replicationRun("manual-1").Spec
+	spec.Target.NodeName = spec.Source.NodeName
+	spec.Target.Dataset = spec.Source.Dataset
+
+	err := validateRunSpec(spec)
+	if err == nil || err.Error() != "source and target must not reference the same dataset on the same node" {
+		t.Fatalf("validateRunSpec() error = %v", err)
 	}
 }
 
@@ -177,6 +200,15 @@ func envValue(job *batchv1.Job, name string) string {
 		}
 	}
 	return ""
+}
+
+func hasEnv(job *batchv1.Job, name string) bool {
+	for _, env := range job.Spec.Template.Spec.Containers[0].Env {
+		if env.Name == name {
+			return true
+		}
+	}
+	return false
 }
 
 func ptr[T any](v T) *T { return &v }

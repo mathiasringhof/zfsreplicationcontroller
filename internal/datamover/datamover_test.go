@@ -15,84 +15,17 @@ type call struct {
 }
 
 type fakeRunner struct {
-	calls        []call
-	snapshots    map[string]bool
-	guids        map[string]string
-	failSnapshot bool
+	calls []call
 }
 
 func (f *fakeRunner) Run(_ context.Context, name string, args ...string) (string, string, error) {
 	f.calls = append(f.calls, call{name: name, args: args})
-	if name == "syncoid" {
-		f.replicateSyncoid(args)
-		return "", "", nil
-	}
-	if len(args) >= 4 && args[0] == "list" && args[3] != "" {
-		if f.snapshots[args[len(args)-1]] {
-			return args[len(args)-1], "", nil
-		}
-		return "", "not found", errFake
-	}
-	if args[0] == "snapshot" {
-		if f.failSnapshot {
-			return "", "snapshot failed", errFake
-		}
-		f.snapshots[args[1]] = true
-		return "", "", nil
-	}
-	if args[0] == "get" && args[4] == "guid" {
-		snap := args[5]
-		if !f.snapshots[snap] {
-			return "", "not found", errFake
-		}
-		if guid := f.guids[snap]; guid != "" {
-			return guid + "\n", "", nil
-		}
-		return "123\n", "", nil
-	}
 	return "", "", nil
 }
 
-func (f *fakeRunner) replicateSyncoid(args []string) {
-	if len(args) < 2 {
-		return
-	}
-	srcDataset := args[len(args)-2]
-	dstDataset := args[len(args)-1]
-	if _, dataset, ok := strings.Cut(dstDataset, ":"); ok {
-		dstDataset = dataset
-	}
-	snapshotName := ""
-	for _, arg := range args {
-		if strings.HasPrefix(arg, "--include-snaps=^") && strings.HasSuffix(arg, "$") {
-			snapshotName = strings.TrimSuffix(strings.TrimPrefix(arg, "--include-snaps=^"), "$")
-			break
-		}
-	}
-	if snapshotName == "" {
-		return
-	}
-	srcSnap := srcDataset + "@" + snapshotName
-	if !f.snapshots[srcSnap] {
-		return
-	}
-	dstSnap := dstDataset + "@" + snapshotName
-	f.snapshots[dstSnap] = true
-	if f.guids == nil {
-		f.guids = map[string]string{}
-	}
-	f.guids[dstSnap] = f.guids[srcSnap]
-}
-
-type fakeErr struct{}
-
-func (fakeErr) Error() string { return "fake error" }
-
-var errFake error = fakeErr{}
-
 func TestSenderRunsSyncoidWithConfiguredSnapshotOptions(t *testing.T) {
-	runner := &fakeRunner{snapshots: map[string]bool{}}
-	guid, err := RunSender(context.Background(), SenderConfig{
+	runner := &fakeRunner{}
+	err := RunSender(context.Background(), SenderConfig{
 		SrcDataset:       "tank/src",
 		DstHost:          "root@10.0.0.42",
 		DstDataset:       "tank/dst",
@@ -108,9 +41,6 @@ func TestSenderRunsSyncoidWithConfiguredSnapshotOptions(t *testing.T) {
 	}, runner)
 	if err != nil {
 		t.Fatal(err)
-	}
-	if guid != "" {
-		t.Fatalf("guid = %q, want empty when syncoid owns snapshot selection", guid)
 	}
 	want := "--no-sync-snap --no-rollback --compress=zstd --sshoption=StrictHostKeyChecking=no --sshoption=UserKnownHostsFile=/dev/null --sshkey=/var/run/zfsrep/ssh/id_rsa --sshport=2222 --no-resume --include-snaps=^snap-.* --include-snaps=^manual$ --exclude-snaps=.*-tmp$ tank/src root@10.0.0.42:tank/dst"
 	if !hasNamedCall(runner.calls, "syncoid", want) {
@@ -224,8 +154,8 @@ func TestSenderConfigFromEnvExplicitValuesOverrideDefaults(t *testing.T) {
 }
 
 func TestSenderExitsBeforeWorkWhenNodeMismatch(t *testing.T) {
-	runner := &fakeRunner{snapshots: map[string]bool{}}
-	_, err := RunSender(context.Background(), SenderConfig{
+	runner := &fakeRunner{}
+	err := RunSender(context.Background(), SenderConfig{
 		ExpectedNode: "worker-a",
 		ActualNode:   "worker-b",
 	}, runner)
@@ -238,8 +168,8 @@ func TestSenderExitsBeforeWorkWhenNodeMismatch(t *testing.T) {
 }
 
 func TestSenderPassesForceDelete(t *testing.T) {
-	runner := &fakeRunner{snapshots: map[string]bool{}}
-	_, err := RunSender(context.Background(), SenderConfig{
+	runner := &fakeRunner{}
+	err := RunSender(context.Background(), SenderConfig{
 		SrcDataset:       "tank/src",
 		DstHost:          "root@10.0.0.42",
 		DstDataset:       "tank/dst",

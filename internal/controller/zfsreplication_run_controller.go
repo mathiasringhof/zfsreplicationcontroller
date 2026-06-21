@@ -369,8 +369,8 @@ func validateRunSpec(spec zfsv1.ZFSReplicationRunSpec) error {
 	if spec.Target.Dataset == "" {
 		return fmt.Errorf("spec.target.dataset must not be empty")
 	}
-	if spec.Source.Dataset == spec.Target.Dataset {
-		return fmt.Errorf("source and target datasets must differ")
+	if spec.Source.NodeName == spec.Target.NodeName && spec.Source.Dataset == spec.Target.Dataset {
+		return fmt.Errorf("source and target must not reference the same dataset on the same node")
 	}
 	return nil
 }
@@ -433,7 +433,6 @@ func runSenderJob(run *zfsv1.ZFSReplicationRun, names runObjects, image, receive
 	labels[labelPrefix+"/role"] = "sender"
 	env := []corev1.EnvVar{
 		{Name: "ZFSREP_ROLE", Value: "sender"},
-		{Name: "ZFSREP_MANAGED_SNAPSHOT", Value: "false"},
 		{Name: "SRC_DATASET", Value: run.Spec.Source.Dataset},
 		{Name: "DST_HOST", Value: fmt.Sprintf("root@%s", receiverPodIP)},
 		{Name: "SSH_KEY_FILE", Value: "/var/run/zfsrep/ssh/id_rsa"},

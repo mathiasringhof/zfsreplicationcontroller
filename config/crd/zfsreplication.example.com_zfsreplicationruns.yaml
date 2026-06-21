@@ -32,6 +32,9 @@ spec:
               type: object
             spec:
               type: object
+              x-kubernetes-validations:
+                - rule: "self == oldSelf"
+                  message: "spec is immutable"
               required:
                 - source
                 - target
