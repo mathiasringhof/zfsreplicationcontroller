@@ -1,9 +1,9 @@
 # VM E2E Environment
 
 This directory contains scripts for a full Kubernetes environment with real
-controller, sender, receiver Jobs, pinned upstream `syncoid`, and real ZFS
-pools in the Lima workers. The suite exercises the same backend path the
-controller uses in production.
+controller, sender, receiver Jobs, pinned upstream `syncoid`, and ZFS pools in
+the Lima workers. The Go tests apply `ZFSReplicationRun` objects and verify
+replication or failure state through Kubernetes.
 
 ## Requirements
 
@@ -24,7 +24,7 @@ set `E2E_LIMA_NETWORK`, for example `E2E_LIMA_NETWORK=lima:shared`.
 ./test/e2e/run.sh
 ```
 
-This creates three VMs:
+`run.sh` creates three VMs:
 
 - `zrc-e2e-cp`
 - `worker-a`
@@ -39,7 +39,7 @@ go test ./test/e2e -run TestE2E -count=1 -v
 
 The setup installs `zfsutils-linux` on the worker VMs, loads the ZFS kernel
 module, and creates a file-backed `tank` pool on each worker under
-`/var/lib/zfs-real`. Override the defaults with `E2E_REAL_ZFS_POOL`,
+`/var/lib/zfs-real`. Override those defaults with `E2E_REAL_ZFS_POOL`,
 `E2E_REAL_ZFS_ROOT`, or `E2E_REAL_ZFS_SIZE`.
 
 ## Individual Steps

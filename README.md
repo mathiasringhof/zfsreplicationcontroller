@@ -1,29 +1,35 @@
 # ZFS Replication Controller
 
-ZFS Replication Controller is a Kubernetes-native Syncoid orchestrator.
+ZFS Replication Controller runs Syncoid replication between ZFS datasets on two
+Kubernetes nodes.
 
-It creates the temporary connection between two Kubernetes nodes, then runs
-`syncoid` in a privileged per-run sender Job. Snapshot policy stays outside the
-controller: Syncoid can create its own sync snapshots, or external tools such as
-SnapScheduler or Sanoid can create snapshots and the run can pass
-`--no-sync-snap` with include/exclude filters.
+For each `ZFSReplicationRun`, the controller creates a per-run SSH key, starts a
+privileged receiver Job on the target node, waits for that receiver pod to become
+ready, then starts a privileged sender Job on the source node. The sender invokes
+`syncoid` against the receiver pod address.
 
-## What It Does
+Snapshot creation is controlled by Syncoid options. Syncoid can create its own
+sync snapshots, or a run can set `noSyncSnap: true` and rely on snapshots created
+by another tool.
 
-- Watches `ZFSReplicationRun` objects for one-shot Syncoid invocations.
-- Watches `ZFSReplicationSchedule` objects and creates `ZFSReplicationRun`
-  objects on cron ticks.
-- Creates a per-run SSH `Secret`.
-- Starts a privileged receiver `Job` on the target node that accepts only the
-  per-run key.
-- Starts a privileged sender `Job` on the source node after the receiver pod is
-  ready.
-- Passes structured Syncoid options from YAML to the sender.
-- Updates basic status after the sender Job succeeds or fails.
+The API is `v1alpha1`.
 
-The controller does not create a Kubernetes `Service` or use long-lived node SSH
-credentials. The per-run SSH Secret and receiver Job are removed after the run
-finishes.
+## Resources
+
+- `ZFSReplicationRun`: one Syncoid invocation. The run spec is immutable after
+  creation.
+- `ZFSReplicationSchedule`: creates `ZFSReplicationRun` objects from a template
+  on cron ticks.
+
+The run controller rejects empty source or target fields. It also rejects a run
+whose source and target refer to the same dataset on the same node.
+
+## Requirements
+
+- Kubernetes nodes with the required ZFS datasets and `/dev/zfs`.
+- Permission to run privileged pods with a `/dev/zfs` hostPath mount.
+- A controller image that contains `manager`, `zfsrep-sender`,
+  `zfsrep-ssh-receiver`, `zfsutils-linux`, OpenSSH, and Syncoid.
 
 ## Install
 
@@ -35,7 +41,12 @@ docker build -t registry.example.com/zfsreplicationcontroller:latest .
 docker push registry.example.com/zfsreplicationcontroller:latest
 ```
 
-Set that image in `config/manager/deployment.yaml`, then install:
+Set that image in both places in `config/manager/deployment.yaml`:
+
+- `spec.template.spec.containers[0].image`
+- `DATA_MOVER_IMAGE`
+
+Install the CRDs, RBAC, namespace, and controller deployment:
 
 ```sh
 kubectl apply -k config
@@ -68,7 +79,7 @@ spec:
 
 With `noSyncSnap: true`, the controller does not create snapshots. Syncoid lists
 source and target snapshots, applies include/exclude filters, finds the newest
-common GUID-compatible base, and replicates forward.
+common base, and replicates forward.
 
 Omit `noSyncSnap` or set it to `false` when Syncoid should create its own sync
 snapshot.
@@ -98,8 +109,12 @@ spec:
 ```
 
 Schedules use numeric five-field cron expressions. The built-in parser supports
-`*`, `*/n`, lists, ranges, and stepped ranges. `concurrencyPolicy: Forbid` is the
-default and skips a tick while a previous scheduled run is still active.
+`*`, `*/n`, lists, ranges, and stepped ranges. It does not support named months,
+named weekdays, seconds, or macros such as `@hourly`.
+
+`concurrencyPolicy: Forbid` is the default and skips a tick while a previous
+scheduled run is still active. Set `suspend: true` to stop creating runs without
+deleting the schedule.
 
 ## Syncoid Options
 
@@ -107,16 +122,34 @@ The controller owns connection-sensitive options: source dataset, target
 dataset, SSH key, SSH port, and receiver address. The `syncoid` block exposes
 the replication behavior:
 
-- `noSyncSnap`: pass `--no-sync-snap`.
+- `noSyncSnap`: pass `--no-sync-snap`. Defaults to false.
 - `noRollback`: pass `--no-rollback` when true. Defaults to true.
-- `forceDelete`: pass `--force-delete`.
-- `compress`: pass `--compress=<value>`.
+- `forceDelete`: pass `--force-delete`. Defaults to false.
+- `compress`: pass `--compress=<value>`. Defaults to `none` in the sender.
 - `receiveUnmounted`: pass `--recvoptions=u` when true. Defaults to true.
 - `receiveResumable`: pass `--no-resume` when false. Defaults to true.
 - `includeSnaps`: one `--include-snaps=<regex>` per item.
 - `excludeSnaps`: one `--exclude-snaps=<regex>` per item.
 
-## Operational Warnings
+## Object Lifecycle
+
+The controller does not create a Kubernetes `Service` and does not use
+long-lived node SSH credentials. Each run gets its own SSH `Secret`; the
+receiver accepts only that key.
+
+After a run succeeds or fails, the controller deletes the receiver Job and SSH
+Secret. The sender Job has `ttlSecondsAfterFinished: 86400` so Kubernetes can
+keep it briefly for inspection before TTL cleanup.
+
+Sender and receiver Jobs use `spec.template.spec.nodeName`, not only a node
+selector. Each container verifies at startup that the actual node from the
+downward API matches the expected node and exits before running ZFS or SSH
+commands if it does not.
+
+Jobs use `backoffLimit: 0`, `restartPolicy: Never`, and
+`automountServiceAccountToken: false`.
+
+## Operational Notes
 
 The target dataset must be passive and suitable for `syncoid` to receive into.
 
@@ -127,17 +160,16 @@ When external snapshot tooling owns snapshots and retention, make sure retention
 does not prune the common source/target base before a scheduled replication run
 can complete.
 
-Sender and receiver Jobs are pinned with `spec.template.spec.nodeName`, not only
-a node selector. Each container verifies at startup that the actual node from
-the downward API matches the expected node and exits before running ZFS or SSH
-commands if it does not.
-
-Jobs use `backoffLimit: 0` and `restartPolicy: Never`.
-
 ## Development
 
 ```sh
 go fmt ./...
 go test ./...
-go vet ./...
+golangci-lint run
 ```
+
+The VM e2e environment is documented in `test/e2e/README.md`.
+
+## License
+
+Apache-2.0. See `LICENSE`.
