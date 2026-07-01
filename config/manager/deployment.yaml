@@ -17,7 +17,7 @@ spec:
       containers:
         - name: manager
           image: ghcr.io/mathiasringhof/zfsreplicationcontroller:main
-          imagePullPolicy: IfNotPresent
+          imagePullPolicy: Always
           command:
             - /usr/local/bin/manager
           args:

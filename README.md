@@ -49,14 +49,18 @@ ghcr.io/mathiasringhof/zfsreplicationcontroller
 
 Tags:
 
-- `main`: latest image built from the default branch.
-- `sha-<commit>`: immutable commit image, preferred for GitOps pinning.
+- `main`: latest image built from the default branch. Mutable; useful for quick
+  testing, not preferred for GitOps pinning.
+- `sha-<commit>`: commit-addressed tag, preferred over `main` when a digest is
+  not available.
 - `<version>` and `<major>.<minor>`: published from `v*` release tags.
 
 The default manifests use `ghcr.io/mathiasringhof/zfsreplicationcontroller:main`
-for both the controller and data mover image. For GitOps deployments, pin both
-values to the same `sha-<commit>` tag or digest after the image has been
-published.
+for both the controller and data mover image. The controller Deployment uses
+`imagePullPolicy: Always`, and generated data mover Jobs also use `Always` for
+mutable `main` and `latest` tags. For GitOps deployments, pin both values to the
+same digest after the image has been published. A `sha-<commit>` tag is a useful
+fallback, but a digest is the content-addressed immutable reference.
 
 The deployment chain is:
 
