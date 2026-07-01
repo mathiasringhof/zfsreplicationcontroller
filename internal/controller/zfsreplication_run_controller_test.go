@@ -2,12 +2,15 @@ package controller
 
 import (
 	"context"
+	"errors"
+	"strings"
 	"testing"
 	"time"
 
 	zfsv1 "github.com/mathias/zfsreplicationcontroller/api/v1alpha1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -15,6 +18,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 )
 
 func TestRunReconcileSenderJobUsesSyncoidOptions(t *testing.T) {
@@ -44,6 +48,40 @@ func TestRunReconcileSenderJobUsesSyncoidOptions(t *testing.T) {
 	}
 	if hasEnv(sender, "ZFSREP_MANAGED_SNAPSHOT") {
 		t.Fatalf("sender still has stale ZFSREP_MANAGED_SNAPSHOT env")
+	}
+}
+
+func TestRunReconcileRetriesCleanupForTerminalRun(t *testing.T) {
+	for _, phase := range []zfsv1.Phase{zfsv1.PhaseSucceeded, zfsv1.PhaseFailed} {
+		t.Run(string(phase), func(t *testing.T) {
+			run := replicationRun("manual-" + strings.ToLower(string(phase)))
+			run.Status.Phase = phase
+			names := objectNamesForRun(run.Name)
+			receiverJob := runReceiverJob(run, names, "datamover:test")
+			sshSecret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: names.SecretName, Namespace: run.Namespace}}
+			deleteReceiverFailures := 1
+			r := newRunReconcilerWithInterceptors(t, interceptor.Funcs{
+				Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+					if obj.GetName() == names.ReceiverName && deleteReceiverFailures > 0 {
+						deleteReceiverFailures--
+						return errors.New("temporary receiver delete failure")
+					}
+					return c.Delete(ctx, obj, opts...)
+				},
+			}, run, receiverJob, sshSecret)
+
+			if _, err := r.Reconcile(context.Background(), request(run.Name)); err == nil {
+				t.Fatal("Reconcile() error = nil, want cleanup delete error")
+			}
+			assertObjectExists(t, r.Client, &batchv1.Job{}, names.ReceiverName)
+			assertObjectDeleted(t, r.Client, &corev1.Secret{}, names.SecretName)
+
+			if _, err := r.Reconcile(context.Background(), request(run.Name)); err != nil {
+				t.Fatalf("second Reconcile() error = %v, want nil", err)
+			}
+			assertObjectDeleted(t, r.Client, &batchv1.Job{}, names.ReceiverName)
+			assertObjectDeleted(t, r.Client, &corev1.Secret{}, names.SecretName)
+		})
 	}
 }
 
@@ -158,6 +196,18 @@ func newRunReconciler(t *testing.T, objs ...client.Object) *ZFSReplicationRunRec
 	return &ZFSReplicationRunReconciler{Client: c, Scheme: scheme, DataMoverImage: "datamover:test"}
 }
 
+func newRunReconcilerWithInterceptors(t *testing.T, funcs interceptor.Funcs, objs ...client.Object) *ZFSReplicationRunReconciler {
+	t.Helper()
+	scheme := newTestScheme(t)
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&zfsv1.ZFSReplicationRun{}).
+		WithObjects(objs...).
+		WithInterceptorFuncs(funcs).
+		Build()
+	return &ZFSReplicationRunReconciler{Client: c, Scheme: scheme, DataMoverImage: "datamover:test"}
+}
+
 func newScheduleReconciler(t *testing.T, now time.Time, objs ...client.Object) *ZFSReplicationScheduleReconciler {
 	t.Helper()
 	scheme := newTestScheme(t)
@@ -191,6 +241,21 @@ func getJob(t *testing.T, c client.Client, name string) *batchv1.Job {
 		t.Fatal(err)
 	}
 	return &job
+}
+
+func assertObjectExists(t *testing.T, c client.Client, obj client.Object, name string) {
+	t.Helper()
+	if err := c.Get(context.Background(), types.NamespacedName{Name: name, Namespace: "storage"}, obj); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func assertObjectDeleted(t *testing.T, c client.Client, obj client.Object, name string) {
+	t.Helper()
+	err := c.Get(context.Background(), types.NamespacedName{Name: name, Namespace: "storage"}, obj)
+	if !apierrors.IsNotFound(err) {
+		t.Fatalf("Get(%s) error = %v, want not found", name, err)
+	}
 }
 
 func envValue(job *batchv1.Job, name string) string {
