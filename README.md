@@ -77,9 +77,9 @@ spec:
       - "^snap-.*"
 ```
 
-With `noSyncSnap: true`, the controller does not create snapshots. Syncoid lists
-source and target snapshots, applies include/exclude filters, finds the newest
-common base, and replicates forward.
+With `noSyncSnap: true`, Syncoid uses the existing source and target snapshots,
+applies include/exclude filters, finds the newest common base, and replicates
+forward.
 
 Omit `noSyncSnap` or set it to `false` when Syncoid should create its own sync
 snapshot.
@@ -108,9 +108,9 @@ spec:
         - "^snap-.*"
 ```
 
-Schedules use numeric five-field cron expressions. The built-in parser supports
-`*`, `*/n`, lists, ranges, and stepped ranges. It does not support named months,
-named weekdays, seconds, or macros such as `@hourly`.
+Schedules use five numeric cron fields. Supported field syntax is `*`, `*/n`,
+lists, ranges, and stepped ranges. Named months, named weekdays, seconds, and
+macros such as `@hourly` are outside this parser.
 
 `concurrencyPolicy: Forbid` is the default and skips a tick while a previous
 scheduled run is still active. Set `suspend: true` to stop creating runs without
@@ -133,18 +133,16 @@ the replication behavior:
 
 ## Object Lifecycle
 
-The controller does not create a Kubernetes `Service` and does not use
-long-lived node SSH credentials. Each run gets its own SSH `Secret`; the
-receiver accepts only that key.
+Each run gets its own SSH `Secret`. The sender connects to the receiver pod
+address, and the receiver accepts only the per-run key.
 
 After a run succeeds or fails, the controller deletes the receiver Job and SSH
 Secret. The sender Job has `ttlSecondsAfterFinished: 86400` so Kubernetes can
 keep it briefly for inspection before TTL cleanup.
 
-Sender and receiver Jobs use `spec.template.spec.nodeName`, not only a node
-selector. Each container verifies at startup that the actual node from the
-downward API matches the expected node and exits before running ZFS or SSH
-commands if it does not.
+Sender and receiver Jobs pin pods with `spec.template.spec.nodeName`. At
+startup, each container compares the downward API node name with the expected
+node and exits before running ZFS or SSH commands on a mismatch.
 
 Jobs use `backoffLimit: 0`, `restartPolicy: Never`, and
 `automountServiceAccountToken: false`.

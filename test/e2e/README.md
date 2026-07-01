@@ -1,9 +1,9 @@
 # VM E2E Environment
 
-This directory contains scripts for a full Kubernetes environment with real
-controller, sender, receiver Jobs, pinned upstream `syncoid`, and ZFS pools in
-the Lima workers. The Go tests apply `ZFSReplicationRun` objects and verify
-replication or failure state through Kubernetes.
+These scripts build a Lima-backed k3s cluster with a control-plane VM, two
+worker VMs, real ZFS pools, and the controller/data mover image. The Go e2e
+tests create `ZFSReplicationRun` objects and verify replication or failure state
+through Kubernetes.
 
 ## Requirements
 
@@ -17,7 +17,7 @@ The scripts use Lima's `lima:user-v2` network by default, which supports
 guest-to-guest k3s traffic without `socket_vmnet`. To use a different network,
 set `E2E_LIMA_NETWORK`, for example `E2E_LIMA_NETWORK=lima:shared`.
 
-## One Command Setup
+## Environment Setup
 
 ```sh
 ./test/e2e/doctor.sh
@@ -31,7 +31,7 @@ set `E2E_LIMA_NETWORK`, for example `E2E_LIMA_NETWORK=lima:shared`.
 - `worker-b`
 
 It installs k3s, builds the e2e image, imports it into every node, deploys the
-controller, and prints the generated kubeconfig path.
+controller, and prints the kubeconfig path.
 
 ```sh
 go test ./test/e2e -run TestE2E -count=1 -v
