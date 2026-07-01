@@ -1,6 +1,8 @@
 package controller
 
 import (
+	"strings"
+
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -35,7 +37,7 @@ func dataMoverJob(namespace, name, image string, labels map[string]string, nodeN
 	container := corev1.Container{
 		Name:            "datamover",
 		Image:           image,
-		ImagePullPolicy: corev1.PullIfNotPresent,
+		ImagePullPolicy: imagePullPolicyFor(image),
 		Command:         []string{command},
 		Env:             env,
 		SecurityContext: &corev1.SecurityContext{Privileged: &privileged},
@@ -79,6 +81,25 @@ func dataMoverJob(namespace, name, image string, labels map[string]string, nodeN
 			},
 		},
 	}
+}
+
+func imagePullPolicyFor(image string) corev1.PullPolicy {
+	if strings.Contains(image, "@sha256:") {
+		return corev1.PullIfNotPresent
+	}
+	if tag := imageTag(image); tag == "" || tag == "latest" || tag == "main" {
+		return corev1.PullAlways
+	}
+	return corev1.PullIfNotPresent
+}
+
+func imageTag(image string) string {
+	lastSlash := strings.LastIndex(image, "/")
+	lastColon := strings.LastIndex(image, ":")
+	if lastColon <= lastSlash {
+		return ""
+	}
+	return image[lastColon+1:]
 }
 
 func cloneLabels(in map[string]string) map[string]string {

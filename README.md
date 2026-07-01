@@ -33,24 +33,63 @@ whose source and target refer to the same dataset on the same node.
 
 ## Install
 
-Build and push an image that includes `zfsutils-linux`, pinned upstream
-`syncoid` 2.3.0, and the controller binaries:
+The controller is deployed as a container image, not as Go source. The Dockerfile
+builds the `manager` and `zfsrep-sender` binaries, then packages them with
+`zfsrep-ssh-receiver`, `zfsutils-linux`, OpenSSH, and pinned upstream `syncoid`
+2.3.0.
 
-```sh
-docker build -t registry.example.com/zfsreplicationcontroller:latest .
-docker push registry.example.com/zfsreplicationcontroller:latest
+GitHub Actions builds the image on pull requests and publishes it to GHCR on
+pushes to `main` and version tags.
+
+Published image:
+
+```text
+ghcr.io/mathiasringhof/zfsreplicationcontroller
 ```
 
-Set that image in both places in `config/manager/deployment.yaml`:
+Tags:
+
+- `main`: latest image built from the default branch. Mutable; useful for quick
+  testing, not preferred for GitOps pinning.
+- `sha-<commit>`: commit-addressed tag, preferred over `main` when a digest is
+  not available.
+- `<version>` and `<major>.<minor>`: published from `v*` release tags.
+
+The default manifests use `ghcr.io/mathiasringhof/zfsreplicationcontroller:main`
+for both the controller and data mover image. The controller Deployment uses
+`imagePullPolicy: Always`, and generated data mover Jobs also use `Always` for
+mutable `main` and `latest` tags. For GitOps deployments, pin both values to the
+same digest after the image has been published. A `sha-<commit>` tag is a useful
+fallback, but a digest is the content-addressed immutable reference.
+
+The deployment chain is:
+
+```text
+Go source -> container image -> CRDs/RBAC/Deployment -> manager pod -> custom resources -> Jobs
+```
+
+If you use a different registry or a pinned image, set it in both places in
+`config/manager/deployment.yaml`:
 
 - `spec.template.spec.containers[0].image`
 - `DATA_MOVER_IMAGE`
 
-Install the CRDs, RBAC, namespace, and controller deployment:
+Install the CRDs, RBAC, namespace, and controller Deployment:
 
 ```sh
 kubectl apply -k config
 ```
+
+Verify the manager pod is ready:
+
+```sh
+kubectl -n zfsreplication-system rollout status deploy/zfsreplication-controller
+```
+
+Create `ZFSReplicationRun` and `ZFSReplicationSchedule` objects only after
+choosing real node names and disposable test datasets for your cluster. The
+sender and receiver Jobs are created in the namespace of the run object, not in
+`zfsreplication-system`.
 
 ## One-Shot Run
 

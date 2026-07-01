@@ -16,15 +16,15 @@ spec:
       serviceAccountName: zfsreplication-controller
       containers:
         - name: manager
-          image: zfsreplicationcontroller:latest
-          imagePullPolicy: IfNotPresent
+          image: ghcr.io/mathiasringhof/zfsreplicationcontroller:main
+          imagePullPolicy: Always
           command:
             - /usr/local/bin/manager
           args:
             - --datamover-image=$(DATA_MOVER_IMAGE)
           env:
             - name: DATA_MOVER_IMAGE
-              value: zfsreplicationcontroller:latest
+              value: ghcr.io/mathiasringhof/zfsreplicationcontroller:main
           ports:
             - name: health
               containerPort: 8081
