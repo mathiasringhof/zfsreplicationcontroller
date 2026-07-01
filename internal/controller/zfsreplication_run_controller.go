@@ -32,14 +32,14 @@ func (r *ZFSReplicationRunReconciler) Reconcile(ctx context.Context, req ctrl.Re
 	if err := r.Get(ctx, req.NamespacedName, &run); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
+	names := objectNamesForRun(run.Name)
 	if run.Status.Phase == zfsv1.PhaseSucceeded || run.Status.Phase == zfsv1.PhaseFailed {
-		return ctrl.Result{}, nil
+		return ctrl.Result{}, r.cleanupRunEphemeralObjects(ctx, &run, names)
 	}
 	if err := validateRunSpec(run.Spec); err != nil {
 		return ctrl.Result{}, r.failRunValidation(ctx, &run, err.Error())
 	}
 
-	names := objectNamesForRun(run.Name)
 	if err := r.ensureRunSecret(ctx, &run, names); err != nil {
 		return ctrl.Result{}, err
 	}
