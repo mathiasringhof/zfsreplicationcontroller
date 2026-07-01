@@ -108,9 +108,10 @@ spec:
         - "^snap-.*"
 ```
 
-Schedules use five numeric cron fields. Supported field syntax is `*`, `*/n`,
-lists, ranges, and stepped ranges. Named months, named weekdays, seconds, and
-macros such as `@hourly` are outside this parser.
+Schedules use the standard `github.com/robfig/cron/v3` parser, matching the
+library used by Kubernetes CronJobs. It supports five-field cron expressions,
+named months and weekdays, descriptors such as `@hourly`, and `@every`
+durations. Seconds fields are not supported.
 
 `concurrencyPolicy: Forbid` is the default and skips a tick while a previous
 scheduled run is still active. Set `suspend: true` to stop creating runs without

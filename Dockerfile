@@ -1,4 +1,4 @@
-FROM golang:1.22 AS build
+FROM docker.io/library/golang:1.22 AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
@@ -6,7 +6,7 @@ COPY . .
 RUN CGO_ENABLED=0 go build -o /out/manager ./cmd/manager
 RUN CGO_ENABLED=0 go build -o /out/zfsrep-sender ./cmd/zfsrep-sender
 
-FROM ubuntu:24.04
+FROM docker.io/library/ubuntu:24.04
 ARG SANOID_VERSION=2.3.0
 ARG SANOID_SHA256=1d8735a271a34ec87ea46313a66f6f20bd38b583886924574d3c1f72ea173620
 RUN apt-get update && apt-get install -y --no-install-recommends \

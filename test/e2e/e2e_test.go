@@ -47,7 +47,7 @@ func TestE2EFullAndIncrementalReplication(t *testing.T) {
 
 	k.applyReplication(first)
 	assertSucceededStatus(t, first, k.waitForSuccess(first, 4*time.Minute))
-	k.assertRealZFSProperty(first.TargetNode, "zfs-dst-p1-"+suffix, first.TargetDataset, "first-"+suffix)
+	k.assertRealZFSMarker(first.TargetNode, "zfs-dst-p1-"+suffix, pool, first.TargetDataset, "first-"+suffix)
 	k.assertNoSecrets(first.Name)
 
 	second := first
@@ -59,7 +59,7 @@ func TestE2EFullAndIncrementalReplication(t *testing.T) {
 
 	k.applyReplication(second)
 	assertSucceededStatus(t, second, k.waitForSuccess(second, 4*time.Minute))
-	k.assertRealZFSProperty(second.TargetNode, "zfs-dst-p2-"+suffix, second.TargetDataset, "second-"+suffix)
+	k.assertRealZFSMarker(second.TargetNode, "zfs-dst-p2-"+suffix, pool, second.TargetDataset, "second-"+suffix)
 	k.assertNoSecrets(second.Name)
 }
 
@@ -389,12 +389,12 @@ func (k kubectlRunner) cleanupRealZFSDatasetOnExit(node, jobName, dataset string
 	})
 }
 
-func (k kubectlRunner) assertRealZFSProperty(node, jobName, dataset, want string) {
+func (k kubectlRunner) assertRealZFSMarker(node, jobName, pool, dataset, want string) {
 	k.t.Helper()
-	logs := k.runRealZFS(node, jobName, "zfs get -H -o value org.zfsreplicationcontroller:e2e "+dataset)
+	logs := k.runRealZFS(node, jobName, realZFSReadMarkerScript(pool, dataset))
 	got := strings.TrimSpace(logs)
 	if got != want {
-		k.t.Fatalf("%s property on %s = %q, want %q", dataset, node, got, want)
+		k.t.Fatalf("%s marker on %s = %q, want %q", dataset, node, got, want)
 	}
 }
 
@@ -635,31 +635,72 @@ func realZFSJobManifest(t *testing.T, node, name, script string) []byte {
 }
 
 func realZFSSetupSourceScript(pool, dataset, marker string) string {
+	mountpoint := realZFSMountpoint(dataset)
 	return realZFSPreamble(pool) + "\n" + strings.Join([]string{
-		"zfs destroy -r " + dataset + " >/dev/null 2>&1 || true",
-		"zfs create -o mountpoint=none " + dataset,
-		"zfs set org.zfsreplicationcontroller:e2e=" + marker + " " + dataset,
+		"zfs destroy -r " + shellQuote(dataset) + " >/dev/null 2>&1 || true",
+		"rm -rf " + shellQuote(mountpoint),
+		"mkdir -p " + shellQuote(mountpoint),
+		"zfs create -o mountpoint=" + shellQuote(mountpoint) + " " + shellQuote(dataset),
+		"printf '%s\\n' " + shellQuote(marker) + " > " + shellQuote(realZFSMarkerPath(dataset)),
+		"sync",
 	}, "\n")
 }
 
 func realZFSSetupTargetScript(pool, dataset string) string {
 	return realZFSPreamble(pool) + "\n" + strings.Join([]string{
-		"zfs destroy -r " + dataset + " >/dev/null 2>&1 || true",
-		"zfs create -o mountpoint=none " + dataset,
+		"zfs destroy -r " + shellQuote(dataset) + " >/dev/null 2>&1 || true",
+		"zfs create -o mountpoint=none " + shellQuote(dataset),
 	}, "\n")
 }
 
 func realZFSMutateSourceScript(pool, dataset, marker string) string {
-	return realZFSPreamble(pool) + "\n" +
-		"zfs set org.zfsreplicationcontroller:e2e=" + marker + " " + dataset
+	mountpoint := realZFSMountpoint(dataset)
+	return realZFSPreamble(pool) + "\n" + strings.Join([]string{
+		"mkdir -p " + shellQuote(mountpoint),
+		"zfs set mountpoint=" + shellQuote(mountpoint) + " " + shellQuote(dataset),
+		"zfs mount " + shellQuote(dataset) + " >/dev/null 2>&1 || true",
+		"printf '%s\\n' " + shellQuote(marker) + " > " + shellQuote(realZFSMarkerPath(dataset)),
+		"sync",
+	}, "\n")
+}
+
+func realZFSReadMarkerScript(pool, dataset string) string {
+	clone := dataset + "-read-" + uniqueSuffix()
+	mountpoint := realZFSMountpoint(clone)
+	return realZFSPreamble(pool) + "\n" + strings.Join([]string{
+		"snapshot=$(zfs list -H -t snapshot -o name -s creation -r " + shellQuote(dataset) + " | tail -n 1)",
+		"[ -n \"$snapshot\" ]",
+		"clone=" + shellQuote(clone),
+		"mountpoint=" + shellQuote(mountpoint),
+		"trap 'zfs unmount \"$clone\" >/dev/null 2>&1 || true; zfs destroy -rf \"$clone\" >/dev/null 2>&1 || true; rm -rf \"$mountpoint\"' EXIT",
+		"zfs destroy -rf \"$clone\" >/dev/null 2>&1 || true",
+		"rm -rf \"$mountpoint\"",
+		"mkdir -p \"$mountpoint\"",
+		"zfs clone -o mountpoint=\"$mountpoint\" \"$snapshot\" \"$clone\"",
+		"zfs mount \"$clone\" >/dev/null 2>&1 || true",
+		"cat \"$mountpoint/marker.txt\"",
+	}, "\n")
 }
 
 func realZFSPreamble(pool string) string {
 	return strings.Join([]string{
 		"command -v zfs >/dev/null",
 		"command -v zpool >/dev/null",
-		"zpool list -H " + pool + " >/dev/null",
+		"zpool list -H " + shellQuote(pool) + " >/dev/null",
 	}, "\n")
+}
+
+func realZFSMountpoint(dataset string) string {
+	replacer := strings.NewReplacer("/", "-", "@", "-")
+	return "/var/lib/zfsreplicationcontroller-e2e/" + replacer.Replace(dataset)
+}
+
+func realZFSMarkerPath(dataset string) string {
+	return realZFSMountpoint(dataset) + "/marker.txt"
+}
+
+func shellQuote(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
 }
 
 func jobFailureMessage(job jobObject) string {
