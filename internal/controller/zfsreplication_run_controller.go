@@ -263,6 +263,26 @@ func (r *ZFSReplicationRunReconciler) cleanupRunEphemeralObjects(ctx context.Con
 			errs = append(errs, fmt.Errorf("delete %s/%s: %w", obj.GetNamespace(), obj.GetName(), err))
 		}
 	}
+	if err := r.deleteRunReceiverPods(ctx, run, names); err != nil {
+		errs = append(errs, err)
+	}
+	return errors.Join(errs...)
+}
+
+func (r *ZFSReplicationRunReconciler) deleteRunReceiverPods(ctx context.Context, run *zfsv1.ZFSReplicationRun, names runObjects) error {
+	var receiverPods corev1.PodList
+	receiverLabels := cloneLabels(names.Labels)
+	receiverLabels[labelPrefix+"/role"] = "receiver"
+	if err := r.podReader().List(ctx, &receiverPods, client.InNamespace(run.Namespace), client.MatchingLabels(receiverLabels)); err != nil {
+		return fmt.Errorf("list receiver Pods for %s/%s: %w", run.Namespace, run.Name, err)
+	}
+	var errs []error
+	for i := range receiverPods.Items {
+		pod := &receiverPods.Items[i]
+		if err := r.Delete(ctx, pod); client.IgnoreNotFound(err) != nil {
+			errs = append(errs, fmt.Errorf("delete receiver Pod %s/%s: %w", pod.Namespace, pod.Name, err))
+		}
+	}
 	return errors.Join(errs...)
 }
 
