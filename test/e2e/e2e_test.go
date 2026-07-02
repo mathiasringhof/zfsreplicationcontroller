@@ -88,7 +88,7 @@ func TestE2EExternalSnapshotsWithoutCommonBaseFails(t *testing.T) {
 
 	k.applyReplication(sc)
 	status := k.waitForFailed(sc, 4*time.Minute)
-	assertFailedStatus(t, sc, status, "")
+	assertFailedAfterDataMoverSetupStatus(t, sc, status, "")
 	k.assertRealZFSSnapshotExists(sc.SourceNode, "zfs-src-snap-no-base-"+suffix, sc.sourceSnapshot())
 	k.assertRunEphemeralCleanup(sc.Name)
 }
@@ -133,7 +133,7 @@ func TestE2ESyncoidFailure(t *testing.T) {
 
 	k.applyReplication(sc)
 	status := k.waitForFailed(sc, 4*time.Minute)
-	assertFailedStatus(t, sc, status, "CRITICAL ERROR")
+	assertFailedAfterDataMoverSetupStatus(t, sc, status, "CRITICAL ERROR")
 	if !strings.Contains(status.LastError, sc.TargetDataset) {
 		t.Fatalf("lastError = %q, want to mention target dataset %q", status.LastError, sc.TargetDataset)
 	}
@@ -359,12 +359,16 @@ func (k kubectlRunner) podsForReplication(name, runID string) (podList, error) {
 func (k kubectlRunner) assertRunEphemeralCleanup(name string) {
 	k.t.Helper()
 	k.assertNoLabelledResourcesEventually(name, "receiver jobs", "jobs", e2eLabelPrefix+"/role=receiver")
-	k.assertNoLabelledResourcesEventually(name, "ssh secrets", "secrets", e2eLabelPrefix+"/role=ssh")
+	k.assertNoLabelledResourcesEventually(name, "receiver pods", "pods", e2eLabelPrefix+"/role=receiver")
+	k.assertNoLabelledResourcesEventually(name, "run secrets", "secrets", "")
 }
 
-func (k kubectlRunner) assertNoLabelledResourcesEventually(name, description, resource, roleSelector string) {
+func (k kubectlRunner) assertNoLabelledResourcesEventually(name, description, resource, extraSelector string) {
 	k.t.Helper()
-	selector := e2eLabelPrefix + "/run=" + name + "," + roleSelector
+	selector := e2eLabelPrefix + "/run=" + name
+	if extraSelector != "" {
+		selector += "," + extraSelector
+	}
 	deadline := time.Now().Add(60 * time.Second)
 	var lastOut string
 	var lastErr error
@@ -610,6 +614,14 @@ func assertFailedStatus(t *testing.T, sc replicationCase, st replicationStatus, 
 	}
 	if st.StartedAt == "" || st.CompletedAt == "" {
 		t.Fatalf("failure timestamps missing: %#v", st)
+	}
+}
+
+func assertFailedAfterDataMoverSetupStatus(t *testing.T, sc replicationCase, st replicationStatus, wantError string) {
+	t.Helper()
+	assertFailedStatus(t, sc, st, wantError)
+	if st.ReceiverJobName == "" || st.ReceiverPodName == "" || st.ReceiverPodIP == "" || st.SSHSecretName == "" {
+		t.Fatalf("receiver/ssh status names missing after datamover setup for %s: %#v", sc.Name, st)
 	}
 }
 
