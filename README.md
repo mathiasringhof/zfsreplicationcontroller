@@ -80,6 +80,29 @@ Install the CRDs, RBAC, namespace, and controller Deployment:
 kubectl apply -k config
 ```
 
+By default, the manager watches all namespaces and the default install uses a
+`ClusterRoleBinding` so runs and schedules can live in any namespace. To scope a
+controller instance to one namespace, set `WATCH_NAMESPACE` or pass
+`--watch-namespace`; an empty value keeps the all-namespaces behavior.
+
+For a production smoke deployment with namespaced runtime permissions, use the
+namespaced smoke profile from the repository root:
+
+```sh
+kubectl apply -k .
+```
+
+That profile still installs the CRDs cluster-wide, but it runs the manager with
+`WATCH_NAMESPACE=zfsreplication-smoke` and grants `ZFSReplicationRun`,
+`ZFSReplicationSchedule`, Jobs, Secrets, Pods, Pods/log, and Events access only
+in the `zfsreplication-smoke` namespace. Change `zfsreplication-smoke`
+consistently in
+`config/namespaced/watched_namespace.yaml`,
+`config/rbac/namespaced_role.yaml`,
+`config/rbac/namespaced_role_binding.yaml`, and
+`config/namespaced/manager_watch_namespace_patch.yaml` for a different smoke
+namespace.
+
 Verify the manager pod is ready:
 
 ```sh
@@ -98,7 +121,7 @@ apiVersion: zfsreplication.example.com/v1alpha1
 kind: ZFSReplicationRun
 metadata:
   name: pg-a-to-b-manual-001
-  namespace: storage
+  namespace: zfsreplication-smoke
 spec:
   source:
     nodeName: worker-a
@@ -130,7 +153,7 @@ apiVersion: zfsreplication.example.com/v1alpha1
 kind: ZFSReplicationSchedule
 metadata:
   name: pg-a-to-b-hourly
-  namespace: storage
+  namespace: zfsreplication-smoke
 spec:
   schedule: "10 * * * *"
   concurrencyPolicy: Forbid
