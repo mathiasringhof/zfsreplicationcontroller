@@ -48,7 +48,7 @@ func TestE2EFullAndIncrementalReplication(t *testing.T) {
 	k.applyReplication(first)
 	assertSucceededStatus(t, first, k.waitForSuccess(first, 4*time.Minute))
 	k.assertRealZFSMarker(first.TargetNode, "zfs-dst-p1-"+suffix, pool, first.TargetDataset, "first-"+suffix)
-	k.assertNoSecrets(first.Name)
+	k.assertRunEphemeralCleanup(first.Name)
 
 	second := first
 	second.Name = name + "-2"
@@ -60,7 +60,7 @@ func TestE2EFullAndIncrementalReplication(t *testing.T) {
 	k.applyReplication(second)
 	assertSucceededStatus(t, second, k.waitForSuccess(second, 4*time.Minute))
 	k.assertRealZFSMarker(second.TargetNode, "zfs-dst-p2-"+suffix, pool, second.TargetDataset, "second-"+suffix)
-	k.assertNoSecrets(second.Name)
+	k.assertRunEphemeralCleanup(second.Name)
 }
 
 func TestE2EExternalSnapshotsWithoutCommonBaseFails(t *testing.T) {
@@ -88,8 +88,9 @@ func TestE2EExternalSnapshotsWithoutCommonBaseFails(t *testing.T) {
 
 	k.applyReplication(sc)
 	status := k.waitForFailed(sc, 4*time.Minute)
-	assertFailedStatus(t, sc, status, "")
+	assertFailedAfterDataMoverSetupStatus(t, sc, status, "")
 	k.assertRealZFSSnapshotExists(sc.SourceNode, "zfs-src-snap-no-base-"+suffix, sc.sourceSnapshot())
+	k.assertRunEphemeralCleanup(sc.Name)
 }
 
 func TestE2ESameNodeSameDatasetRejectedBeforeJobs(t *testing.T) {
@@ -132,10 +133,11 @@ func TestE2ESyncoidFailure(t *testing.T) {
 
 	k.applyReplication(sc)
 	status := k.waitForFailed(sc, 4*time.Minute)
-	assertFailedStatus(t, sc, status, "CRITICAL ERROR")
+	assertFailedAfterDataMoverSetupStatus(t, sc, status, "CRITICAL ERROR")
 	if !strings.Contains(status.LastError, sc.TargetDataset) {
 		t.Fatalf("lastError = %q, want to mention target dataset %q", status.LastError, sc.TargetDataset)
 	}
+	k.assertRunEphemeralCleanup(sc.Name)
 }
 
 type replicationCase struct {
@@ -354,15 +356,39 @@ func (k kubectlRunner) podsForReplication(name, runID string) (podList, error) {
 	return pods, nil
 }
 
-func (k kubectlRunner) assertNoSecrets(name string) {
+func (k kubectlRunner) assertRunEphemeralCleanup(name string) {
 	k.t.Helper()
-	out, err := k.runOutput(20*time.Second, "get", "secrets", "-n", e2eNamespace, "-l", e2eLabelPrefix+"/run="+name, "-o", "name")
-	if err != nil && !strings.Contains(err.Error(), "No resources found") {
-		k.t.Fatal(err)
+	k.assertNoLabelledResourcesEventually(name, "receiver jobs", "jobs", e2eLabelPrefix+"/role=receiver")
+	k.assertNoLabelledResourcesEventually(name, "receiver pods", "pods", e2eLabelPrefix+"/role=receiver")
+	k.assertNoLabelledResourcesEventually(name, "run secrets", "secrets", "")
+}
+
+func (k kubectlRunner) assertNoLabelledResourcesEventually(name, description, resource, extraSelector string) {
+	k.t.Helper()
+	selector := e2eLabelPrefix + "/run=" + name
+	if extraSelector != "" {
+		selector += "," + extraSelector
 	}
-	if strings.TrimSpace(out) != "" {
-		k.t.Fatalf("secrets exist for %s:\n%s", name, out)
+	deadline := time.Now().Add(60 * time.Second)
+	var lastOut string
+	var lastErr error
+	for time.Now().Before(deadline) {
+		out, err := k.runOutput(20*time.Second, "get", resource, "-n", e2eNamespace, "-l", selector, "-o", "name")
+		if err != nil {
+			if strings.Contains(err.Error(), "No resources found") {
+				return
+			}
+			lastErr = err
+		} else {
+			lastOut = out
+			if strings.TrimSpace(out) == "" {
+				return
+			}
+		}
+		time.Sleep(1 * time.Second)
 	}
+	k.collectDiagnostics(name)
+	k.t.Fatalf("%s still exist for %s after terminal cleanup; selector=%q last output=%q last error=%v", description, name, selector, lastOut, lastErr)
 }
 
 func (k kubectlRunner) assertNoJobsOrSecrets(name string) {
@@ -588,6 +614,14 @@ func assertFailedStatus(t *testing.T, sc replicationCase, st replicationStatus, 
 	}
 	if st.StartedAt == "" || st.CompletedAt == "" {
 		t.Fatalf("failure timestamps missing: %#v", st)
+	}
+}
+
+func assertFailedAfterDataMoverSetupStatus(t *testing.T, sc replicationCase, st replicationStatus, wantError string) {
+	t.Helper()
+	assertFailedStatus(t, sc, st, wantError)
+	if st.ReceiverJobName == "" || st.ReceiverPodName == "" || st.ReceiverPodIP == "" || st.SSHSecretName == "" {
+		t.Fatalf("receiver/ssh status names missing after datamover setup for %s: %#v", sc.Name, st)
 	}
 }
 
