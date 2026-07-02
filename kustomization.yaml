@@ -1,0 +1,15 @@
+# Namespace-scoped smoke profile. The default all-namespaces install remains
+# available from config/.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - config/namespaced/watched_namespace.yaml
+  - config/manager/namespace.yaml
+  - config/crd/zfsreplication.example.com_zfsreplicationruns.yaml
+  - config/crd/zfsreplication.example.com_zfsreplicationschedules.yaml
+  - config/rbac/service_account.yaml
+  - config/rbac/namespaced_role.yaml
+  - config/rbac/namespaced_role_binding.yaml
+  - config/manager/deployment.yaml
+patches:
+  - path: config/namespaced/manager_watch_namespace_patch.yaml

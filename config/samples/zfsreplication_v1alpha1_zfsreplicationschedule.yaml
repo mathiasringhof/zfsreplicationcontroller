@@ -2,7 +2,7 @@ apiVersion: zfsreplication.example.com/v1alpha1
 kind: ZFSReplicationSchedule
 metadata:
   name: pg-a-to-b-hourly
-  namespace: storage
+  namespace: zfsreplication-smoke
 spec:
   schedule: "10 * * * *"
   concurrencyPolicy: Forbid

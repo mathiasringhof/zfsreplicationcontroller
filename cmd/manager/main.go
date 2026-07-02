@@ -3,6 +3,7 @@ package main
 import (
 	"flag"
 	"os"
+	"strings"
 
 	zfsv1 "github.com/mathias/zfsreplicationcontroller/api/v1alpha1"
 	"github.com/mathias/zfsreplicationcontroller/internal/controller"
@@ -14,15 +15,17 @@ import (
 	"k8s.io/client-go/kubernetes"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 )
 
 func main() {
-	var metricsAddr, probeAddr, image string
+	var metricsAddr, probeAddr, image, watchNamespace string
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "metrics bind address")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "probe bind address")
 	flag.StringVar(&image, "datamover-image", os.Getenv("DATA_MOVER_IMAGE"), "datamover image")
+	flag.StringVar(&watchNamespace, "watch-namespace", os.Getenv("WATCH_NAMESPACE"), "namespace to watch; empty watches all namespaces")
 	flag.Parse()
 
 	scheme := runtime.NewScheme()
@@ -33,11 +36,7 @@ func main() {
 	utilruntime.Must(zfsv1.AddToScheme(scheme))
 
 	config := ctrl.GetConfigOrDie()
-	mgr, err := ctrl.NewManager(config, ctrl.Options{
-		Scheme:                 scheme,
-		HealthProbeBindAddress: probeAddr,
-		Metrics:                metricsserver.Options{BindAddress: metricsAddr},
-	})
+	mgr, err := ctrl.NewManager(config, managerOptions(scheme, metricsAddr, probeAddr, watchNamespace))
 	if err != nil {
 		panic(err)
 	}
@@ -71,4 +70,19 @@ func main() {
 	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
 		panic(err)
 	}
+}
+
+func managerOptions(scheme *runtime.Scheme, metricsAddr, probeAddr, watchNamespace string) ctrl.Options {
+	opts := ctrl.Options{
+		Scheme:                 scheme,
+		HealthProbeBindAddress: probeAddr,
+		Metrics:                metricsserver.Options{BindAddress: metricsAddr},
+	}
+	watchNamespace = strings.TrimSpace(watchNamespace)
+	if watchNamespace != "" {
+		opts.Cache.DefaultNamespaces = map[string]cache.Config{
+			watchNamespace: {},
+		}
+	}
+	return opts
 }

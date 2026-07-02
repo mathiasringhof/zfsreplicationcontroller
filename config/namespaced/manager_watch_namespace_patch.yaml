@@ -1,0 +1,18 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: zfsreplication-controller
+  namespace: zfsreplication-system
+spec:
+  template:
+    spec:
+      containers:
+        - name: manager
+          args:
+            - --datamover-image=$(DATA_MOVER_IMAGE)
+            - --watch-namespace=$(WATCH_NAMESPACE)
+          env:
+            - name: DATA_MOVER_IMAGE
+              value: ghcr.io/mathiasringhof/zfsreplicationcontroller:main
+            - name: WATCH_NAMESPACE
+              value: zfsreplication-smoke
