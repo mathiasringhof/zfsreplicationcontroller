@@ -140,6 +140,39 @@ func TestE2ESyncoidFailure(t *testing.T) {
 	k.assertRunEphemeralCleanup(sc.Name)
 }
 
+func TestE2EOrphanReceiverPodTerminalCleanup(t *testing.T) {
+	k := newKubectlRunner(t)
+	suffix := uniqueSuffix()
+	name := "e2e-orphan-receiver-" + suffix
+	podName := name + "-receiver"
+	pool := realZFSPool()
+	sc := replicationCase{
+		Name:          name,
+		SourceNode:    e2eSourceNode,
+		TargetNode:    e2eTargetNode,
+		SourceDataset: pool + "/orphan-src-" + suffix,
+		TargetDataset: pool + "/orphan-dst-" + suffix,
+	}
+	k.cleanupReplicationOnExit(name)
+	k.cleanupReplication(name)
+
+	k.scaleController(0)
+	t.Cleanup(func() { k.scaleController(1) })
+
+	k.applyReplication(sc)
+	k.run(30*time.Second, "patch", "zfsreplicationrun", name, "-n", e2eNamespace, "--subresource=status", "--type=merge", "-p", `{"status":{"phase":"Succeeded"}}`)
+	if _, err := k.runInput(30*time.Second, orphanReceiverPodManifest(t, name, podName), "apply", "-f", "-"); err != nil {
+		t.Fatal(err)
+	}
+	k.run(60*time.Second, "wait", "pod/"+podName, "-n", e2eNamespace, "--for=condition=Ready", "--timeout=60s")
+	k.logSelectedRunObjects(name, "before orphan receiver cleanup")
+
+	k.scaleController(1)
+	k.run(30*time.Second, "annotate", "zfsreplicationrun", name, "-n", e2eNamespace, "zfsreplication.example.com/e2e-trigger="+suffix, "--overwrite")
+	k.assertRunEphemeralCleanup(name)
+	k.logSelectedRunObjects(name, "after orphan receiver cleanup")
+}
+
 type replicationCase struct {
 	Name          string
 	SourceNode    string
@@ -254,6 +287,12 @@ func (k kubectlRunner) cleanupReplicationOnExit(name string) {
 	k.t.Cleanup(func() { k.cleanupReplication(name) })
 }
 
+func (k kubectlRunner) scaleController(replicas int) {
+	k.t.Helper()
+	k.run(30*time.Second, "scale", "deployment/zfsreplication-controller", "-n", "zfsreplication-system", "--replicas="+strconv.Itoa(replicas))
+	k.run(180*time.Second, "rollout", "status", "deployment/zfsreplication-controller", "-n", "zfsreplication-system", "--timeout=180s")
+}
+
 func (k kubectlRunner) applyReplication(sc replicationCase) {
 	k.t.Helper()
 	manifest := sc.manifestJSON(k.t)
@@ -361,6 +400,21 @@ func (k kubectlRunner) assertRunEphemeralCleanup(name string) {
 	k.assertNoLabelledResourcesEventually(name, "receiver jobs", "jobs", e2eLabelPrefix+"/role=receiver")
 	k.assertNoLabelledResourcesEventually(name, "receiver pods", "pods", e2eLabelPrefix+"/role=receiver")
 	k.assertNoLabelledResourcesEventually(name, "run secrets", "secrets", "")
+}
+
+func (k kubectlRunner) logSelectedRunObjects(name, stage string) {
+	k.t.Helper()
+	for _, selector := range []string{
+		e2eLabelPrefix + "/run=" + name,
+		e2eLabelPrefix + "/run=" + name + "," + e2eLabelPrefix + "/role=receiver",
+	} {
+		out, err := k.runOutput(20*time.Second, "get", "pods,jobs,secrets", "-n", e2eNamespace, "-l", selector, "-o", "wide", "--show-labels")
+		if err != nil {
+			k.t.Logf("%s selector=%q failed: %v", stage, selector, err)
+			continue
+		}
+		k.t.Logf("%s selector=%q\n%s", stage, selector, out)
+	}
 }
 
 func (k kubectlRunner) assertNoLabelledResourcesEventually(name, description, resource, extraSelector string) {
@@ -657,6 +711,41 @@ func realZFSJobManifest(t *testing.T, node, name, script string) []byte {
 					"volumes": []map[string]any{
 						{"name": "dev-zfs", "hostPath": map[string]any{"path": "/dev/zfs"}},
 					},
+				},
+			},
+		},
+	}
+	out, err := json.MarshalIndent(doc, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+func orphanReceiverPodManifest(t *testing.T, runName, podName string) []byte {
+	t.Helper()
+	doc := map[string]any{
+		"apiVersion": "v1",
+		"kind":       "Pod",
+		"metadata": map[string]any{
+			"name":      podName,
+			"namespace": e2eNamespace,
+			"labels": map[string]string{
+				e2eLabelPrefix + "/run":  runName,
+				e2eLabelPrefix + "/role": "receiver",
+			},
+		},
+		"spec": map[string]any{
+			"restartPolicy":                "Never",
+			"automountServiceAccountToken": false,
+			"nodeName":                     e2eTargetNode,
+			"containers": []map[string]any{
+				{
+					"name":            "receiver",
+					"image":           e2eImageTag(),
+					"imagePullPolicy": "IfNotPresent",
+					"command":         []string{"/bin/sh", "-c", "sleep 600"},
+					"securityContext": map[string]any{"privileged": true},
 				},
 			},
 		},

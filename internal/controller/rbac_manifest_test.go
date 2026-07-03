@@ -89,6 +89,13 @@ func TestControllerClusterRoleHasRequiredPermissions(t *testing.T) {
 		t.Fatalf("pods/log RBAC verbs = %v, missing get", verbs)
 	}
 
+	verbs = verbsForResource(role.Rules, "", "pods")
+	for _, verb := range []string{"get", "list", "watch", "delete"} {
+		if !contains(verbs, verb) {
+			t.Fatalf("pods RBAC verbs = %v, missing %q", verbs, verb)
+		}
+	}
+
 	verbs = verbsForResource(role.Rules, "", "secrets")
 	for _, verb := range []string{"create", "get", "list", "watch", "update", "patch", "delete"} {
 		if !contains(verbs, verb) {
@@ -138,7 +145,7 @@ func TestNamespacedRBACRestrictsWorkloadPermissionsToWatchedNamespace(t *testing
 		{apiGroup: "zfsreplication.example.com", resource: "zfsreplicationschedules/status", verbs: []string{"get", "update", "patch"}},
 		{apiGroup: "batch", resource: "jobs", verbs: []string{"create", "get", "list", "watch", "update", "patch", "delete"}},
 		{apiGroup: "", resource: "secrets", verbs: []string{"create", "get", "list", "watch", "update", "patch", "delete"}},
-		{apiGroup: "", resource: "pods", verbs: []string{"get", "list", "watch"}},
+		{apiGroup: "", resource: "pods", verbs: []string{"get", "list", "watch", "delete"}},
 		{apiGroup: "", resource: "pods/log", verbs: []string{"get"}},
 		{apiGroup: "", resource: "events", verbs: []string{"create", "patch"}},
 	} {

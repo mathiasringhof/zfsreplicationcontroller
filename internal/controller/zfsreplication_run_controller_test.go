@@ -53,36 +53,103 @@ func TestRunReconcileSenderJobUsesSyncoidOptions(t *testing.T) {
 
 func TestRunReconcileRetriesCleanupForTerminalRun(t *testing.T) {
 	for _, phase := range []zfsv1.Phase{zfsv1.PhaseSucceeded, zfsv1.PhaseFailed} {
-		t.Run(string(phase), func(t *testing.T) {
-			run := replicationRun("manual-" + strings.ToLower(string(phase)))
+		t.Run(string(phase)+"/receiver job delete failure", func(t *testing.T) {
+			run := replicationRun("manual-" + strings.ToLower(string(phase)) + "-job")
 			run.Status.Phase = phase
 			names := objectNamesForRun(run.Name)
 			receiverJob := runReceiverJob(run, names, "datamover:test")
 			sshSecret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: names.SecretName, Namespace: run.Namespace}}
-			deleteReceiverFailures := 1
+			receiverPod := runReceiverPod(run, "10.0.0.42")
+			deleteReceiverJobFailures := 1
 			r := newRunReconcilerWithInterceptors(t, interceptor.Funcs{
 				Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
-					if obj.GetName() == names.ReceiverName && deleteReceiverFailures > 0 {
-						deleteReceiverFailures--
-						return errors.New("temporary receiver delete failure")
+					if obj.GetName() == names.ReceiverName && deleteReceiverJobFailures > 0 {
+						deleteReceiverJobFailures--
+						return errors.New("temporary receiver job delete failure")
 					}
 					return c.Delete(ctx, obj, opts...)
 				},
-			}, run, receiverJob, sshSecret)
+			}, run, receiverJob, sshSecret, receiverPod)
 
-			if _, err := r.Reconcile(context.Background(), request(run.Name)); err == nil {
-				t.Fatal("Reconcile() error = nil, want cleanup delete error")
+			if _, err := r.Reconcile(context.Background(), request(run.Name)); err == nil || !strings.Contains(err.Error(), "temporary receiver job delete failure") {
+				t.Fatalf("Reconcile() error = %v, want cleanup job delete error", err)
 			}
 			assertObjectExists(t, r.Client, &batchv1.Job{}, names.ReceiverName)
+			assertObjectDeleted(t, r.Client, &corev1.Pod{}, receiverPod.Name)
 			assertObjectDeleted(t, r.Client, &corev1.Secret{}, names.SecretName)
 
 			if _, err := r.Reconcile(context.Background(), request(run.Name)); err != nil {
 				t.Fatalf("second Reconcile() error = %v, want nil", err)
 			}
 			assertObjectDeleted(t, r.Client, &batchv1.Job{}, names.ReceiverName)
+			assertObjectDeleted(t, r.Client, &corev1.Pod{}, receiverPod.Name)
+			assertObjectDeleted(t, r.Client, &corev1.Secret{}, names.SecretName)
+		})
+
+		t.Run(string(phase)+"/receiver pod delete failure", func(t *testing.T) {
+			run := replicationRun("manual-" + strings.ToLower(string(phase)))
+			run.Status.Phase = phase
+			names := objectNamesForRun(run.Name)
+			receiverJob := runReceiverJob(run, names, "datamover:test")
+			sshSecret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: names.SecretName, Namespace: run.Namespace}}
+			receiverPod := runReceiverPod(run, "10.0.0.42")
+			deleteReceiverPodFailures := 1
+			r := newRunReconcilerWithInterceptors(t, interceptor.Funcs{
+				Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+					if obj.GetName() == receiverPod.Name && deleteReceiverPodFailures > 0 {
+						deleteReceiverPodFailures--
+						return errors.New("temporary receiver pod delete failure")
+					}
+					return c.Delete(ctx, obj, opts...)
+				},
+			}, run, receiverJob, sshSecret, receiverPod)
+
+			if _, err := r.Reconcile(context.Background(), request(run.Name)); err == nil || !strings.Contains(err.Error(), "temporary receiver pod delete failure") {
+				t.Fatalf("Reconcile() error = %v, want cleanup pod delete error", err)
+			}
+			assertObjectExists(t, r.Client, &corev1.Pod{}, receiverPod.Name)
+			assertObjectDeleted(t, r.Client, &batchv1.Job{}, names.ReceiverName)
+			assertObjectDeleted(t, r.Client, &corev1.Secret{}, names.SecretName)
+
+			if _, err := r.Reconcile(context.Background(), request(run.Name)); err != nil {
+				t.Fatalf("second Reconcile() error = %v, want nil", err)
+			}
+			assertObjectDeleted(t, r.Client, &corev1.Pod{}, receiverPod.Name)
+			assertObjectDeleted(t, r.Client, &batchv1.Job{}, names.ReceiverName)
 			assertObjectDeleted(t, r.Client, &corev1.Secret{}, names.SecretName)
 		})
 	}
+}
+
+func TestRunReconcileCleansUpReceiverPodForTerminalRun(t *testing.T) {
+	run := replicationRun("manual-cleanup")
+	run.Status.Phase = zfsv1.PhaseSucceeded
+	names := objectNamesForRun(run.Name)
+	receiverJob := runReceiverJob(run, names, "datamover:test")
+	sshSecret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: names.SecretName, Namespace: run.Namespace}}
+	receiverPod := runReceiverPod(run, "10.0.0.42")
+	r := newRunReconciler(t, run, receiverJob, sshSecret, receiverPod)
+
+	if _, err := r.Reconcile(context.Background(), request(run.Name)); err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+
+	assertObjectDeleted(t, r.Client, &corev1.Pod{}, receiverPod.Name)
+	assertObjectDeleted(t, r.Client, &batchv1.Job{}, names.ReceiverName)
+	assertObjectDeleted(t, r.Client, &corev1.Secret{}, names.SecretName)
+}
+
+func TestRunReconcileCleansUpOrphanReceiverPodForTerminalRun(t *testing.T) {
+	run := replicationRun("manual-orphan-cleanup")
+	run.Status.Phase = zfsv1.PhaseSucceeded
+	receiverPod := runReceiverPod(run, "10.0.0.42")
+	r := newRunReconciler(t, run, receiverPod)
+
+	if _, err := r.Reconcile(context.Background(), request(run.Name)); err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+
+	assertObjectDeleted(t, r.Client, &corev1.Pod{}, receiverPod.Name)
 }
 
 func TestScheduleReconcileCreatesRunForDueSchedule(t *testing.T) {
