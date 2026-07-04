@@ -492,6 +492,9 @@ func TestReceiveTaskCRDSchemaExposesMVP1Fields(t *testing.T) {
 	if spec.Properties["policy"].Properties["allowSyncSnapshotDestroy"].Type != "boolean" {
 		t.Fatalf("allowSyncSnapshotDestroy schema = %#v", spec.Properties["policy"].Properties["allowSyncSnapshotDestroy"])
 	}
+	if spec.Properties["policy"].Properties["syncSnapshotIdentifier"].Type != "string" {
+		t.Fatalf("syncSnapshotIdentifier schema = %#v", spec.Properties["policy"].Properties["syncSnapshotIdentifier"])
+	}
 	if spec.Properties["policy"].Properties["compression"].Type != "string" {
 		t.Fatalf("compression schema = %#v", spec.Properties["policy"].Properties["compression"])
 	}

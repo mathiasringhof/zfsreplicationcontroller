@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -19,8 +21,14 @@ import (
 
 const receiverCommandPath = "/usr/local/bin/zfsrep-receiver"
 
+const (
+	maxReceiverCommandLength       = 8192
+	maxReceiverDestroyBatchCommand = 32
+)
+
 type receiverTaskAuthorization struct {
 	AuthorizedKey string
+	PolicyID      string
 	PolicyPath    string
 	Policy        receiverCommandPolicy
 }
@@ -33,6 +41,7 @@ type receiverCommandPolicy struct {
 	AllowDestroy             bool   `json:"allowDestroy,omitempty"`
 	AllowMount               bool   `json:"allowMount,omitempty"`
 	AllowSyncSnapshotDestroy bool   `json:"allowSyncSnapshotDestroy,omitempty"`
+	SyncSnapshotIdentifier   string `json:"syncSnapshotIdentifier,omitempty"`
 	Compression              string `json:"compression"`
 }
 
@@ -58,6 +67,7 @@ const (
 	receiverCommandExit     receiverCommandKind = "exit"
 	receiverCommandEcho     receiverCommandKind = "echo"
 	receiverCommandLookup   receiverCommandKind = "lookup"
+	receiverCommandPS       receiverCommandKind = "ps"
 	receiverCommandPipeline receiverCommandKind = "pipeline"
 	receiverCommandBatch    receiverCommandKind = "batch"
 )
@@ -86,13 +96,17 @@ func (e forcedCommandExitError) ExitCode() int {
 func runForcedCommandFromArgs(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("exec", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
-	var policyPath string
-	fs.StringVar(&policyPath, "policy", "", "receiver policy file")
+	var policyID string
+	fs.StringVar(&policyID, "policy-id", "", "receiver policy ID")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if policyPath == "" {
-		return fmt.Errorf("receiver policy file is required")
+	if policyID == "" {
+		return fmt.Errorf("receiver policy ID is required")
+	}
+	policyPath, err := receiverPolicyPathForID(receiverPolicyDir(configFromEnv()), policyID)
+	if err != nil {
+		return err
 	}
 	policy, err := readReceiverPolicy(policyPath)
 	if err != nil {
@@ -119,6 +133,19 @@ func runForcedCommand(ctx context.Context, cfg forcedCommandConfig) error {
 }
 
 func readReceiverPolicy(path string) (receiverCommandPolicy, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return receiverCommandPolicy{}, fmt.Errorf("stat receiver policy: %w", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return receiverCommandPolicy{}, fmt.Errorf("receiver policy must not be a symlink")
+	}
+	if !info.Mode().IsRegular() {
+		return receiverCommandPolicy{}, fmt.Errorf("receiver policy must be a regular file")
+	}
+	if info.Mode().Perm()&0o022 != 0 {
+		return receiverCommandPolicy{}, fmt.Errorf("receiver policy must not be group or world writable")
+	}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return receiverCommandPolicy{}, fmt.Errorf("read receiver policy: %w", err)
@@ -132,7 +159,11 @@ func readReceiverPolicy(path string) (receiverCommandPolicy, error) {
 }
 
 func receiveTaskAuthorization(cfg receiverConfig, task *zfsv1.ZFSReceiveTask) receiverTaskAuthorization {
-	policyPath := filepath.Join(receiverPolicyDir(cfg), receiverPolicyFileName(task))
+	policyID := receiverPolicyID(task)
+	policyPath, err := receiverPolicyPathForID(receiverPolicyDir(cfg), policyID)
+	if err != nil {
+		panic(err)
+	}
 	policy := receiverCommandPolicy{
 		TargetDataset:            task.Spec.Destination.Dataset,
 		ReceiveUnmounted:         task.Spec.Policy.ReceiveUnmounted,
@@ -141,12 +172,14 @@ func receiveTaskAuthorization(cfg receiverConfig, task *zfsv1.ZFSReceiveTask) re
 		AllowDestroy:             task.Spec.Policy.AllowDestroy,
 		AllowMount:               task.Spec.Policy.AllowMount,
 		AllowSyncSnapshotDestroy: task.Spec.Policy.AllowSyncSnapshotDestroy,
+		SyncSnapshotIdentifier:   task.Spec.Policy.SyncSnapshotIdentifier,
 		Compression:              compressionDefault(task.Spec.Policy.Compression),
 	}
-	forcedCommand := receiverCommandPath + " exec --policy " + policyPath
+	forcedCommand := receiverCommandPath + " exec --policy-id " + policyID
 	key := "restrict,command=\"" + escapeAuthorizedKeysOption(forcedCommand) + "\" " + strings.TrimSpace(task.Spec.SSH.AuthorizedPublicKey)
 	return receiverTaskAuthorization{
 		AuthorizedKey: key,
+		PolicyID:      policyID,
 		PolicyPath:    policyPath,
 		Policy:        policy,
 	}
@@ -156,23 +189,32 @@ func receiverPolicyDir(cfg receiverConfig) string {
 	return filepath.Join(filepath.Dir(cfg.AuthorizedKeysFile), "policies")
 }
 
-func receiverPolicyFileName(task *zfsv1.ZFSReceiveTask) string {
-	return sanitizePolicyPathSegment(task.Namespace) + "_" + sanitizePolicyPathSegment(task.Name) + ".json"
+func receiverPolicyID(task *zfsv1.ZFSReceiveTask) string {
+	sum := sha256.Sum256([]byte(task.Namespace + "\x00" + task.Name))
+	return "policy-" + hex.EncodeToString(sum[:])[:32]
 }
 
-func sanitizePolicyPathSegment(value string) string {
-	var out strings.Builder
-	for _, r := range value {
-		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-' || r == '.' {
-			out.WriteRune(r)
-		} else {
-			out.WriteByte('_')
+func receiverPolicyPathForID(dir, id string) (string, error) {
+	if !validReceiverPolicyID(id) {
+		return "", fmt.Errorf("invalid receiver policy ID %q", id)
+	}
+	return filepath.Join(filepath.Clean(dir), id+".json"), nil
+}
+
+func validReceiverPolicyID(id string) bool {
+	if len(id) != len("policy-")+32 || !strings.HasPrefix(id, "policy-") {
+		return false
+	}
+	for _, r := range id[len("policy-"):] {
+		if !isLowerHex(r) {
+			return false
 		}
 	}
-	if out.Len() == 0 {
-		return "default"
-	}
-	return out.String()
+	return true
+}
+
+func isLowerHex(r rune) bool {
+	return r >= '0' && r <= '9' || r >= 'a' && r <= 'f'
 }
 
 func escapeAuthorizedKeysOption(value string) string {
@@ -181,29 +223,26 @@ func escapeAuthorizedKeysOption(value string) string {
 }
 
 func writeReceiverPolicies(dir string, policies map[string]receiverCommandPolicy) error {
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return fmt.Errorf("create receiver policy directory: %w", err)
+	if err := ensureReceiverPolicyDir(dir); err != nil {
+		return err
 	}
 	active := map[string]struct{}{}
-	paths := make([]string, 0, len(policies))
-	for path := range policies {
-		paths = append(paths, path)
+	ids := make([]string, 0, len(policies))
+	for id := range policies {
+		ids = append(ids, id)
 	}
-	sort.Strings(paths)
-	for _, path := range paths {
-		if filepath.Dir(path) != dir {
-			return fmt.Errorf("receiver policy path %q is outside policy directory", path)
+	sort.Strings(ids)
+	for _, id := range ids {
+		path, err := receiverPolicyPathForID(dir, id)
+		if err != nil {
+			return err
 		}
-		data, err := json.Marshal(policies[path])
+		data, err := json.Marshal(policies[id])
 		if err != nil {
 			return fmt.Errorf("marshal receiver policy: %w", err)
 		}
-		tmp := path + ".tmp"
-		if err := os.WriteFile(tmp, append(data, '\n'), 0o600); err != nil {
+		if err := writeReceiverPolicyFile(path, append(data, '\n')); err != nil {
 			return fmt.Errorf("write receiver policy: %w", err)
-		}
-		if err := os.Rename(tmp, path); err != nil {
-			return fmt.Errorf("replace receiver policy: %w", err)
 		}
 		active[filepath.Base(path)] = struct{}{}
 	}
@@ -218,20 +257,103 @@ func writeReceiverPolicies(dir string, policies map[string]receiverCommandPolicy
 		if _, ok := active[entry.Name()]; ok {
 			continue
 		}
-		if err := os.Remove(filepath.Join(dir, entry.Name())); err != nil {
+		stalePath := filepath.Join(dir, entry.Name())
+		if err := removeReceiverPolicyFile(stalePath); err != nil {
 			return fmt.Errorf("remove stale receiver policy: %w", err)
 		}
 	}
 	return nil
 }
 
+func ensureReceiverPolicyDir(dir string) error {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("create receiver policy directory: %w", err)
+	}
+	info, err := os.Lstat(dir)
+	if err != nil {
+		return fmt.Errorf("stat receiver policy directory: %w", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("receiver policy directory must not be a symlink")
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("receiver policy path is not a directory")
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		return fmt.Errorf("set receiver policy directory mode: %w", err)
+	}
+	return nil
+}
+
+func writeReceiverPolicyFile(path string, data []byte) error {
+	if info, err := os.Lstat(path); err == nil && info.IsDir() {
+		return fmt.Errorf("receiver policy path is a directory")
+	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	tmp := path + ".tmp"
+	if info, err := os.Lstat(tmp); err == nil {
+		if info.IsDir() {
+			return fmt.Errorf("receiver policy temporary path is a directory")
+		}
+		if err := os.Remove(tmp); err != nil {
+			return err
+		}
+	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	file, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return err
+	}
+	_, writeErr := file.Write(data)
+	closeErr := file.Close()
+	if writeErr != nil {
+		return errors.Join(writeErr, os.Remove(tmp))
+	}
+	if closeErr != nil {
+		return errors.Join(closeErr, os.Remove(tmp))
+	}
+	if err := os.Chmod(tmp, 0o600); err != nil {
+		return errors.Join(err, os.Remove(tmp))
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return errors.Join(err, os.Remove(tmp))
+	}
+	return os.Chmod(path, 0o600)
+}
+
+func removeReceiverPolicyFile(path string) error {
+	info, err := os.Lstat(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	if info.IsDir() {
+		return nil
+	}
+	return os.Remove(path)
+}
+
 func authorizeReceiverCommand(raw string, policy receiverCommandPolicy) (receiverCommandPlan, error) {
+	raw = strings.TrimSpace(raw)
+	if len(raw) > maxReceiverCommandLength {
+		return receiverCommandPlan{}, fmt.Errorf("command is too long")
+	}
 	if strings.Contains(raw, ";") {
 		return authorizeReceiverCommandBatch(raw, policy)
 	}
 	policy.Compression = compressionDefault(policy.Compression)
 	if policy.TargetDataset == "" {
 		return receiverCommandPlan{}, fmt.Errorf("target dataset is empty")
+	}
+	if !validReceiverDatasetName(policy.TargetDataset) {
+		return receiverCommandPlan{}, fmt.Errorf("target dataset is invalid")
+	}
+	if policy.SyncSnapshotIdentifier != "" && !validSyncoidIdentifier(policy.SyncSnapshotIdentifier) {
+		return receiverCommandPlan{}, fmt.Errorf("sync snapshot identifier is invalid")
 	}
 	tokens, err := tokenizeReceiverCommand(raw)
 	if err != nil {
@@ -255,6 +377,10 @@ func authorizeReceiverCommand(raw string, policy receiverCommandPolicy) (receive
 		case "command":
 			if receiverStepHasNoStdoutRedirects(step) && len(step.Args) == 2 && step.Args[0] == "-v" && commandLookupAllowed(step.Args[1], policy) {
 				return receiverCommandPlan{kind: receiverCommandLookup, lookupCommand: step.Args[1]}, nil
+			}
+		case "ps":
+			if receiverStepHasNoRedirects(step) && stringSlicesEqual(step.Args, []string{"-Ao", "args="}) {
+				return receiverCommandPlan{kind: receiverCommandPS}, nil
 			}
 		}
 	}
@@ -292,6 +418,9 @@ func authorizeReceiverCommandBatch(raw string, policy receiverCommandPolicy) (re
 			return receiverCommandPlan{}, fmt.Errorf("only zfs destroy commands may be batched")
 		}
 		batch = append(batch, plan)
+		if len(batch) > maxReceiverDestroyBatchCommand {
+			return receiverCommandPlan{}, fmt.Errorf("too many commands in batch")
+		}
 	}
 	if len(batch) == 0 {
 		return receiverCommandPlan{}, fmt.Errorf("empty command batch")
@@ -629,7 +758,7 @@ func validateDecompressorStep(step receiverCommandStep, policy receiverCommandPo
 
 func validateZFSReceiveStep(step receiverCommandStep, policy receiverCommandPolicy) error {
 	if len(step.Args) == 3 && step.Args[0] == "receive" && step.Args[1] == "-A" {
-		if step.Args[2] != policy.TargetDataset {
+		if !validReceiverDatasetName(step.Args[2]) || step.Args[2] != policy.TargetDataset {
 			return fmt.Errorf("zfs receive abort target is outside policy")
 		}
 		if !policy.ReceiveResumable {
@@ -641,7 +770,7 @@ func validateZFSReceiveStep(step receiverCommandStep, policy receiverCommandPoli
 		return fmt.Errorf("unsupported zfs receive command")
 	}
 	target := step.Args[len(step.Args)-1]
-	if target != policy.TargetDataset {
+	if !validReceiverDatasetName(target) || target != policy.TargetDataset {
 		return fmt.Errorf("zfs receive target is outside policy")
 	}
 	seenUnmounted := false
@@ -675,8 +804,10 @@ func validateZFSReceiveStep(step receiverCommandStep, policy receiverCommandPoli
 
 func zfsDestroyAllowed(args []string, policy receiverCommandPolicy) bool {
 	if len(args) == 2 && args[0] == "destroy" {
-		if syncoidSnapshotTarget(args[1], policy.TargetDataset) {
-			return policy.AllowSyncSnapshotDestroy
+		if dataset, snapshot, ok := splitSnapshotTarget(args[1]); ok {
+			return policy.AllowSyncSnapshotDestroy &&
+				dataset == policy.TargetDataset &&
+				syncoidSnapshotTarget(snapshot, policy.SyncSnapshotIdentifier)
 		}
 		return policy.AllowDestroy && datasetOrChild(args[1], policy.TargetDataset) && !strings.Contains(args[1], "@")
 	}
@@ -686,12 +817,69 @@ func zfsDestroyAllowed(args []string, policy receiverCommandPolicy) bool {
 	return false
 }
 
-func syncoidSnapshotTarget(value, target string) bool {
-	return strings.HasPrefix(value, target+"@syncoid_") && !strings.Contains(value, ",")
+func syncoidSnapshotTarget(snapshot, identifier string) bool {
+	if identifier == "" || !validSyncoidIdentifier(identifier) || !validReceiverSnapshotName(snapshot) {
+		return false
+	}
+	return strings.HasPrefix(snapshot, "syncoid_"+identifier+"_")
 }
 
 func datasetOrChild(value, target string) bool {
-	return value == target || strings.HasPrefix(value, target+"/")
+	return validReceiverDatasetName(value) &&
+		validReceiverDatasetName(target) &&
+		(value == target || strings.HasPrefix(value, target+"/"))
+}
+
+func splitSnapshotTarget(value string) (string, string, bool) {
+	dataset, snapshot, ok := strings.Cut(value, "@")
+	if !ok || strings.Contains(snapshot, "@") || !validReceiverDatasetName(dataset) || !validReceiverSnapshotName(snapshot) {
+		return "", "", false
+	}
+	return dataset, snapshot, true
+}
+
+func validReceiverDatasetName(dataset string) bool {
+	if dataset == "" ||
+		strings.HasPrefix(dataset, "/") ||
+		strings.HasSuffix(dataset, "/") ||
+		strings.Contains(dataset, "//") ||
+		strings.ContainsAny(dataset, "@# \t\r\n;|&`$()<>\\\"'*?[") {
+		return false
+	}
+	for _, part := range strings.Split(dataset, "/") {
+		if part == "" || part == "." || part == ".." || strings.ContainsFunc(part, unicode.IsControl) {
+			return false
+		}
+	}
+	return true
+}
+
+func validReceiverSnapshotName(snapshot string) bool {
+	if snapshot == "" || snapshot == "." || snapshot == ".." {
+		return false
+	}
+	for _, r := range snapshot {
+		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' ||
+			r == '_' || r == '-' || r == '.' || r == ':' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func validSyncoidIdentifier(identifier string) bool {
+	if identifier == "" {
+		return false
+	}
+	for _, r := range identifier {
+		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' ||
+			r == '_' || r == '-' || r == '.' || r == ':' {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 func targetPool(dataset string) string {
@@ -763,6 +951,8 @@ func executeReceiverCommandPlan(ctx context.Context, cfg forcedCommandConfig, pl
 		}
 		_, err = fmt.Fprintln(stdout, path)
 		return err
+	case receiverCommandPS:
+		return nil
 	case receiverCommandPipeline:
 		return executeReceiverPipeline(ctx, stdin, stdout, stderr, plan.pipeline)
 	case receiverCommandBatch:
@@ -785,12 +975,15 @@ func executeReceiverCommandPlan(ctx context.Context, cfg forcedCommandConfig, pl
 func executeReceiverPipeline(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer, steps []receiverCommandStep) error {
 	cmds := make([]*exec.Cmd, 0, len(steps))
 	previousStdout := stdin
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	for i, step := range steps {
 		path, err := resolveAllowedCommand(step.Name)
 		if err != nil {
 			return err
 		}
 		cmd := exec.CommandContext(ctx, path, step.Args...)
+		cmd.Env = receiverChildEnvironment()
 		cmd.Stdin = previousStdout
 		if i == len(steps)-1 {
 			if step.StdoutNull {
@@ -814,17 +1007,43 @@ func executeReceiverPipeline(ctx context.Context, stdin io.Reader, stdout, stder
 		}
 		cmds = append(cmds, cmd)
 	}
+	started := make([]*exec.Cmd, 0, len(cmds))
 	for _, cmd := range cmds {
 		if err := cmd.Start(); err != nil {
+			cancel()
+			waitReceiverCommands(started)
 			return fmt.Errorf("start %s: %w", cmd.Path, err)
 		}
+		started = append(started, cmd)
 	}
-	for _, cmd := range cmds {
-		if err := cmd.Wait(); err != nil {
-			return commandExitError(err)
+	results := make(chan error, len(started))
+	for _, cmd := range started {
+		go func(cmd *exec.Cmd) {
+			results <- commandExitError(cmd.Wait())
+		}(cmd)
+	}
+	var firstErr error
+	for range started {
+		if err := <-results; err != nil {
+			if firstErr == nil {
+				firstErr = err
+				cancel()
+			}
 		}
 	}
-	return nil
+	return firstErr
+}
+
+func receiverChildEnvironment() []string {
+	return []string{"LC_ALL=C", "LANG=C"}
+}
+
+func waitReceiverCommands(cmds []*exec.Cmd) {
+	for _, cmd := range cmds {
+		if err := cmd.Wait(); err != nil {
+			continue
+		}
+	}
 }
 
 func commandExitError(err error) error {
@@ -835,7 +1054,9 @@ func commandExitError(err error) error {
 	return err
 }
 
-func resolveAllowedCommand(name string) (string, error) {
+var resolveAllowedCommand = defaultResolveAllowedCommand
+
+func defaultResolveAllowedCommand(name string) (string, error) {
 	for _, path := range allowedCommandPaths(name) {
 		info, err := os.Stat(path)
 		if err == nil && !info.IsDir() && info.Mode()&0o111 != 0 {

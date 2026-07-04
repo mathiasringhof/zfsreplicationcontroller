@@ -204,6 +204,10 @@ the replication behavior:
 - `includeSnaps`: one `--include-snaps=<regex>` per item.
 - `excludeSnaps`: one `--exclude-snaps=<regex>` per item.
 
+The controller also passes a generated Syncoid `--identifier` derived from the
+replication relationship so receiver-side sync snapshot pruning is scoped to
+snapshots owned by that relationship.
+
 ## Object Lifecycle
 
 Each run gets its own SSH `Secret` and `ZFSReceiveTask`. The sender connects to

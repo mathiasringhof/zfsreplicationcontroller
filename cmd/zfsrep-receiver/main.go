@@ -228,7 +228,7 @@ func reconcileReceiveTasks(ctx context.Context, kubeClient client.Client, cfg re
 		}
 		auth := receiveTaskAuthorization(cfg, task)
 		activeKeys[auth.AuthorizedKey] = struct{}{}
-		activePolicies[auth.PolicyPath] = auth.Policy
+		activePolicies[auth.PolicyID] = auth.Policy
 		readyTasks = append(readyTasks, task)
 	}
 

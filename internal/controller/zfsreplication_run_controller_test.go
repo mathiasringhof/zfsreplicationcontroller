@@ -44,6 +44,9 @@ func TestRunReconcileSenderJobUsesSyncoidOptions(t *testing.T) {
 	if got := envValue(sender, "SYNCOID_COMPRESS"); got != "zstd" {
 		t.Fatalf("SYNCOID_COMPRESS = %q", got)
 	}
+	if got := envValue(sender, "SYNCOID_IDENTIFIER"); got == "" || strings.ContainsAny(got, " \t\r\n;|&`$()<>\\") {
+		t.Fatalf("SYNCOID_IDENTIFIER = %q, want non-empty shell-safe identifier", got)
+	}
 	if got := envValue(sender, "SYNCOID_INCLUDE_SNAPS"); got != "^snap-.*\n^manual$" {
 		t.Fatalf("SYNCOID_INCLUDE_SNAPS = %q", got)
 	}
@@ -102,6 +105,9 @@ func TestRunReconcileCreatesReceiveTaskBeforeSenderJob(t *testing.T) {
 	}
 	if task.Spec.Policy.Compression != "zstd" {
 		t.Fatalf("task compression = %q, want zstd", task.Spec.Policy.Compression)
+	}
+	if task.Spec.Policy.SyncSnapshotIdentifier == "" || strings.ContainsAny(task.Spec.Policy.SyncSnapshotIdentifier, " \t\r\n;|&`$()<>\\") {
+		t.Fatalf("task sync snapshot identifier = %q, want non-empty shell-safe identifier", task.Spec.Policy.SyncSnapshotIdentifier)
 	}
 	assertObjectDeleted(t, r.Client, &batchv1.Job{}, names.SenderName)
 	assertObjectDeleted(t, r.Client, &batchv1.Job{}, names.ReceiverName)

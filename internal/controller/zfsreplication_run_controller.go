@@ -2,6 +2,8 @@ package controller
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"strconv"
@@ -582,6 +584,7 @@ func runSSHSecret(run *zfsv1.ZFSReplicationRun, names runObjects, key sshKeyMate
 func runReceiveTask(run *zfsv1.ZFSReplicationRun, names runObjects, publicKey string, expiresAt metav1.Time) *zfsv1.ZFSReceiveTask {
 	labels := cloneLabels(names.Labels)
 	labels[labelPrefix+"/role"] = "receiver"
+	syncSnapshotIdentifier := syncSnapshotIdentifierForRun(run)
 	return &zfsv1.ZFSReceiveTask{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      names.ReceiveTaskName,
@@ -602,6 +605,7 @@ func runReceiveTask(run *zfsv1.ZFSReplicationRun, names runObjects, publicKey st
 				AllowRollback:            !boolDefault(run.Spec.Syncoid.NoRollback, true),
 				AllowDestroy:             boolDefault(run.Spec.Syncoid.ForceDelete, false),
 				AllowSyncSnapshotDestroy: !boolDefault(run.Spec.Syncoid.NoSyncSnap, false),
+				SyncSnapshotIdentifier:   syncSnapshotIdentifier,
 				Compression:              compressionDefault(run.Spec.Syncoid.Compress),
 			},
 		},
@@ -619,9 +623,21 @@ func runSenderJob(run *zfsv1.ZFSReplicationRun, names runObjects, image, receive
 		{Name: "KNOWN_HOSTS_FILE", Value: "/var/run/zfsrep/ssh/known_hosts"},
 		{Name: "SSH_PORT", Value: "2222"},
 		{Name: "DST_DATASET", Value: run.Spec.Target.Dataset},
+		{Name: "SYNCOID_IDENTIFIER", Value: syncSnapshotIdentifierForRun(run)},
 	}
 	env = append(env, syncoidEnv(run.Spec.Syncoid)...)
 	return dataMoverJobForRun(run, names.SenderName, image, labels, run.Spec.Source.NodeName, "/usr/local/bin/zfsrep-sender", env, names.SecretName, false)
+}
+
+func syncSnapshotIdentifierForRun(run *zfsv1.ZFSReplicationRun) string {
+	sum := sha256.Sum256([]byte(strings.Join([]string{
+		run.Namespace,
+		run.Spec.Source.NodeName,
+		run.Spec.Source.Dataset,
+		run.Spec.Target.NodeName,
+		run.Spec.Target.Dataset,
+	}, "\x00")))
+	return "zrc-" + hex.EncodeToString(sum[:])[:24]
 }
 
 func syncoidEnv(spec zfsv1.SyncoidSpec) []corev1.EnvVar {

@@ -8,42 +8,44 @@ import (
 )
 
 type SenderConfig struct {
-	SrcDataset       string
-	DstHost          string
-	DstDataset       string
-	SSHKeyFile       string
-	KnownHostsFile   string
-	SSHPort          string
-	NoSyncSnap       bool
-	NoRollback       bool
-	ForceDelete      bool
-	Compress         string
-	ReceiveUnmounted bool
-	ReceiveResumable bool
-	IncludeSnaps     []string
-	ExcludeSnaps     []string
-	ExpectedNode     string
-	ActualNode       string
+	SrcDataset        string
+	DstHost           string
+	DstDataset        string
+	SSHKeyFile        string
+	KnownHostsFile    string
+	SSHPort           string
+	NoSyncSnap        bool
+	NoRollback        bool
+	ForceDelete       bool
+	Compress          string
+	SyncoidIdentifier string
+	ReceiveUnmounted  bool
+	ReceiveResumable  bool
+	IncludeSnaps      []string
+	ExcludeSnaps      []string
+	ExpectedNode      string
+	ActualNode        string
 }
 
 func SenderConfigFromEnv() SenderConfig {
 	return SenderConfig{
-		SrcDataset:       os.Getenv("SRC_DATASET"),
-		DstHost:          os.Getenv("DST_HOST"),
-		DstDataset:       os.Getenv("DST_DATASET"),
-		SSHKeyFile:       os.Getenv("SSH_KEY_FILE"),
-		KnownHostsFile:   os.Getenv("KNOWN_HOSTS_FILE"),
-		SSHPort:          os.Getenv("SSH_PORT"),
-		NoSyncSnap:       boolEnvDefault("SYNCOID_NO_SYNC_SNAP", false),
-		NoRollback:       boolEnvDefault("SYNCOID_NO_ROLLBACK", true),
-		ForceDelete:      boolEnvDefault("SYNCOID_FORCE_DELETE", false),
-		Compress:         getenv("SYNCOID_COMPRESS", "none"),
-		ReceiveUnmounted: getenv("RECEIVE_UNMOUNTED", "true") == "true",
-		ReceiveResumable: getenv("RECEIVE_RESUMABLE", "true") == "true",
-		IncludeSnaps:     listEnv("SYNCOID_INCLUDE_SNAPS"),
-		ExcludeSnaps:     listEnv("SYNCOID_EXCLUDE_SNAPS"),
-		ExpectedNode:     os.Getenv("EXPECTED_NODE_NAME"),
-		ActualNode:       os.Getenv("ACTUAL_NODE_NAME"),
+		SrcDataset:        os.Getenv("SRC_DATASET"),
+		DstHost:           os.Getenv("DST_HOST"),
+		DstDataset:        os.Getenv("DST_DATASET"),
+		SSHKeyFile:        os.Getenv("SSH_KEY_FILE"),
+		KnownHostsFile:    os.Getenv("KNOWN_HOSTS_FILE"),
+		SSHPort:           os.Getenv("SSH_PORT"),
+		NoSyncSnap:        boolEnvDefault("SYNCOID_NO_SYNC_SNAP", false),
+		NoRollback:        boolEnvDefault("SYNCOID_NO_ROLLBACK", true),
+		ForceDelete:       boolEnvDefault("SYNCOID_FORCE_DELETE", false),
+		Compress:          getenv("SYNCOID_COMPRESS", "none"),
+		SyncoidIdentifier: os.Getenv("SYNCOID_IDENTIFIER"),
+		ReceiveUnmounted:  getenv("RECEIVE_UNMOUNTED", "true") == "true",
+		ReceiveResumable:  getenv("RECEIVE_RESUMABLE", "true") == "true",
+		IncludeSnaps:      listEnv("SYNCOID_INCLUDE_SNAPS"),
+		ExcludeSnaps:      listEnv("SYNCOID_EXCLUDE_SNAPS"),
+		ExpectedNode:      os.Getenv("EXPECTED_NODE_NAME"),
+		ActualNode:        os.Getenv("ACTUAL_NODE_NAME"),
 	}
 }
 
@@ -65,6 +67,12 @@ func RunSender(ctx context.Context, cfg SenderConfig, r CommandRunner) error {
 	args = append(args, "--no-privilege-elevation")
 	if compress != "" {
 		args = append(args, "--compress="+compress)
+	}
+	if cfg.SyncoidIdentifier != "" {
+		if !validSyncoidIdentifier(cfg.SyncoidIdentifier) {
+			return fmt.Errorf("unsupported syncoid identifier %q", cfg.SyncoidIdentifier)
+		}
+		args = append(args, "--identifier="+cfg.SyncoidIdentifier)
 	}
 	if cfg.DstHost != "" && cfg.KnownHostsFile == "" {
 		return fmt.Errorf("known hosts file is required for SSH replication")
@@ -102,6 +110,17 @@ func RunSender(ctx context.Context, cfg SenderConfig, r CommandRunner) error {
 		return fmt.Errorf("syncoid failed: %s", clean(stderr, err))
 	}
 	return nil
+}
+
+func validSyncoidIdentifier(identifier string) bool {
+	for _, r := range identifier {
+		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' ||
+			r == '_' || r == '-' || r == '.' || r == ':' {
+			continue
+		}
+		return false
+	}
+	return identifier != ""
 }
 
 func syncoidCompression(compress string) (string, error) {

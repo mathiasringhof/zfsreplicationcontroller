@@ -94,6 +94,7 @@ type ReceiveTaskPolicy struct {
 	AllowDestroy             bool   `json:"allowDestroy,omitempty"`
 	AllowMount               bool   `json:"allowMount,omitempty"`
 	AllowSyncSnapshotDestroy bool   `json:"allowSyncSnapshotDestroy,omitempty"`
+	SyncSnapshotIdentifier   string `json:"syncSnapshotIdentifier,omitempty"`
 	Compression              string `json:"compression,omitempty"`
 }
 
