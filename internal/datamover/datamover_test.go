@@ -30,6 +30,7 @@ func TestSenderRunsSyncoidWithConfiguredSnapshotOptions(t *testing.T) {
 		DstHost:          "root@10.0.0.42",
 		DstDataset:       "tank/dst",
 		SSHKeyFile:       "/var/run/zfsrep/ssh/id_rsa",
+		KnownHostsFile:   "/var/run/zfsrep/ssh/known_hosts",
 		SSHPort:          "2222",
 		NoSyncSnap:       true,
 		NoRollback:       true,
@@ -42,7 +43,7 @@ func TestSenderRunsSyncoidWithConfiguredSnapshotOptions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := "--no-sync-snap --no-rollback --compress=zstd --sshoption=StrictHostKeyChecking=no --sshoption=UserKnownHostsFile=/dev/null --sshkey=/var/run/zfsrep/ssh/id_rsa --sshport=2222 --no-resume --include-snaps=^snap-.* --include-snaps=^manual$ --exclude-snaps=.*-tmp$ tank/src root@10.0.0.42:tank/dst"
+	want := "--no-sync-snap --no-rollback --no-privilege-elevation --compress=zstd --sshoption=UserKnownHostsFile=/var/run/zfsrep/ssh/known_hosts --sshoption=StrictHostKeyChecking=yes --sshoption=IdentitiesOnly=yes --sshkey=/var/run/zfsrep/ssh/id_rsa --sshport=2222 --no-resume --include-snaps=^snap-.* --include-snaps=^manual$ --exclude-snaps=.*-tmp$ tank/src root@10.0.0.42:tank/dst"
 	if !hasNamedCall(runner.calls, "syncoid", want) {
 		t.Fatalf("syncoid was not called with %q: %#v", want, runner.calls)
 	}
@@ -174,6 +175,7 @@ func TestSenderPassesForceDelete(t *testing.T) {
 		DstHost:          "root@10.0.0.42",
 		DstDataset:       "tank/dst",
 		SSHKeyFile:       "/var/run/zfsrep/ssh/id_rsa",
+		KnownHostsFile:   "/var/run/zfsrep/ssh/known_hosts",
 		SSHPort:          "2222",
 		NoRollback:       true,
 		Compress:         "none",
@@ -184,7 +186,7 @@ func TestSenderPassesForceDelete(t *testing.T) {
 	if err != nil {
 		t.Fatalf("error = %v", err)
 	}
-	want := "--no-rollback --compress=none --sshoption=StrictHostKeyChecking=no --sshoption=UserKnownHostsFile=/dev/null --sshkey=/var/run/zfsrep/ssh/id_rsa --sshport=2222 --recvoptions=u --force-delete tank/src root@10.0.0.42:tank/dst"
+	want := "--no-rollback --no-privilege-elevation --compress=none --sshoption=UserKnownHostsFile=/var/run/zfsrep/ssh/known_hosts --sshoption=StrictHostKeyChecking=yes --sshoption=IdentitiesOnly=yes --sshkey=/var/run/zfsrep/ssh/id_rsa --sshport=2222 --recvoptions=u --force-delete tank/src root@10.0.0.42:tank/dst"
 	if !hasNamedCall(runner.calls, "syncoid", want) {
 		t.Fatalf("force-delete syncoid call missing %q: %#v", want, runner.calls)
 	}

@@ -5,11 +5,17 @@ kind: Kustomization
 resources:
   - config/namespaced/watched_namespace.yaml
   - config/manager/namespace.yaml
+  - config/crd/zfsreplication.example.com_zfsreceivetasks.yaml
   - config/crd/zfsreplication.example.com_zfsreplicationruns.yaml
   - config/crd/zfsreplication.example.com_zfsreplicationschedules.yaml
   - config/rbac/service_account.yaml
+  - config/rbac/receiver_service_account.yaml
   - config/rbac/namespaced_role.yaml
   - config/rbac/namespaced_role_binding.yaml
+  - config/rbac/receiver_namespaced_role.yaml
+  - config/rbac/receiver_namespaced_role_binding.yaml
   - config/manager/deployment.yaml
+  - config/receiver/daemonset.yaml
 patches:
   - path: config/namespaced/manager_watch_namespace_patch.yaml
+  - path: config/namespaced/receiver_watch_namespace_patch.yaml

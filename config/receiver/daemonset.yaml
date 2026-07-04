@@ -1,0 +1,66 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: zfs-receiver
+  namespace: zfsreplication-system
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: zfs-receiver
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: zfs-receiver
+    spec:
+      serviceAccountName: zfs-receiver
+      nodeSelector:
+        zfsreplication.example.com/enabled: "true"
+      containers:
+        - name: receiver
+          image: ghcr.io/mathiasringhof/zfsreplicationcontroller:main
+          imagePullPolicy: Always
+          command:
+            - /usr/local/bin/zfsrep-receiver
+          ports:
+            - name: ssh
+              containerPort: 2222
+          securityContext:
+            privileged: true
+            runAsUser: 0
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_UID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.uid
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: WATCH_NAMESPACE
+              value: ""
+            - name: SSH_AUTHORIZED_KEYS_FILE
+              value: /run/zfs-receiver/authorized_keys
+            - name: SSH_LISTEN_PORT
+              value: "2222"
+          readinessProbe:
+            tcpSocket:
+              port: ssh
+          volumeMounts:
+            - name: dev-zfs
+              mountPath: /dev/zfs
+            - name: runtime
+              mountPath: /run/zfs-receiver
+      volumes:
+        - name: dev-zfs
+          hostPath:
+            path: /dev/zfs
+        - name: runtime
+          emptyDir: {}

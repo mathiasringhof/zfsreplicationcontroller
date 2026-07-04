@@ -70,10 +70,24 @@ func TestControllerClusterRoleHasRequiredPermissions(t *testing.T) {
 		}
 	}
 
+	verbs = verbsForResource(role.Rules, "zfsreplication.example.com", "zfsreceivetasks")
+	for _, verb := range []string{"create", "get", "list", "watch"} {
+		if !contains(verbs, verb) {
+			t.Fatalf("zfsreceivetasks RBAC verbs = %v, missing %q", verbs, verb)
+		}
+	}
+
 	verbs = verbsForResource(role.Rules, "zfsreplication.example.com", "zfsreplicationruns/status")
 	for _, verb := range []string{"get", "update", "patch"} {
 		if !contains(verbs, verb) {
 			t.Fatalf("zfsreplicationruns/status RBAC verbs = %v, missing %q", verbs, verb)
+		}
+	}
+
+	verbs = verbsForResource(role.Rules, "zfsreplication.example.com", "zfsreceivetasks/status")
+	for _, verb := range []string{"get", "update", "patch"} {
+		if !contains(verbs, verb) {
+			t.Fatalf("zfsreceivetasks/status RBAC verbs = %v, missing %q", verbs, verb)
 		}
 	}
 
@@ -134,7 +148,9 @@ func TestNamespacedRBACRestrictsWorkloadPermissionsToWatchedNamespace(t *testing
 	}{
 		{apiGroup: "zfsreplication.example.com", resource: "zfsreplicationschedules", verbs: []string{"get", "list", "watch"}},
 		{apiGroup: "zfsreplication.example.com", resource: "zfsreplicationruns", verbs: []string{"create", "get", "list", "watch"}},
+		{apiGroup: "zfsreplication.example.com", resource: "zfsreceivetasks", verbs: []string{"create", "get", "list", "watch"}},
 		{apiGroup: "zfsreplication.example.com", resource: "zfsreplicationruns/status", verbs: []string{"get", "update", "patch"}},
+		{apiGroup: "zfsreplication.example.com", resource: "zfsreceivetasks/status", verbs: []string{"get", "update", "patch"}},
 		{apiGroup: "zfsreplication.example.com", resource: "zfsreplicationschedules/status", verbs: []string{"get", "update", "patch"}},
 		{apiGroup: "batch", resource: "jobs", verbs: []string{"create", "get", "list", "watch", "update", "patch", "delete"}},
 		{apiGroup: "", resource: "secrets", verbs: []string{"create", "get", "list", "watch", "update", "patch", "delete"}},
@@ -146,6 +162,51 @@ func TestNamespacedRBACRestrictsWorkloadPermissionsToWatchedNamespace(t *testing
 		for _, verb := range tt.verbs {
 			if !contains(verbs, verb) {
 				t.Fatalf("%s/%s namespaced RBAC verbs = %v, missing %q", tt.apiGroup, tt.resource, verbs, verb)
+			}
+		}
+	}
+}
+
+func TestReceiverNamespacedRBACRestrictsTaskPermissionsToWatchedNamespace(t *testing.T) {
+	t.Helper()
+
+	rolePath := filepath.Join("..", "..", "config", "rbac", "receiver_namespaced_role.yaml")
+	data, err := os.ReadFile(rolePath)
+	if err != nil {
+		t.Fatalf("read %s: %v", rolePath, err)
+	}
+
+	var role struct {
+		Kind     string `yaml:"kind"`
+		Metadata struct {
+			Namespace string `yaml:"namespace"`
+		} `yaml:"metadata"`
+		Rules []struct {
+			APIGroups []string `yaml:"apiGroups"`
+			Resources []string `yaml:"resources"`
+			Verbs     []string `yaml:"verbs"`
+		} `yaml:"rules"`
+	}
+	if err := yaml.Unmarshal(data, &role); err != nil {
+		t.Fatalf("parse %s: %v", rolePath, err)
+	}
+	if role.Kind != "Role" {
+		t.Fatalf("receiver namespaced RBAC kind = %q, want Role", role.Kind)
+	}
+	if role.Metadata.Namespace != smokeNamespace {
+		t.Fatalf("receiver namespaced RBAC namespace = %q, want %s", role.Metadata.Namespace, smokeNamespace)
+	}
+	for _, tt := range []struct {
+		resource string
+		verbs    []string
+	}{
+		{resource: "zfsreceivetasks", verbs: []string{"get", "list", "watch"}},
+		{resource: "zfsreceivetasks/status", verbs: []string{"get", "update", "patch"}},
+	} {
+		verbs := verbsForResource(role.Rules, "zfsreplication.example.com", tt.resource)
+		for _, verb := range tt.verbs {
+			if !contains(verbs, verb) {
+				t.Fatalf("%s receiver namespaced RBAC verbs = %v, missing %q", tt.resource, verbs, verb)
 			}
 		}
 	}
@@ -170,7 +231,14 @@ func TestNamespacedOverlayUsesNamespacedRBACAndWatchNamespace(t *testing.T) {
 			t.Fatalf("namespaced overlay includes cluster-wide RBAC resource %q", forbidden)
 		}
 	}
-	for _, required := range []string{"config/rbac/namespaced_role.yaml", "config/rbac/namespaced_role_binding.yaml"} {
+	for _, required := range []string{
+		"config/crd/zfsreplication.example.com_zfsreceivetasks.yaml",
+		"config/rbac/namespaced_role.yaml",
+		"config/rbac/namespaced_role_binding.yaml",
+		"config/rbac/receiver_namespaced_role.yaml",
+		"config/rbac/receiver_namespaced_role_binding.yaml",
+		"config/receiver/daemonset.yaml",
+	} {
 		if !contains(kustomization.Resources, required) {
 			t.Fatalf("namespaced overlay resources = %v, missing %q", kustomization.Resources, required)
 		}
@@ -203,13 +271,38 @@ func TestNamespacedOverlayUsesNamespacedRBACAndWatchNamespace(t *testing.T) {
 	if got := manifestEnvValue(manager.Env, "WATCH_NAMESPACE"); got != smokeNamespace {
 		t.Fatalf("WATCH_NAMESPACE env = %q, want %s", got, smokeNamespace)
 	}
+
+	patchPath = filepath.Join("..", "..", "config", "namespaced", "receiver_watch_namespace_patch.yaml")
+	data, err = os.ReadFile(patchPath)
+	if err != nil {
+		t.Fatalf("read %s: %v", patchPath, err)
+	}
+	var daemonSet struct {
+		Spec struct {
+			Template struct {
+				Spec struct {
+					Containers []manifestContainer `yaml:"containers"`
+				} `yaml:"spec"`
+			} `yaml:"template"`
+		} `yaml:"spec"`
+	}
+	if err := yaml.Unmarshal(data, &daemonSet); err != nil {
+		t.Fatalf("parse %s: %v", patchPath, err)
+	}
+	receiver := findContainer(daemonSet.Spec.Template.Spec.Containers, "receiver")
+	if receiver == nil {
+		t.Fatalf("receiver watch namespace patch has no receiver container")
+	}
+	if got := manifestEnvValue(receiver.Env, "WATCH_NAMESPACE"); got != smokeNamespace {
+		t.Fatalf("receiver WATCH_NAMESPACE env = %q, want %s", got, smokeNamespace)
+	}
 }
 
 func TestNamespacedOverlayRenderedManifestStaysNamespaced(t *testing.T) {
 	t.Helper()
 
 	objects := renderKustomize(t, filepath.Join("..", ".."))
-	var seenRole, seenRoleBinding, seenDeployment, seenSmokeNamespace bool
+	var seenRole, seenRoleBinding, seenDeployment, seenReceiverRole, seenReceiverRoleBinding, seenReceiverDaemonSet, seenSmokeNamespace bool
 	for _, obj := range objects {
 		switch obj.Kind {
 		case "ClusterRole", "ClusterRoleBinding":
@@ -225,11 +318,23 @@ func TestNamespacedOverlayRenderedManifestStaysNamespaced(t *testing.T) {
 					t.Fatalf("rendered Role namespace = %q, want %s", obj.Metadata.Namespace, smokeNamespace)
 				}
 			}
+			if obj.Metadata.Name == "zfs-receiver" {
+				seenReceiverRole = true
+				if obj.Metadata.Namespace != smokeNamespace {
+					t.Fatalf("rendered receiver Role namespace = %q, want %s", obj.Metadata.Namespace, smokeNamespace)
+				}
+			}
 		case "RoleBinding":
 			if obj.Metadata.Name == "zfsreplication-controller" {
 				seenRoleBinding = true
 				if obj.Metadata.Namespace != smokeNamespace {
 					t.Fatalf("rendered RoleBinding namespace = %q, want %s", obj.Metadata.Namespace, smokeNamespace)
+				}
+			}
+			if obj.Metadata.Name == "zfs-receiver" {
+				seenReceiverRoleBinding = true
+				if obj.Metadata.Namespace != smokeNamespace {
+					t.Fatalf("rendered receiver RoleBinding namespace = %q, want %s", obj.Metadata.Namespace, smokeNamespace)
 				}
 			}
 		case "Deployment":
@@ -249,6 +354,20 @@ func TestNamespacedOverlayRenderedManifestStaysNamespaced(t *testing.T) {
 					t.Fatalf("rendered manager args = %v, missing watch namespace arg", manager.Args)
 				}
 			}
+		case "DaemonSet":
+			if obj.Metadata.Name == "zfs-receiver" {
+				seenReceiverDaemonSet = true
+				if obj.Metadata.Namespace != "zfsreplication-system" {
+					t.Fatalf("rendered receiver DaemonSet namespace = %q, want zfsreplication-system", obj.Metadata.Namespace)
+				}
+				receiver := findContainer(obj.Spec.Template.Spec.Containers, "receiver")
+				if receiver == nil {
+					t.Fatalf("rendered receiver DaemonSet has no receiver container")
+				}
+				if got := manifestEnvValue(receiver.Env, "WATCH_NAMESPACE"); got != smokeNamespace {
+					t.Fatalf("rendered receiver WATCH_NAMESPACE env = %q, want %s", got, smokeNamespace)
+				}
+			}
 		}
 	}
 	for name, seen := range map[string]bool{
@@ -256,6 +375,9 @@ func TestNamespacedOverlayRenderedManifestStaysNamespaced(t *testing.T) {
 		"namespaced Role":                 seenRole,
 		"namespaced RoleBinding":          seenRoleBinding,
 		"watch-scoped manager Deployment": seenDeployment,
+		"namespaced receiver Role":        seenReceiverRole,
+		"namespaced receiver RoleBinding": seenReceiverRoleBinding,
+		"watch-scoped receiver DaemonSet": seenReceiverDaemonSet,
 	} {
 		if !seen {
 			t.Fatalf("rendered namespaced overlay missing %s", name)
@@ -309,6 +431,63 @@ func TestCRDSchemaExposesSyncoidOptions(t *testing.T) {
 	}
 	if !hasValidationRule(runSpec.XKubernetesValidations, "self == oldSelf", "spec is immutable") {
 		t.Fatalf("spec validations = %#v, want immutable spec rule", runSpec.XKubernetesValidations)
+	}
+}
+
+func TestReceiveTaskCRDSchemaExposesMVP1Fields(t *testing.T) {
+	t.Helper()
+
+	crdPath := filepath.Join("..", "..", "config", "crd", "zfsreplication.example.com_zfsreceivetasks.yaml")
+	data, err := os.ReadFile(crdPath)
+	if err != nil {
+		t.Fatalf("read %s: %v", crdPath, err)
+	}
+
+	type schemaNode struct {
+		Properties             map[string]schemaNode `yaml:"properties"`
+		Required               []string              `yaml:"required"`
+		Type                   string                `yaml:"type"`
+		XKubernetesValidations []validationRule      `yaml:"x-kubernetes-validations"`
+	}
+	var crd struct {
+		Spec struct {
+			Versions []struct {
+				Schema struct {
+					OpenAPIV3Schema schemaNode `yaml:"openAPIV3Schema"`
+				} `yaml:"schema"`
+			} `yaml:"versions"`
+		} `yaml:"spec"`
+	}
+	if err := yaml.Unmarshal(data, &crd); err != nil {
+		t.Fatalf("parse %s: %v", crdPath, err)
+	}
+	if len(crd.Spec.Versions) == 0 {
+		t.Fatalf("%s has no versions", crdPath)
+	}
+	spec := crd.Spec.Versions[0].Schema.OpenAPIV3Schema.Properties["spec"]
+	for _, required := range []string{"runRef", "nodeName", "destination", "ssh"} {
+		if !contains(spec.Required, required) {
+			t.Fatalf("receive task required fields = %v, missing %q", spec.Required, required)
+		}
+	}
+	if spec.Properties["ssh"].Properties["authorizedPublicKey"].Type != "string" {
+		t.Fatalf("authorizedPublicKey schema = %#v", spec.Properties["ssh"].Properties["authorizedPublicKey"])
+	}
+	if spec.Properties["ssh"].Properties["expiresAt"].Type != "string" {
+		t.Fatalf("expiresAt schema = %#v", spec.Properties["ssh"].Properties["expiresAt"])
+	}
+	if spec.Properties["policy"].Properties["allowRollback"].Type != "boolean" {
+		t.Fatalf("allowRollback schema = %#v", spec.Properties["policy"].Properties["allowRollback"])
+	}
+	status := crd.Spec.Versions[0].Schema.OpenAPIV3Schema.Properties["status"]
+	if status.Properties["endpoint"].Properties["host"].Type != "string" {
+		t.Fatalf("endpoint.host schema = %#v", status.Properties["endpoint"].Properties["host"])
+	}
+	if status.Properties["ssh"].Properties["hostKey"].Type != "string" {
+		t.Fatalf("ssh.hostKey schema = %#v", status.Properties["ssh"].Properties["hostKey"])
+	}
+	if !hasValidationRule(spec.XKubernetesValidations, "self == oldSelf", "spec is immutable") {
+		t.Fatalf("receive task spec validations = %#v, want immutable spec rule", spec.XKubernetesValidations)
 	}
 }
 

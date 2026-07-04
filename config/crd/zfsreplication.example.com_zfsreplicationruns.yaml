@@ -107,6 +107,8 @@ spec:
                   type: string
                 receiverJobName:
                   type: string
+                receiveTaskName:
+                  type: string
                 receiverPodName:
                   type: string
                 receiverPodIP:

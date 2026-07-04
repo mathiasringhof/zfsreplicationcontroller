@@ -12,6 +12,7 @@ type SenderConfig struct {
 	DstHost          string
 	DstDataset       string
 	SSHKeyFile       string
+	KnownHostsFile   string
 	SSHPort          string
 	NoSyncSnap       bool
 	NoRollback       bool
@@ -31,6 +32,7 @@ func SenderConfigFromEnv() SenderConfig {
 		DstHost:          os.Getenv("DST_HOST"),
 		DstDataset:       os.Getenv("DST_DATASET"),
 		SSHKeyFile:       os.Getenv("SSH_KEY_FILE"),
+		KnownHostsFile:   os.Getenv("KNOWN_HOSTS_FILE"),
 		SSHPort:          os.Getenv("SSH_PORT"),
 		NoSyncSnap:       boolEnvDefault("SYNCOID_NO_SYNC_SNAP", false),
 		NoRollback:       boolEnvDefault("SYNCOID_NO_ROLLBACK", true),
@@ -56,13 +58,20 @@ func RunSender(ctx context.Context, cfg SenderConfig, r CommandRunner) error {
 	if cfg.NoRollback {
 		args = append(args, "--no-rollback")
 	}
+	args = append(args, "--no-privilege-elevation")
 	if cfg.Compress != "" {
 		args = append(args, "--compress="+cfg.Compress)
 	}
-	args = append(args,
-		"--sshoption=StrictHostKeyChecking=no",
-		"--sshoption=UserKnownHostsFile=/dev/null",
-	)
+	if cfg.DstHost != "" && cfg.KnownHostsFile == "" {
+		return fmt.Errorf("known hosts file is required for SSH replication")
+	}
+	if cfg.KnownHostsFile != "" {
+		args = append(args,
+			"--sshoption=UserKnownHostsFile="+cfg.KnownHostsFile,
+			"--sshoption=StrictHostKeyChecking=yes",
+			"--sshoption=IdentitiesOnly=yes",
+		)
+	}
 	if cfg.SSHKeyFile != "" {
 		args = append(args, "--sshkey="+cfg.SSHKeyFile)
 	}

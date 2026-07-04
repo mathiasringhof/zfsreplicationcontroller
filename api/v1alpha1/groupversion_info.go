@@ -22,6 +22,8 @@ func addKnownTypes(scheme *runtime.Scheme) error {
 	scheme.AddKnownTypes(SchemeGroupVersion,
 		&ZFSReplicationRun{},
 		&ZFSReplicationRunList{},
+		&ZFSReceiveTask{},
+		&ZFSReceiveTaskList{},
 		&ZFSReplicationSchedule{},
 		&ZFSReplicationScheduleList{},
 	)

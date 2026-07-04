@@ -316,9 +316,11 @@ func (k kubectlRunner) getStatus(name string) (replicationStatus, error) {
 func (k kubectlRunner) collectDiagnostics(name string) {
 	for _, args := range [][]string{
 		{"get", "zfsreplicationrun", name, "-n", e2eNamespace, "-o", "yaml"},
+		{"get", "zfsreceivetasks", "-n", e2eNamespace, "-o", "yaml"},
 		{"get", "pods,jobs,secrets,leases", "-n", e2eNamespace, "-o", "wide"},
 		{"get", "events", "-n", e2eNamespace, "--sort-by=.lastTimestamp"},
 		{"logs", "-n", "zfsreplication-system", "deployment/zfsreplication-controller"},
+		{"logs", "-n", "zfsreplication-system", "daemonset/zfs-receiver"},
 	} {
 		if out, err := k.runOutput(25*time.Second, args...); err == nil {
 			k.t.Logf("kubectl %s\n%s", strings.Join(args, " "), out)
@@ -551,6 +553,7 @@ type replicationStatus struct {
 	Phase           string `json:"phase"`
 	SenderJobName   string `json:"senderJobName"`
 	ReceiverJobName string `json:"receiverJobName"`
+	ReceiveTaskName string `json:"receiveTaskName"`
 	ReceiverPodName string `json:"receiverPodName"`
 	ReceiverPodIP   string `json:"receiverPodIP"`
 	SSHSecretName   string `json:"sshSecretName"`
@@ -593,7 +596,7 @@ func assertSucceededStatus(t *testing.T, sc replicationCase, st replicationStatu
 	if st.SenderJobName == "" {
 		t.Fatalf("status object names missing: %#v", st)
 	}
-	if st.ReceiverJobName == "" || st.ReceiverPodName == "" || st.ReceiverPodIP == "" || st.SSHSecretName == "" {
+	if st.ReceiveTaskName == "" || st.ReceiverPodName == "" || st.ReceiverPodIP == "" || st.SSHSecretName == "" {
 		t.Fatalf("receiver/ssh status names missing: %#v", st)
 	}
 	if st.StartedAt == "" || st.CompletedAt == "" {
@@ -620,7 +623,7 @@ func assertFailedStatus(t *testing.T, sc replicationCase, st replicationStatus, 
 func assertFailedAfterDataMoverSetupStatus(t *testing.T, sc replicationCase, st replicationStatus, wantError string) {
 	t.Helper()
 	assertFailedStatus(t, sc, st, wantError)
-	if st.ReceiverJobName == "" || st.ReceiverPodName == "" || st.ReceiverPodIP == "" || st.SSHSecretName == "" {
+	if st.ReceiveTaskName == "" || st.ReceiverPodName == "" || st.ReceiverPodIP == "" || st.SSHSecretName == "" {
 		t.Fatalf("receiver/ssh status names missing after datamover setup for %s: %#v", sc.Name, st)
 	}
 }

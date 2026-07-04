@@ -12,12 +12,13 @@ import (
 const labelPrefix = "zfsreplication.example.com"
 
 type runObjects struct {
-	BaseName     string
-	RunName      string
-	SecretName   string
-	ReceiverName string
-	SenderName   string
-	Labels       map[string]string
+	BaseName        string
+	RunName         string
+	SecretName      string
+	ReceiverName    string
+	ReceiveTaskName string
+	SenderName      string
+	Labels          map[string]string
 }
 
 func dataMoverJob(namespace, name, image string, labels map[string]string, nodeName, command string, env []corev1.EnvVar, secretName string, readiness bool) *batchv1.Job {

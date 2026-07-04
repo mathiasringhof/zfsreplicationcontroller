@@ -19,18 +19,13 @@ func TestRuntimeImagePinsSyncoid230(t *testing.T) {
 		"syncoid --version | grep -F \"${SANOID_VERSION}\"",
 		"syncoid --help 2>&1 | grep -F -- \"--include-snaps\"",
 		"openssh-server",
-		"COPY hack/zfsrep-ssh-receiver /usr/local/bin/zfsrep-ssh-receiver",
+		"go build -o /out/zfsrep-receiver ./cmd/zfsrep-receiver",
+		"COPY --from=build /out/zfsrep-receiver /usr/local/bin/zfsrep-receiver",
+		"useradd -o -u 0 -g 0 -M -d /run/zfs-receiver -s /bin/sh zfs-recv",
+		"usermod -p '*' zfs-recv",
 	} {
 		if !strings.Contains(dockerfile, want) {
 			t.Fatalf("Dockerfile missing %q", want)
-		}
-	}
-	for _, old := range []string{
-		"cmd/zfsrep-receiver",
-		"zfsrep-receiver",
-	} {
-		if strings.Contains(dockerfile, old) {
-			t.Fatalf("Dockerfile still references old HTTP receiver %q", old)
 		}
 	}
 	if strings.Contains(dockerfile, " zfsutils-linux sanoid ") {
