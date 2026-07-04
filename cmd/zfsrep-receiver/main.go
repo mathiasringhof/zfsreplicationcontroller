@@ -252,6 +252,11 @@ func reconcileReceiveTasks(ctx context.Context, kubeClient client.Client, cfg re
 }
 
 func patchTaskReady(ctx context.Context, kubeClient client.Client, task *zfsv1.ZFSReceiveTask, cfg receiverConfig, hostKey string) error {
+	latest, ok, err := latestNonTerminalTask(ctx, kubeClient, task)
+	if err != nil || !ok {
+		return err
+	}
+	task = latest
 	if task.Status.Phase == zfsv1.ReceiveTaskPhaseReady &&
 		task.Status.Endpoint.Host == cfg.PodIP &&
 		task.Status.Endpoint.Port == cfg.SSHPort &&
@@ -271,6 +276,11 @@ func patchTaskReady(ctx context.Context, kubeClient client.Client, task *zfsv1.Z
 }
 
 func patchTaskFailed(ctx context.Context, kubeClient client.Client, task *zfsv1.ZFSReceiveTask, msg string) error {
+	latest, ok, err := latestNonTerminalTask(ctx, kubeClient, task)
+	if err != nil || !ok {
+		return err
+	}
+	task = latest
 	if task.Status.Phase == zfsv1.ReceiveTaskPhaseFailed && task.Status.Error == msg {
 		return nil
 	}
@@ -278,6 +288,17 @@ func patchTaskFailed(ctx context.Context, kubeClient client.Client, task *zfsv1.
 	copy.Status.Phase = zfsv1.ReceiveTaskPhaseFailed
 	copy.Status.Error = msg
 	return kubeClient.Status().Patch(ctx, copy, client.MergeFrom(task))
+}
+
+func latestNonTerminalTask(ctx context.Context, kubeClient client.Client, task *zfsv1.ZFSReceiveTask) (*zfsv1.ZFSReceiveTask, bool, error) {
+	var latest zfsv1.ZFSReceiveTask
+	if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(task), &latest); err != nil {
+		return nil, false, err
+	}
+	if receiveTaskTerminal(latest.Status.Phase) {
+		return &latest, false, nil
+	}
+	return &latest, true, nil
 }
 
 func receiveTaskTerminal(phase zfsv1.ReceiveTaskPhase) bool {

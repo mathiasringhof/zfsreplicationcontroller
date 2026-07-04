@@ -28,6 +28,9 @@ const (
 	e2eTargetNode = "worker-b"
 
 	e2eLabelPrefix = "zfsreplication.example.com"
+
+	e2eReceiveTaskPhaseCompleted = "Completed"
+	e2eReceiveTaskPhaseFailed    = "Failed"
 )
 
 func TestE2EFullAndIncrementalReplication(t *testing.T) {
@@ -52,7 +55,9 @@ func TestE2EFullAndIncrementalReplication(t *testing.T) {
 	k.runRealZFS(first.TargetNode, "zfs-dst-"+suffix, realZFSSetupTargetScript(pool, first.TargetDataset))
 
 	k.applyReplication(first)
-	assertSucceededStatus(t, first, k.waitForSuccess(first, 4*time.Minute))
+	firstStatus := k.waitForSuccess(first, 4*time.Minute)
+	assertSucceededStatus(t, first, firstStatus)
+	k.assertReceiveTaskTerminal(first, firstStatus, e2eReceiveTaskPhaseCompleted)
 	k.assertRealZFSMarker(first.TargetNode, "zfs-dst-p1-"+suffix, pool, first.TargetDataset, "first-"+suffix)
 	k.assertRunEphemeralCleanup(first.Name)
 
@@ -64,7 +69,9 @@ func TestE2EFullAndIncrementalReplication(t *testing.T) {
 	k.runRealZFS(second.SourceNode, "zfs-mut-"+suffix, realZFSMutateSourceScript(pool, second.SourceDataset, "second-"+suffix))
 
 	k.applyReplication(second)
-	assertSucceededStatus(t, second, k.waitForSuccess(second, 4*time.Minute))
+	secondStatus := k.waitForSuccess(second, 4*time.Minute)
+	assertSucceededStatus(t, second, secondStatus)
+	k.assertReceiveTaskTerminal(second, secondStatus, e2eReceiveTaskPhaseCompleted)
 	k.assertRealZFSMarker(second.TargetNode, "zfs-dst-p2-"+suffix, pool, second.TargetDataset, "second-"+suffix)
 	k.assertRunEphemeralCleanup(second.Name)
 }
@@ -95,6 +102,7 @@ func TestE2EExternalSnapshotsWithoutCommonBaseFails(t *testing.T) {
 	k.applyReplication(sc)
 	status := k.waitForFailed(sc, 4*time.Minute)
 	assertFailedAfterDataMoverSetupStatus(t, sc, status, "")
+	k.assertReceiveTaskTerminal(sc, status, e2eReceiveTaskPhaseFailed)
 	k.assertRealZFSSnapshotExists(sc.SourceNode, "zfs-src-snap-no-base-"+suffix, sc.sourceSnapshot())
 	k.assertRunEphemeralCleanup(sc.Name)
 }
@@ -140,54 +148,26 @@ func TestE2ESyncoidFailure(t *testing.T) {
 	k.applyReplication(sc)
 	status := k.waitForFailed(sc, 4*time.Minute)
 	assertFailedAfterDataMoverSetupStatus(t, sc, status, "CRITICAL ERROR")
+	k.assertReceiveTaskTerminal(sc, status, e2eReceiveTaskPhaseFailed)
 	if !strings.Contains(status.LastError, sc.TargetDataset) {
 		t.Fatalf("lastError = %q, want to mention target dataset %q", status.LastError, sc.TargetDataset)
 	}
 	k.assertRunEphemeralCleanup(sc.Name)
 }
 
-func TestE2EOrphanReceiverPodTerminalCleanup(t *testing.T) {
-	k := newKubectlRunner(t)
-	suffix := uniqueSuffix()
-	name := "e2e-orphan-receiver-" + suffix
-	pool := realZFSPool()
-	sc := replicationCase{
-		Name:          name,
-		SourceNode:    e2eSourceNode,
-		TargetNode:    e2eTargetNode,
-		SourceDataset: pool + "/orphan-src-" + suffix,
-		TargetDataset: pool + "/orphan-dst-" + suffix,
-	}
-	k.cleanupReplicationOnExit(name)
-	k.cleanupReplication(name)
-
-	k.scaleController(0)
-	t.Cleanup(func() { k.scaleController(1) })
-
-	k.applyReplication(sc)
-	k.patchRunPhase(e2eNamespace, name, "Succeeded")
-	k.seedTerminalCleanupObjects(e2eNamespace, name, []terminalCleanupObject{terminalCleanupReceiverPod})
-	k.logSelectedRunObjects(e2eNamespace, name, "before orphan receiver cleanup")
-
-	k.scaleController(1)
-	k.run(30*time.Second, "annotate", "zfsreplicationrun", name, "-n", e2eNamespace, "zfsreplication.example.com/e2e-trigger="+suffix, "--overwrite")
-	k.assertRunEphemeralCleanup(name)
-	k.logSelectedRunObjects(e2eNamespace, name, "after orphan receiver cleanup")
-}
-
-func TestE2ETerminalCleanupPartialStateMatrix(t *testing.T) {
+func TestE2ETerminalCleanupCurrentStateMatrix(t *testing.T) {
 	k := newKubectlRunner(t)
 	suffix := uniqueSuffix()
 	pool := realZFSPool()
 	cases := []struct {
-		nameSuffix string
-		phase      string
-		objects    []terminalCleanupObject
+		nameSuffix    string
+		phase         string
+		objects       []terminalCleanupObject
+		wantTaskPhase string
 	}{
-		{nameSuffix: "pod", phase: "Succeeded", objects: []terminalCleanupObject{terminalCleanupReceiverPod}},
-		{nameSuffix: "all", phase: "Failed", objects: []terminalCleanupObject{terminalCleanupReceiverJob, terminalCleanupReceiverPod, terminalCleanupSSHSecret}},
+		{nameSuffix: "task-success", phase: "Succeeded", objects: []terminalCleanupObject{terminalCleanupReceiveTask, terminalCleanupSSHSecret}, wantTaskPhase: e2eReceiveTaskPhaseCompleted},
+		{nameSuffix: "task-failed", phase: "Failed", objects: []terminalCleanupObject{terminalCleanupReceiveTask, terminalCleanupSSHSecret}, wantTaskPhase: e2eReceiveTaskPhaseFailed},
 		{nameSuffix: "secret", phase: "Succeeded", objects: []terminalCleanupObject{terminalCleanupSSHSecret}},
-		{nameSuffix: "job", phase: "Failed", objects: []terminalCleanupObject{terminalCleanupReceiverJob}},
 	}
 
 	k.scaleController(0)
@@ -205,7 +185,7 @@ func TestE2ETerminalCleanupPartialStateMatrix(t *testing.T) {
 		k.cleanupReplication(sc.Name)
 		k.applyReplication(sc)
 		k.patchRunPhase(e2eNamespace, sc.Name, tc.phase)
-		k.seedTerminalCleanupObjects(e2eNamespace, sc.Name, tc.objects)
+		k.seedTerminalCleanupObjects(e2eNamespace, sc, tc.objects)
 		k.logSelectedRunObjects(e2eNamespace, sc.Name, "before terminal cleanup")
 	}
 
@@ -214,6 +194,9 @@ func TestE2ETerminalCleanupPartialStateMatrix(t *testing.T) {
 		name := "e2e-clean-" + suffix + "-" + tc.nameSuffix
 		k.run(30*time.Second, "annotate", "zfsreplicationrun", name, "-n", e2eNamespace, "e2e-reconcile="+uniqueSuffix(), "--overwrite")
 		k.assertRunEphemeralCleanup(name)
+		if tc.wantTaskPhase != "" {
+			k.assertReceiveTaskPhase(e2eNamespace, runObjectName(name, "receiver"), tc.wantTaskPhase)
+		}
 		k.logSelectedRunObjects(e2eNamespace, name, "after terminal cleanup")
 	}
 }
@@ -392,6 +375,7 @@ func newKubectlRunner(t *testing.T) kubectlRunner {
 	}
 	k := kubectlRunner{t: t, path: kubectl, kubeconfig: kubeconfig}
 	k.ensureNamespace(e2eNamespace)
+	k.assertReceiverDaemonSetAvailable()
 	return k
 }
 
@@ -411,6 +395,7 @@ func (k kubectlRunner) cleanupReplication(name string) {
 func (k kubectlRunner) cleanupReplicationInNamespace(namespace, name string) {
 	k.t.Helper()
 	k.run(75*time.Second, "delete", "zfsreplicationrun", name, "-n", namespace, "--ignore-not-found=true", "--wait=true", "--timeout=60s")
+	k.run(75*time.Second, "delete", "zfsreceivetasks", "-n", namespace, "-l", e2eLabelPrefix+"/run="+name, "--ignore-not-found=true", "--wait=true", "--timeout=60s")
 	k.run(75*time.Second, "delete", "jobs,pods,secrets", "-n", namespace, "-l", e2eLabelPrefix+"/run="+name, "--ignore-not-found=true", "--wait=true", "--timeout=60s")
 }
 
@@ -494,6 +479,19 @@ func (k kubectlRunner) getStatusInNamespace(namespace, name string) (replication
 	return obj.Status, nil
 }
 
+func (k kubectlRunner) getReceiveTaskStatus(namespace, name string) (receiveTaskStatus, error) {
+	k.t.Helper()
+	out, err := k.runOutput(20*time.Second, "get", "zfsreceivetask", name, "-n", namespace, "-o", "json")
+	if err != nil {
+		return receiveTaskStatus{}, err
+	}
+	var obj receiveTaskObject
+	if err := json.Unmarshal([]byte(out), &obj); err != nil {
+		return receiveTaskStatus{}, fmt.Errorf("parse zfsreceivetask status: %w\n%s", err, out)
+	}
+	return obj.Status, nil
+}
+
 func (k kubectlRunner) collectDiagnosticsInNamespace(namespace, name string) {
 	for _, args := range [][]string{
 		{"get", "zfsreplicationrun", name, "-n", namespace, "-o", "yaml"},
@@ -546,8 +544,6 @@ func (k kubectlRunner) assertRunEphemeralCleanup(name string) {
 
 func (k kubectlRunner) assertRunEphemeralCleanupInNamespace(namespace, name string) {
 	k.t.Helper()
-	k.assertNoLabelledResourcesEventuallyInNamespace(namespace, name, "receiver jobs", "jobs", e2eLabelPrefix+"/role=receiver")
-	k.assertNoLabelledResourcesEventuallyInNamespace(namespace, name, "receiver pods", "pods", e2eLabelPrefix+"/role=receiver")
 	k.assertNoLabelledResourcesEventuallyInNamespace(namespace, name, "run secrets", "secrets", "")
 }
 
@@ -598,8 +594,7 @@ func (k kubectlRunner) assertNoJobsOrSecretsInNamespace(namespace, name string) 
 type terminalCleanupObject string
 
 const (
-	terminalCleanupReceiverJob terminalCleanupObject = "receiver job"
-	terminalCleanupReceiverPod terminalCleanupObject = "receiver pod"
+	terminalCleanupReceiveTask terminalCleanupObject = "receive task"
 	terminalCleanupSSHSecret   terminalCleanupObject = "ssh secret"
 )
 
@@ -615,37 +610,22 @@ func (k kubectlRunner) patchRunPhase(namespace, name, phase string) {
 	k.run(30*time.Second, "patch", "zfsreplicationrun", name, "-n", namespace, "--subresource=status", "--type=merge", "-p", payload)
 }
 
-func (k kubectlRunner) seedTerminalCleanupObjects(namespace, runName string, objects []terminalCleanupObject) {
+func (k kubectlRunner) seedTerminalCleanupObjects(namespace string, sc replicationCase, objects []terminalCleanupObject) {
 	k.t.Helper()
 	for _, obj := range objects {
 		var manifest []byte
 		switch obj {
-		case terminalCleanupReceiverJob:
-			manifest = receiverJobManifest(k.t, namespace, runName)
-		case terminalCleanupReceiverPod:
-			manifest = orphanReceiverPodManifest(k.t, namespace, runName)
+		case terminalCleanupReceiveTask:
+			manifest = receiveTaskManifest(k.t, namespace, sc)
 		case terminalCleanupSSHSecret:
-			manifest = runSSHSecretManifest(k.t, namespace, runName)
+			manifest = runSSHSecretManifest(k.t, namespace, sc.Name)
 		default:
 			k.t.Fatalf("unknown cleanup object %q", obj)
 		}
 		if _, err := k.runInput(30*time.Second, manifest, "apply", "-f", "-"); err != nil {
-			k.t.Fatalf("seed %s for %s/%s:\n%s\n%v", obj, namespace, runName, manifest, err)
+			k.t.Fatalf("seed %s for %s/%s:\n%s\n%v", obj, namespace, sc.Name, manifest, err)
 		}
 	}
-	if containsTerminalCleanupObject(objects, terminalCleanupReceiverPod) {
-		selector := e2eLabelPrefix + "/run=" + runName + "," + e2eLabelPrefix + "/role=receiver"
-		k.run(60*time.Second, "wait", "pod", "-n", namespace, "-l", selector, "--for=condition=Ready", "--timeout=60s")
-	}
-}
-
-func containsTerminalCleanupObject(objects []terminalCleanupObject, want terminalCleanupObject) bool {
-	for _, obj := range objects {
-		if obj == want {
-			return true
-		}
-	}
-	return false
 }
 
 func (k kubectlRunner) logSelectedRunObjects(namespace, name, stage string) {
@@ -654,13 +634,57 @@ func (k kubectlRunner) logSelectedRunObjects(namespace, name, stage string) {
 		e2eLabelPrefix + "/run=" + name,
 		e2eLabelPrefix + "/run=" + name + "," + e2eLabelPrefix + "/role=receiver",
 	} {
-		args := []string{"get", "pods,jobs,secrets", "-n", namespace, "-l", selector, "-o", "wide", "--show-labels"}
+		args := []string{"get", "zfsreceivetasks,pods,jobs,secrets", "-n", namespace, "-l", selector, "-o", "wide", "--show-labels"}
 		out, err := k.runOutput(20*time.Second, args...)
 		if err != nil && !strings.Contains(err.Error(), "No resources found") {
 			k.t.Fatalf("capture %s objects for %s/%s selector %q: %v", stage, namespace, name, selector, err)
 		}
 		k.t.Logf("%s objects for %s/%s selector %q:\n%s", stage, namespace, name, selector, out)
 	}
+}
+
+func (k kubectlRunner) assertReceiverDaemonSetAvailable() {
+	k.t.Helper()
+	k.run(90*time.Second, "rollout", "status", "daemonset/zfs-receiver", "-n", e2eControllerNamespace, "--timeout=90s")
+}
+
+func (k kubectlRunner) assertReceiveTaskTerminal(sc replicationCase, runStatus replicationStatus, wantPhase string) {
+	k.t.Helper()
+	if runStatus.ReceiveTaskName == "" {
+		k.t.Fatalf("receiveTaskName is empty for %s: %#v", sc.Name, runStatus)
+	}
+	st := k.assertReceiveTaskPhase(e2eNamespace, runStatus.ReceiveTaskName, wantPhase)
+	if st.Endpoint.Host == "" || st.Endpoint.Port == 0 || st.SSH.HostKey == "" || st.ReceiverPod.Name == "" {
+		k.t.Fatalf("receive task status missing daemonset receiver details for %s: %#v", sc.Name, st)
+	}
+	if wantPhase == e2eReceiveTaskPhaseCompleted && st.Error != "" {
+		k.t.Fatalf("receive task error = %q, want empty", st.Error)
+	}
+	if wantPhase == e2eReceiveTaskPhaseFailed && st.Error == "" {
+		k.t.Fatalf("receive task error is empty for failed task %s", runStatus.ReceiveTaskName)
+	}
+}
+
+func (k kubectlRunner) assertReceiveTaskPhase(namespace, name, wantPhase string) receiveTaskStatus {
+	k.t.Helper()
+	deadline := time.Now().Add(60 * time.Second)
+	var last receiveTaskStatus
+	var lastErr error
+	for time.Now().Before(deadline) {
+		status, err := k.getReceiveTaskStatus(namespace, name)
+		if err != nil {
+			lastErr = err
+		} else {
+			last = status
+			if status.Phase == wantPhase {
+				return status
+			}
+		}
+		time.Sleep(1 * time.Second)
+	}
+	k.collectDiagnosticsInNamespace(namespace, strings.TrimPrefix(name, "zfsrep-"))
+	k.t.Fatalf("timed out waiting for receive task %s/%s to reach %s; last status=%#v last error=%v", namespace, name, wantPhase, last, lastErr)
+	return receiveTaskStatus{}
 }
 
 func (k kubectlRunner) assertCanI(verb, resource, namespace string, want bool) {
@@ -696,23 +720,28 @@ func (k kubectlRunner) applyNamespacedControllerProfile() {
 	k.run(60*time.Second, "delete", "clusterrolebinding", e2eControllerDeploymentName, "--ignore-not-found=true")
 	k.run(60*time.Second, "delete", "clusterrole", e2eControllerDeploymentName, "--ignore-not-found=true")
 	k.run(120*time.Second, "apply", "-k", repoRoot)
-	k.useE2EControllerImage()
+	k.useE2EImages()
 	k.run(180*time.Second, "rollout", "status", "deployment/"+e2eControllerDeploymentName, "-n", e2eControllerNamespace, "--timeout=180s")
+	k.run(180*time.Second, "rollout", "status", "daemonset/zfs-receiver", "-n", e2eControllerNamespace, "--timeout=180s")
 }
 
 func (k kubectlRunner) restoreClusterControllerProfile() {
 	k.t.Helper()
 	k.run(120*time.Second, "apply", "-k", filepath.Join(e2eRepoRoot(k.t), "config"))
-	k.useE2EControllerImage()
+	k.useE2EImages()
 	k.run(180*time.Second, "rollout", "status", "deployment/"+e2eControllerDeploymentName, "-n", e2eControllerNamespace, "--timeout=180s")
+	k.run(180*time.Second, "rollout", "status", "daemonset/zfs-receiver", "-n", e2eControllerNamespace, "--timeout=180s")
 }
 
-func (k kubectlRunner) useE2EControllerImage() {
+func (k kubectlRunner) useE2EImages() {
 	k.t.Helper()
 	k.run(60*time.Second, "set", "image", "deployment/"+e2eControllerDeploymentName, "-n", e2eControllerNamespace, "manager="+e2eImageTag())
+	k.run(60*time.Second, "set", "image", "daemonset/zfs-receiver", "-n", e2eControllerNamespace, "receiver="+e2eImageTag())
 	k.run(60*time.Second, "set", "env", "deployment/"+e2eControllerDeploymentName, "-n", e2eControllerNamespace, "DATA_MOVER_IMAGE="+e2eImageTag())
-	patch := `{"spec":{"template":{"spec":{"containers":[{"name":"manager","imagePullPolicy":"IfNotPresent"}]}}}}`
-	k.run(60*time.Second, "patch", "deployment/"+e2eControllerDeploymentName, "-n", e2eControllerNamespace, "--type=strategic", "-p", patch)
+	controllerPatch := `{"spec":{"template":{"spec":{"containers":[{"name":"manager","imagePullPolicy":"IfNotPresent"}]}}}}`
+	k.run(60*time.Second, "patch", "deployment/"+e2eControllerDeploymentName, "-n", e2eControllerNamespace, "--type=strategic", "-p", controllerPatch)
+	receiverPatch := `{"spec":{"template":{"spec":{"containers":[{"name":"receiver","imagePullPolicy":"IfNotPresent"}]}}}}`
+	k.run(60*time.Second, "patch", "daemonset/zfs-receiver", "-n", e2eControllerNamespace, "--type=strategic", "-p", receiverPatch)
 }
 
 func (k kubectlRunner) assertControllerWatchesNamespace(namespace string) {
@@ -917,6 +946,26 @@ type replicationStatus struct {
 	LastError       string `json:"lastError"`
 }
 
+type receiveTaskObject struct {
+	Status receiveTaskStatus `json:"status"`
+}
+
+type receiveTaskStatus struct {
+	Phase    string `json:"phase"`
+	Endpoint struct {
+		Host string `json:"host"`
+		Port int32  `json:"port"`
+	} `json:"endpoint"`
+	SSH struct {
+		HostKey string `json:"hostKey"`
+	} `json:"ssh"`
+	ReceiverPod struct {
+		Name string `json:"name"`
+		UID  string `json:"uid"`
+	} `json:"receiverPod"`
+	Error string `json:"error"`
+}
+
 type jobObject struct {
 	Status struct {
 		Succeeded  int            `json:"succeeded"`
@@ -999,6 +1048,9 @@ func assertSucceededStatus(t *testing.T, sc replicationCase, st replicationStatu
 	if st.SenderJobName == "" {
 		t.Fatalf("status object names missing: %#v", st)
 	}
+	if st.ReceiverJobName != "" {
+		t.Fatalf("receiverJobName = %q, want empty for daemonset receiver", st.ReceiverJobName)
+	}
 	if st.ReceiveTaskName == "" || st.ReceiverPodName == "" || st.ReceiverPodIP == "" || st.SSHSecretName == "" {
 		t.Fatalf("receiver/ssh status names missing: %#v", st)
 	}
@@ -1026,70 +1078,40 @@ func assertFailedStatus(t *testing.T, sc replicationCase, st replicationStatus, 
 func assertFailedAfterDataMoverSetupStatus(t *testing.T, sc replicationCase, st replicationStatus, wantError string) {
 	t.Helper()
 	assertFailedStatus(t, sc, st, wantError)
+	if st.ReceiverJobName != "" {
+		t.Fatalf("receiverJobName = %q, want empty for daemonset receiver", st.ReceiverJobName)
+	}
 	if st.ReceiveTaskName == "" || st.ReceiverPodName == "" || st.ReceiverPodIP == "" || st.SSHSecretName == "" {
 		t.Fatalf("receiver/ssh status names missing after datamover setup for %s: %#v", sc.Name, st)
 	}
 }
 
-func receiverJobManifest(t *testing.T, namespace, runName string) []byte {
+func receiveTaskManifest(t *testing.T, namespace string, sc replicationCase) []byte {
 	t.Helper()
-	labels := runLabels(runName, "receiver")
 	doc := map[string]any{
-		"apiVersion": "batch/v1",
-		"kind":       "Job",
+		"apiVersion": "zfsreplication.example.com/v1alpha1",
+		"kind":       "ZFSReceiveTask",
 		"metadata": map[string]any{
-			"name":      runObjectName(runName, "receiver"),
+			"name":      runObjectName(sc.Name, "receiver"),
 			"namespace": namespace,
-			"labels":    labels,
+			"labels":    runLabels(sc.Name, "receiver"),
 		},
 		"spec": map[string]any{
-			"suspend": true,
-			"template": map[string]any{
-				"metadata": map[string]any{
-					"labels": labels,
-				},
-				"spec": map[string]any{
-					"restartPolicy":                "Never",
-					"automountServiceAccountToken": false,
-					"nodeName":                     e2eTargetNode,
-					"containers": []map[string]any{
-						{
-							"name":            "receiver",
-							"image":           e2eImageTag(),
-							"imagePullPolicy": "IfNotPresent",
-							"command":         []string{"/bin/sh", "-ec", "sleep 600"},
-						},
-					},
-				},
+			"runRef": map[string]any{
+				"name": sc.Name,
 			},
-		},
-	}
-	return manifestBytes(t, doc)
-}
-
-func orphanReceiverPodManifest(t *testing.T, namespace, runName string) []byte {
-	t.Helper()
-	doc := map[string]any{
-		"apiVersion": "v1",
-		"kind":       "Pod",
-		"metadata": map[string]any{
-			"name":      runObjectName(runName, "orphan-receiver"),
-			"namespace": namespace,
-			"labels":    runLabels(runName, "receiver"),
-		},
-		"spec": map[string]any{
-			"restartPolicy":                 "Always",
-			"automountServiceAccountToken":  false,
-			"nodeName":                      e2eTargetNode,
-			"terminationGracePeriodSeconds": 0,
-			"enableServiceLinks":            false,
-			"containers": []map[string]any{
-				{
-					"name":            "receiver",
-					"image":           e2eImageTag(),
-					"imagePullPolicy": "IfNotPresent",
-					"command":         []string{"/bin/sh", "-ec", "sleep 600"},
-				},
+			"nodeName": sc.TargetNode,
+			"destination": map[string]any{
+				"dataset": sc.TargetDataset,
+			},
+			"ssh": map[string]any{
+				"authorizedPublicKey": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIE2EReceiveTaskTestKey e2e@example.invalid",
+				"expiresAt":           time.Now().Add(30 * time.Minute).UTC().Format(time.RFC3339),
+			},
+			"policy": map[string]any{
+				"receiveUnmounted": true,
+				"receiveResumable": true,
+				"compression":      "none",
 			},
 		},
 	}

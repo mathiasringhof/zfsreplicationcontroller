@@ -7,6 +7,10 @@ import (
 
 	zfsv1 "github.com/mathias/zfsreplicationcontroller/api/v1alpha1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
 func TestRenderSSHDConfigAllowsRootMappedReceiverUser(t *testing.T) {
@@ -65,6 +69,47 @@ func TestReceiveTaskAuthorizationForcesPolicyCommand(t *testing.T) {
 	}
 	if !auth.Policy.ReceiveUnmounted || !auth.Policy.ReceiveResumable || !auth.Policy.AllowSyncSnapshotDestroy {
 		t.Fatalf("policy flags = %#v, want receive flags and sync snapshot destroy", auth.Policy)
+	}
+}
+
+func TestPatchTaskReadyDoesNotReopenTerminalTask(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := clientgoscheme.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := zfsv1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	terminal := &zfsv1.ZFSReceiveTask{
+		ObjectMeta: metav1.ObjectMeta{Name: "recv-1", Namespace: "storage"},
+		Status: zfsv1.ZFSReceiveTaskStatus{
+			Phase: zfsv1.ReceiveTaskPhaseCompleted,
+		},
+	}
+	kubeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&zfsv1.ZFSReceiveTask{}).
+		WithObjects(terminal).
+		Build()
+	stale := terminal.DeepCopy()
+	stale.Status = zfsv1.ZFSReceiveTaskStatus{}
+
+	err := patchTaskReady(context.Background(), kubeClient, stale, receiverConfig{
+		PodName: "zfs-receiver",
+		PodUID:  "uid",
+		PodIP:   "10.0.0.42",
+		SSHPort: 2222,
+	}, "ssh-ed25519 AAAATEST receiver")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var got zfsv1.ZFSReceiveTask
+	if err := kubeClient.Get(context.Background(), types.NamespacedName{Name: terminal.Name, Namespace: terminal.Namespace}, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Status.Phase != zfsv1.ReceiveTaskPhaseCompleted {
+		t.Fatalf("phase after stale ready patch = %s, want %s", got.Status.Phase, zfsv1.ReceiveTaskPhaseCompleted)
 	}
 }
 

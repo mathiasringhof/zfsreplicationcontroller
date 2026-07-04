@@ -24,17 +24,22 @@ set `E2E_LIMA_NETWORK`, for example `E2E_LIMA_NETWORK=lima:shared`.
 ./test/e2e/run.sh
 ```
 
-`run.sh` creates three VMs:
+`run.sh` deletes any previous E2E VMs, creates a fresh cluster, builds and
+imports the current image, deploys the controller and receiver, runs the Go E2E
+suite, and tears the VMs down again. Set `E2E_KEEP_CLUSTER=1` to leave the
+cluster running for debugging after the run.
+
+The clean run creates three VMs:
 
 - `zrc-e2e-cp`
 - `worker-a`
 - `worker-b`
 
 It installs k3s, builds the e2e image, imports it into every node, deploys the
-controller, and prints the kubeconfig path.
+controller and receiver DaemonSet, and then runs:
 
 ```sh
-go test ./test/e2e -run TestE2E -count=1 -v
+KUBECONFIG=test/e2e/.artifacts/kubeconfig go test ./test/e2e -run TestE2E -count=1 -v
 ```
 
 The setup installs `zfsutils-linux` on the worker VMs, loads the ZFS kernel
@@ -43,6 +48,9 @@ module, and creates a file-backed `tank` pool on each worker under
 `E2E_REAL_ZFS_ROOT`, or `E2E_REAL_ZFS_SIZE`.
 
 ## Individual Steps
+
+Use these for local debugging when you intentionally want to keep a cluster
+around between runs:
 
 ```sh
 ./test/e2e/up.sh
