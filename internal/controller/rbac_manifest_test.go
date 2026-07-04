@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -575,12 +576,7 @@ func renderKustomize(t *testing.T, path string) []manifestObject {
 }
 
 func contains(items []string, needle string) bool {
-	for _, item := range items {
-		if item == needle {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(items, needle)
 }
 
 func hasValidationRule(rules []validationRule, rule, message string) bool {

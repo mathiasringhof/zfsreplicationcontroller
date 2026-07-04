@@ -9,6 +9,7 @@ import (
 
 	zfsv1 "github.com/mathias/zfsreplicationcontroller/api/v1alpha1"
 	"github.com/mathias/zfsreplicationcontroller/internal/datamover"
+	"golang.org/x/crypto/ssh"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -22,10 +23,12 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 )
 
+const testReceiverHostKey = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOOBMEh4NBNCYArCdegKrXOfyIVEEhfvFoOYNYjsBP41 receiver"
+
 func TestRunReconcileSenderJobUsesSyncoidOptions(t *testing.T) {
 	run := replicationRun("manual-1")
 	names := objectNamesForRun(run.Name)
-	r := newRunReconciler(t, run, readyReceiveTask(run, names, "10.0.0.42", "ssh-ed25519 AAAATEST receiver"))
+	r := newRunReconciler(t, run, readyReceiveTask(run, names, "10.0.0.42", testReceiverHostKey))
 	if _, err := r.Reconcile(context.Background(), request("manual-1")); err != nil {
 		t.Fatal(err)
 	}
@@ -82,8 +85,31 @@ func TestRunReconcileSenderJobUsesSyncoidOptions(t *testing.T) {
 	if err := r.Get(context.Background(), types.NamespacedName{Name: names.SecretName, Namespace: run.Namespace}, &secret); err != nil {
 		t.Fatal(err)
 	}
-	if got := string(secret.Data["known_hosts"]); got != "[10.0.0.42]:2222 ssh-ed25519 AAAATEST receiver\n" {
-		t.Fatalf("known_hosts = %q", got)
+	gotKnownHosts := secret.Data["known_hosts"]
+	if got := string(gotKnownHosts); !strings.HasPrefix(got, "[10.0.0.42]:2222 ssh-ed25519 ") {
+		t.Fatalf("known_hosts = %q, want bracketed receiver endpoint", got)
+	}
+	_, hosts, parsedKey, comment, rest, err := ssh.ParseKnownHosts(gotKnownHosts)
+	if err != nil {
+		t.Fatalf("parse known_hosts: %v", err)
+	}
+	if len(hosts) != 1 || hosts[0] != "[10.0.0.42]:2222" {
+		t.Fatalf("known_hosts hosts = %v, want receiver endpoint", hosts)
+	}
+	if parsedKey.Type() != "ssh-ed25519" {
+		t.Fatalf("known_hosts key type = %q", parsedKey.Type())
+	}
+	if comment != "receiver" {
+		t.Fatalf("known_hosts comment = %q, want receiver", comment)
+	}
+	if len(rest) != 0 {
+		t.Fatalf("known_hosts rest = %q, want empty", rest)
+	}
+}
+
+func TestKnownHostsLineRejectsInvalidHostKey(t *testing.T) {
+	if _, err := knownHostsLine("10.0.0.42", 2222, "ssh-ed25519 not-base64 receiver"); err == nil {
+		t.Fatal("knownHostsLine() error = nil, want invalid host key rejection")
 	}
 }
 
@@ -140,7 +166,7 @@ func TestRunReconcileRetriesCleanupForTerminalRun(t *testing.T) {
 			run := replicationRun("manual-" + strings.ToLower(string(phase)) + "-secret")
 			run.Status.Phase = phase
 			names := objectNamesForRun(run.Name)
-			receiveTask := readyReceiveTask(run, names, "10.0.0.42", "ssh-ed25519 AAAATEST receiver")
+			receiveTask := readyReceiveTask(run, names, "10.0.0.42", testReceiverHostKey)
 			sshSecret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: names.SecretName, Namespace: run.Namespace}}
 			deleteSecretFailures := 1
 			r := newRunReconcilerWithInterceptors(t, interceptor.Funcs{
@@ -169,7 +195,7 @@ func TestRunReconcileRetriesCleanupForTerminalRun(t *testing.T) {
 			run := replicationRun("manual-" + strings.ToLower(string(phase)))
 			run.Status.Phase = phase
 			names := objectNamesForRun(run.Name)
-			receiveTask := readyReceiveTask(run, names, "10.0.0.42", "ssh-ed25519 AAAATEST receiver")
+			receiveTask := readyReceiveTask(run, names, "10.0.0.42", testReceiverHostKey)
 			sshSecret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: names.SecretName, Namespace: run.Namespace}}
 			receiverPod := runReceiverPod(run, "10.0.0.42")
 			deleteReceiverPodFailures := 1
@@ -203,7 +229,7 @@ func TestRunReconcileCleansUpReceiverPodForTerminalRun(t *testing.T) {
 	run := replicationRun("manual-cleanup")
 	run.Status.Phase = zfsv1.PhaseSucceeded
 	names := objectNamesForRun(run.Name)
-	receiveTask := readyReceiveTask(run, names, "10.0.0.42", "ssh-ed25519 AAAATEST receiver")
+	receiveTask := readyReceiveTask(run, names, "10.0.0.42", testReceiverHostKey)
 	sshSecret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: names.SecretName, Namespace: run.Namespace}}
 	receiverPod := runReceiverPod(run, "10.0.0.42")
 	r := newRunReconciler(t, run, receiveTask, sshSecret, receiverPod)

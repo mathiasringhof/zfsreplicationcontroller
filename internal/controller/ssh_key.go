@@ -1,14 +1,14 @@
 package controller
 
 import (
+	"bytes"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
-	"encoding/base64"
-	"encoding/binary"
 	"encoding/pem"
 	"fmt"
-	"math/big"
+
+	"golang.org/x/crypto/ssh"
 )
 
 type sshKeyMaterial struct {
@@ -29,7 +29,10 @@ func generateSSHKeyMaterial() (sshKeyMaterial, error) {
 	if private == nil {
 		return sshKeyMaterial{}, fmt.Errorf("encode ssh private key")
 	}
-	public := authorizedKey(&key.PublicKey)
+	public, err := authorizedKey(&key.PublicKey)
+	if err != nil {
+		return sshKeyMaterial{}, err
+	}
 	return sshKeyMaterial{
 		PrivateKeyPEM:  private,
 		PublicKey:      public,
@@ -37,25 +40,12 @@ func generateSSHKeyMaterial() (sshKeyMaterial, error) {
 	}, nil
 }
 
-func authorizedKey(key *rsa.PublicKey) []byte {
-	wire := appendSSHString(nil, []byte("ssh-rsa"))
-	wire = appendSSHMPInt(wire, big.NewInt(int64(key.E)))
-	wire = appendSSHMPInt(wire, key.N)
-	encoded := base64.StdEncoding.EncodeToString(wire)
-	return []byte("ssh-rsa " + encoded + " zfsreplication-controller\n")
-}
-
-func appendSSHString(out, value []byte) []byte {
-	var length [4]byte
-	binary.BigEndian.PutUint32(length[:], uint32(len(value)))
-	out = append(out, length[:]...)
-	return append(out, value...)
-}
-
-func appendSSHMPInt(out []byte, value *big.Int) []byte {
-	bytes := value.Bytes()
-	if len(bytes) > 0 && bytes[0]&0x80 != 0 {
-		bytes = append([]byte{0}, bytes...)
+func authorizedKey(key *rsa.PublicKey) ([]byte, error) {
+	public, err := ssh.NewPublicKey(key)
+	if err != nil {
+		return nil, fmt.Errorf("encode ssh public key: %w", err)
 	}
-	return appendSSHString(out, bytes)
+	out := bytes.TrimSuffix(ssh.MarshalAuthorizedKey(public), []byte("\n"))
+	out = append(out, " zfsreplication-controller\n"...)
+	return out, nil
 }

@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"unicode"
@@ -367,7 +368,7 @@ func authorizeReceiverCommand(raw string, policy receiverCommandPolicy) (receive
 				return receiverCommandPlan{kind: receiverCommandLookup, lookupCommand: step.Args[1]}, nil
 			}
 		case "ps":
-			if receiverStepHasNoRedirects(step) && stringSlicesEqual(step.Args, []string{"-Ao", "args="}) {
+			if receiverStepHasNoRedirects(step) && slices.Equal(step.Args, []string{"-Ao", "args="}) {
 				return receiverCommandPlan{kind: receiverCommandPS}, nil
 			}
 		}
@@ -549,7 +550,7 @@ func commandLookupAllowed(name string, policy receiverCommandPolicy) bool {
 func validateSingleReceiverStep(step receiverCommandStep, policy receiverCommandPolicy) error {
 	switch step.Name {
 	case "ps":
-		if !receiverStepHasNoRedirects(step) || !stringSlicesEqual(step.Args, []string{"-Ao", "args="}) {
+		if !receiverStepHasNoRedirects(step) || !slices.Equal(step.Args, []string{"-Ao", "args="}) {
 			return fmt.Errorf("unsupported ps command")
 		}
 	case "zpool":
@@ -598,7 +599,7 @@ func zfsGetAllowed(args []string, target string) bool {
 		{"get", "-H", "-p", "used", target},
 	}
 	for _, pattern := range allowed {
-		if stringSlicesEqual(args, pattern) {
+		if slices.Equal(args, pattern) {
 			return true
 		}
 	}
@@ -629,7 +630,7 @@ func validateZpoolFeatureCheck(steps []receiverCommandStep, policy receiverComma
 func zpoolFeatureGetAllowed(step receiverCommandStep, policy receiverCommandPolicy) bool {
 	return step.Name == "zpool" &&
 		receiverStepHasNoStdoutRedirects(step) &&
-		stringSlicesEqual(step.Args, []string{"get", "-o", "value", "-H", "feature@extensible_dataset", replication.TargetPool(policy.TargetDataset)})
+		slices.Equal(step.Args, []string{"get", "-o", "value", "-H", "feature@extensible_dataset", replication.TargetPool(policy.TargetDataset)})
 }
 
 func validateReceivePipeline(steps []receiverCommandStep, policy receiverCommandPolicy) error {
@@ -790,18 +791,6 @@ func receiverStepHasNoRedirects(step receiverCommandStep) bool {
 
 func receiverStepHasNoStdoutRedirects(step receiverCommandStep) bool {
 	return !step.StdoutNull && !step.StderrToStdout
-}
-
-func stringSlicesEqual(left, right []string) bool {
-	if len(left) != len(right) {
-		return false
-	}
-	for i := range left {
-		if left[i] != right[i] {
-			return false
-		}
-	}
-	return true
 }
 
 func executeReceiverCommandPlan(ctx context.Context, cfg forcedCommandConfig, plan receiverCommandPlan) error {

@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -1028,12 +1029,7 @@ func deploymentEnvValue(env []deploymentEnvVar, name string) string {
 }
 
 func contains(items []string, needle string) bool {
-	for _, item := range items {
-		if item == needle {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(items, needle)
 }
 
 func assertSucceededStatus(t *testing.T, sc replicationCase, st replicationStatus) {

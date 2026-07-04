@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net"
 	"strconv"
 	"strings"
 	"time"
@@ -13,6 +14,8 @@ import (
 	zfsv1 "github.com/mathias/zfsreplicationcontroller/api/v1alpha1"
 	"github.com/mathias/zfsreplicationcontroller/internal/datamover"
 	"github.com/mathias/zfsreplicationcontroller/internal/replication"
+	"golang.org/x/crypto/ssh"
+	"golang.org/x/crypto/ssh/knownhosts"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -262,7 +265,10 @@ func (r *ZFSReplicationRunReconciler) ensureRunKnownHosts(ctx context.Context, r
 	if err := r.Get(ctx, types.NamespacedName{Name: names.SecretName, Namespace: run.Namespace}, &secret); err != nil {
 		return err
 	}
-	line := knownHostsLine(task.Status.Endpoint.Host, task.Status.Endpoint.Port, task.Status.SSH.HostKey)
+	line, err := knownHostsLine(task.Status.Endpoint.Host, task.Status.Endpoint.Port, task.Status.SSH.HostKey)
+	if err != nil {
+		return err
+	}
 	if string(secret.Data["known_hosts"]) == line {
 		return nil
 	}
@@ -607,6 +613,20 @@ func dataMoverJobForRun(run *zfsv1.ZFSReplicationRun, name, image string, labels
 	return dataMoverJob(run.Namespace, name, image, labels, nodeName, command, env, secretName, readiness)
 }
 
-func knownHostsLine(host string, port int32, hostKey string) string {
-	return fmt.Sprintf("[%s]:%d %s\n", host, port, strings.TrimSpace(hostKey))
+func knownHostsLine(host string, port int32, hostKey string) (string, error) {
+	key, comment, options, rest, err := ssh.ParseAuthorizedKey([]byte(strings.TrimSpace(hostKey)))
+	if err != nil {
+		return "", fmt.Errorf("parse receiver host key: %w", err)
+	}
+	if len(options) > 0 {
+		return "", fmt.Errorf("receiver host key must not include authorized_keys options")
+	}
+	if len(rest) > 0 {
+		return "", fmt.Errorf("receiver host key contains trailing data")
+	}
+	line := knownhosts.Line([]string{net.JoinHostPort(host, strconv.FormatInt(int64(port), 10))}, key)
+	if comment != "" {
+		line += " " + comment
+	}
+	return line + "\n", nil
 }
