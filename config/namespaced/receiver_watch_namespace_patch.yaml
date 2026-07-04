@@ -1,0 +1,13 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: zfs-receiver
+  namespace: zfsreplication-system
+spec:
+  template:
+    spec:
+      containers:
+        - name: receiver
+          env:
+            - name: WATCH_NAMESPACE
+              value: zfsreplication-smoke

@@ -12,6 +12,7 @@ type SenderConfig struct {
 	DstHost          string
 	DstDataset       string
 	SSHKeyFile       string
+	KnownHostsFile   string
 	SSHPort          string
 	NoSyncSnap       bool
 	NoRollback       bool
@@ -31,6 +32,7 @@ func SenderConfigFromEnv() SenderConfig {
 		DstHost:          os.Getenv("DST_HOST"),
 		DstDataset:       os.Getenv("DST_DATASET"),
 		SSHKeyFile:       os.Getenv("SSH_KEY_FILE"),
+		KnownHostsFile:   os.Getenv("KNOWN_HOSTS_FILE"),
 		SSHPort:          os.Getenv("SSH_PORT"),
 		NoSyncSnap:       boolEnvDefault("SYNCOID_NO_SYNC_SNAP", false),
 		NoRollback:       boolEnvDefault("SYNCOID_NO_ROLLBACK", true),
@@ -49,6 +51,10 @@ func RunSender(ctx context.Context, cfg SenderConfig, r CommandRunner) error {
 	if err := validateNode(cfg.ExpectedNode, cfg.ActualNode); err != nil {
 		return err
 	}
+	compress, err := syncoidCompression(cfg.Compress)
+	if err != nil {
+		return err
+	}
 	var args []string
 	if cfg.NoSyncSnap {
 		args = append(args, "--no-sync-snap")
@@ -56,13 +62,20 @@ func RunSender(ctx context.Context, cfg SenderConfig, r CommandRunner) error {
 	if cfg.NoRollback {
 		args = append(args, "--no-rollback")
 	}
-	if cfg.Compress != "" {
-		args = append(args, "--compress="+cfg.Compress)
+	args = append(args, "--no-privilege-elevation")
+	if compress != "" {
+		args = append(args, "--compress="+compress)
 	}
-	args = append(args,
-		"--sshoption=StrictHostKeyChecking=no",
-		"--sshoption=UserKnownHostsFile=/dev/null",
-	)
+	if cfg.DstHost != "" && cfg.KnownHostsFile == "" {
+		return fmt.Errorf("known hosts file is required for SSH replication")
+	}
+	if cfg.KnownHostsFile != "" {
+		args = append(args,
+			"--sshoption=UserKnownHostsFile="+cfg.KnownHostsFile,
+			"--sshoption=StrictHostKeyChecking=yes",
+			"--sshoption=IdentitiesOnly=yes",
+		)
+	}
 	if cfg.SSHKeyFile != "" {
 		args = append(args, "--sshkey="+cfg.SSHKeyFile)
 	}
@@ -89,6 +102,25 @@ func RunSender(ctx context.Context, cfg SenderConfig, r CommandRunner) error {
 		return fmt.Errorf("syncoid failed: %s", clean(stderr, err))
 	}
 	return nil
+}
+
+func syncoidCompression(compress string) (string, error) {
+	switch compress {
+	case "", "none":
+		return "none", nil
+	case "gzip", "xz", "lz4":
+		return compress, nil
+	case "pigz":
+		return "pigz-fast", nil
+	case "zstd":
+		return "zstd-fast", nil
+	case "zstdmt":
+		return "zstdmt-fast", nil
+	case "lzop":
+		return "lzo", nil
+	default:
+		return "", fmt.Errorf("unsupported compression %q", compress)
+	}
 }
 
 func syncoidTarget(host, dataset string) string {

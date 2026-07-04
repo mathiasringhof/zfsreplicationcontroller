@@ -1,0 +1,21 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: zfs-receiver
+rules:
+  - apiGroups:
+      - zfsreplication.example.com
+    resources:
+      - zfsreceivetasks
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - zfsreplication.example.com
+    resources:
+      - zfsreceivetasks/status
+    verbs:
+      - get
+      - update
+      - patch

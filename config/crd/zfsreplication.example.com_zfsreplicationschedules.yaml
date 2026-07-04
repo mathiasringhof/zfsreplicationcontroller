@@ -92,6 +92,16 @@ spec:
                           default: false
                         compress:
                           type: string
+                          enum:
+                            - ""
+                            - none
+                            - gzip
+                            - pigz
+                            - zstd
+                            - zstdmt
+                            - xz
+                            - lzop
+                            - lz4
                         receiveUnmounted:
                           type: boolean
                           default: true

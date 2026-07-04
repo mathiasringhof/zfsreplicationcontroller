@@ -25,6 +25,29 @@ func (in *ZFSReplicationRunList) DeepCopyObject() runtime.Object {
 	return out
 }
 
+func (in *ZFSReceiveTask) DeepCopyObject() runtime.Object {
+	if in == nil {
+		return nil
+	}
+	return in.DeepCopy()
+}
+
+func (in *ZFSReceiveTaskList) DeepCopyObject() runtime.Object {
+	if in == nil {
+		return nil
+	}
+	out := new(ZFSReceiveTaskList)
+	*out = *in
+	out.ListMeta = in.ListMeta
+	if in.Items != nil {
+		out.Items = make([]ZFSReceiveTask, len(in.Items))
+		for i := range in.Items {
+			out.Items[i] = *in.Items[i].DeepCopy()
+		}
+	}
+	return out
+}
+
 func (in *ZFSReplicationSchedule) DeepCopyObject() runtime.Object {
 	if in == nil {
 		return nil
@@ -65,6 +88,17 @@ func (in *ZFSReplicationRun) DeepCopy() *ZFSReplicationRun {
 	return out
 }
 
+func (in *ZFSReceiveTask) DeepCopy() *ZFSReceiveTask {
+	if in == nil {
+		return nil
+	}
+	out := new(ZFSReceiveTask)
+	*out = *in
+	out.ObjectMeta = *in.ObjectMeta.DeepCopy()
+	out.Spec = *in.Spec.DeepCopy()
+	return out
+}
+
 func (in *ZFSReplicationSchedule) DeepCopy() *ZFSReplicationSchedule {
 	if in == nil {
 		return nil
@@ -90,6 +124,16 @@ func (in *ZFSReplicationRunSpec) DeepCopy() *ZFSReplicationRunSpec {
 	out := new(ZFSReplicationRunSpec)
 	*out = *in
 	out.Syncoid = *in.Syncoid.DeepCopy()
+	return out
+}
+
+func (in *ZFSReceiveTaskSpec) DeepCopy() *ZFSReceiveTaskSpec {
+	if in == nil {
+		return nil
+	}
+	out := new(ZFSReceiveTaskSpec)
+	*out = *in
+	out.SSH.ExpiresAt = *in.SSH.ExpiresAt.DeepCopy()
 	return out
 }
 

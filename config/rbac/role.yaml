@@ -14,6 +14,7 @@ rules:
   - apiGroups:
       - zfsreplication.example.com
     resources:
+      - zfsreceivetasks
       - zfsreplicationruns
     verbs:
       - create
@@ -23,6 +24,7 @@ rules:
   - apiGroups:
       - zfsreplication.example.com
     resources:
+      - zfsreceivetasks/status
       - zfsreplicationruns/status
       - zfsreplicationschedules/status
     verbs:

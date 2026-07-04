@@ -77,6 +77,16 @@ spec:
                       default: false
                     compress:
                       type: string
+                      enum:
+                        - ""
+                        - none
+                        - gzip
+                        - pigz
+                        - zstd
+                        - zstdmt
+                        - xz
+                        - lzop
+                        - lz4
                     receiveUnmounted:
                       type: boolean
                       default: true
@@ -106,6 +116,8 @@ spec:
                 senderJobName:
                   type: string
                 receiverJobName:
+                  type: string
+                receiveTaskName:
                   type: string
                 receiverPodName:
                   type: string

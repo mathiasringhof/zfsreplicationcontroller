@@ -5,6 +5,7 @@ RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 go build -o /out/manager ./cmd/manager
 RUN CGO_ENABLED=0 go build -o /out/zfsrep-sender ./cmd/zfsrep-sender
+RUN CGO_ENABLED=0 go build -o /out/zfsrep-receiver ./cmd/zfsrep-receiver
 
 FROM docker.io/library/ubuntu:24.04
 ARG SANOID_VERSION=2.3.0
@@ -27,8 +28,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 	&& syncoid --version | grep -F "${SANOID_VERSION}" \
 	&& syncoid --help 2>&1 | grep -F -- "--include-snaps" \
 	&& rm -rf /tmp/sanoid.tar.gz "/tmp/sanoid-${SANOID_VERSION}" /var/lib/apt/lists/*
+RUN useradd -o -u 0 -g 0 -M -d /run/zfs-receiver -s /bin/sh zfs-recv \
+	&& usermod -p '*' zfs-recv
 COPY --from=build /out/manager /usr/local/bin/manager
 COPY --from=build /out/zfsrep-sender /usr/local/bin/zfsrep-sender
-COPY hack/zfsrep-ssh-receiver /usr/local/bin/zfsrep-ssh-receiver
-RUN chmod +x /usr/local/bin/zfsrep-ssh-receiver
+COPY --from=build /out/zfsrep-receiver /usr/local/bin/zfsrep-receiver
 ENTRYPOINT ["/usr/local/bin/manager"]

@@ -13,9 +13,22 @@ const (
 	PhaseFailed           Phase = "Failed"
 )
 
+type ReceiveTaskPhase string
+
+const (
+	ReceiveTaskPhasePending   ReceiveTaskPhase = "Pending"
+	ReceiveTaskPhaseReady     ReceiveTaskPhase = "Ready"
+	ReceiveTaskPhaseCompleted ReceiveTaskPhase = "Completed"
+	ReceiveTaskPhaseFailed    ReceiveTaskPhase = "Failed"
+)
+
 type DatasetRef struct {
 	NodeName string `json:"nodeName"`
 	Dataset  string `json:"dataset"`
+}
+
+type LocalObjectReference struct {
+	Name string `json:"name"`
 }
 
 type SyncoidSpec struct {
@@ -39,6 +52,7 @@ type ZFSReplicationRunStatus struct {
 	Phase           Phase        `json:"phase,omitempty"`
 	SenderJobName   string       `json:"senderJobName,omitempty"`
 	ReceiverJobName string       `json:"receiverJobName,omitempty"`
+	ReceiveTaskName string       `json:"receiveTaskName,omitempty"`
 	ReceiverPodName string       `json:"receiverPodName,omitempty"`
 	ReceiverPodIP   string       `json:"receiverPodIP,omitempty"`
 	SSHSecretName   string       `json:"sshSecretName,omitempty"`
@@ -62,6 +76,72 @@ type ZFSReplicationRunList struct {
 	metav1.TypeMeta `json:",inline"`
 	metav1.ListMeta `json:"metadata,omitempty"`
 	Items           []ZFSReplicationRun `json:"items"`
+}
+
+type ReceiveDestination struct {
+	Dataset string `json:"dataset"`
+}
+
+type ReceiveTaskSSHSpec struct {
+	AuthorizedPublicKey string      `json:"authorizedPublicKey"`
+	ExpiresAt           metav1.Time `json:"expiresAt"`
+}
+
+type ReceiveTaskPolicy struct {
+	ReceiveUnmounted         bool   `json:"receiveUnmounted"`
+	ReceiveResumable         bool   `json:"receiveResumable,omitempty"`
+	AllowRollback            bool   `json:"allowRollback,omitempty"`
+	AllowDestroy             bool   `json:"allowDestroy,omitempty"`
+	AllowMount               bool   `json:"allowMount,omitempty"`
+	AllowSyncSnapshotDestroy bool   `json:"allowSyncSnapshotDestroy,omitempty"`
+	Compression              string `json:"compression,omitempty"`
+}
+
+type ZFSReceiveTaskSpec struct {
+	RunRef      LocalObjectReference `json:"runRef"`
+	NodeName    string               `json:"nodeName"`
+	Destination ReceiveDestination   `json:"destination"`
+	SSH         ReceiveTaskSSHSpec   `json:"ssh"`
+	Policy      ReceiveTaskPolicy    `json:"policy,omitempty"`
+}
+
+type ReceiveTaskEndpoint struct {
+	Host string `json:"host,omitempty"`
+	Port int32  `json:"port,omitempty"`
+}
+
+type ReceiveTaskSSHStatus struct {
+	HostKey string `json:"hostKey,omitempty"`
+}
+
+type ReceiveTaskPodStatus struct {
+	Name string `json:"name,omitempty"`
+	UID  string `json:"uid,omitempty"`
+}
+
+type ZFSReceiveTaskStatus struct {
+	Phase       ReceiveTaskPhase     `json:"phase,omitempty"`
+	Endpoint    ReceiveTaskEndpoint  `json:"endpoint,omitempty"`
+	SSH         ReceiveTaskSSHStatus `json:"ssh,omitempty"`
+	ReceiverPod ReceiveTaskPodStatus `json:"receiverPod,omitempty"`
+	Error       string               `json:"error,omitempty"`
+}
+
+// +kubebuilder:object:root=true
+// +kubebuilder:subresource:status
+type ZFSReceiveTask struct {
+	metav1.TypeMeta   `json:",inline"`
+	metav1.ObjectMeta `json:"metadata,omitempty"`
+
+	Spec   ZFSReceiveTaskSpec   `json:"spec,omitempty"`
+	Status ZFSReceiveTaskStatus `json:"status,omitempty"`
+}
+
+// +kubebuilder:object:root=true
+type ZFSReceiveTaskList struct {
+	metav1.TypeMeta `json:",inline"`
+	metav1.ListMeta `json:"metadata,omitempty"`
+	Items           []ZFSReceiveTask `json:"items"`
 }
 
 type ConcurrencyPolicy string

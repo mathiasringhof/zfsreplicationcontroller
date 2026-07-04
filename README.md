@@ -3,10 +3,12 @@
 ZFS Replication Controller runs Syncoid replication between ZFS datasets on two
 Kubernetes nodes.
 
-For each `ZFSReplicationRun`, the controller creates a per-run SSH key, starts a
-privileged receiver Job on the target node, waits for that receiver pod to become
-ready, then starts a privileged sender Job on the source node. The sender invokes
-`syncoid` against the receiver pod address.
+For each `ZFSReplicationRun`, the controller creates a per-run SSH key and a
+`ZFSReceiveTask` for the destination node. A privileged receiver DaemonSet on
+that node authorizes the key, publishes its pod IP and SSH host key in task
+status, then the controller starts a privileged sender Job on the source node.
+The sender invokes `syncoid` against the receiver pod address with strict SSH
+host-key checking.
 
 Snapshot creation is controlled by Syncoid options. Syncoid can create its own
 sync snapshots, or a run can set `noSyncSnap: true` and rely on snapshots created
@@ -18,6 +20,7 @@ The API is `v1alpha1`.
 
 - `ZFSReplicationRun`: one Syncoid invocation. The run spec is immutable after
   creation.
+- `ZFSReceiveTask`: internal per-run receiver authorization and readiness state.
 - `ZFSReplicationSchedule`: creates `ZFSReplicationRun` objects from a template
   on cron ticks.
 
@@ -28,14 +31,16 @@ whose source and target refer to the same dataset on the same node.
 
 - Kubernetes nodes with the required ZFS datasets and `/dev/zfs`.
 - Permission to run privileged pods with a `/dev/zfs` hostPath mount.
+- Destination nodes labelled `zfsreplication.example.com/enabled=true` so the
+  receiver DaemonSet is scheduled there.
 - A controller image that contains `manager`, `zfsrep-sender`,
-  `zfsrep-ssh-receiver`, `zfsutils-linux`, OpenSSH, and Syncoid.
+  `zfsrep-receiver`, `zfsutils-linux`, OpenSSH, and Syncoid.
 
 ## Install
 
 The controller is deployed as a container image, not as Go source. The Dockerfile
-builds the `manager` and `zfsrep-sender` binaries, then packages them with
-`zfsrep-ssh-receiver`, `zfsutils-linux`, OpenSSH, and pinned upstream `syncoid`
+builds the `manager`, `zfsrep-sender`, and `zfsrep-receiver` binaries, then
+packages them with `zfsutils-linux`, OpenSSH, and pinned upstream `syncoid`
 2.3.0.
 
 GitHub Actions builds the image on pull requests and publishes it to GHCR on
@@ -56,16 +61,17 @@ Tags:
 - `<version>` and `<major>.<minor>`: published from `v*` release tags.
 
 The default manifests use `ghcr.io/mathiasringhof/zfsreplicationcontroller:main`
-for both the controller and data mover image. The controller Deployment uses
-`imagePullPolicy: Always`, and generated data mover Jobs also use `Always` for
-mutable `main` and `latest` tags. For GitOps deployments, pin both values to the
-same digest after the image has been published. A `sha-<commit>` tag is a useful
-fallback, but a digest is the content-addressed immutable reference.
+for the controller, receiver DaemonSet, and data mover image. The controller
+Deployment, receiver DaemonSet, and generated data mover Jobs use
+`imagePullPolicy: Always` for mutable `main` and `latest` tags. For GitOps
+deployments, pin all image references to the same digest after the image has
+been published. A `sha-<commit>` tag is a useful fallback, but a digest is the
+content-addressed immutable reference.
 
 The deployment chain is:
 
 ```text
-Go source -> container image -> CRDs/RBAC/Deployment -> manager pod -> custom resources -> Jobs
+Go source -> container image -> CRDs/RBAC/Deployment/DaemonSet -> manager pod -> custom resources -> ZFSReceiveTask + sender Job
 ```
 
 If you use a different registry or a pinned image, set it in both places in
@@ -94,13 +100,17 @@ kubectl apply -k .
 
 That profile still installs the CRDs cluster-wide, but it runs the manager with
 `WATCH_NAMESPACE=zfsreplication-smoke` and grants `ZFSReplicationRun`,
-`ZFSReplicationSchedule`, Jobs, Secrets, Pods, Pods/log, and Events access only
-in the `zfsreplication-smoke` namespace. Change `zfsreplication-smoke`
+`ZFSReplicationSchedule`, `ZFSReceiveTask`, Jobs, Secrets, Pods, Pods/log, and
+Events access only in the `zfsreplication-smoke` namespace. Change
+`zfsreplication-smoke`
 consistently in
 `config/namespaced/watched_namespace.yaml`,
 `config/rbac/namespaced_role.yaml`,
-`config/rbac/namespaced_role_binding.yaml`, and
-`config/namespaced/manager_watch_namespace_patch.yaml` for a different smoke
+`config/rbac/namespaced_role_binding.yaml`,
+`config/rbac/receiver_namespaced_role.yaml`,
+`config/rbac/receiver_namespaced_role_binding.yaml`,
+`config/namespaced/manager_watch_namespace_patch.yaml`, and
+`config/namespaced/receiver_watch_namespace_patch.yaml` for a different smoke
 namespace.
 
 Verify the manager pod is ready:
@@ -111,8 +121,8 @@ kubectl -n zfsreplication-system rollout status deploy/zfsreplication-controller
 
 Create `ZFSReplicationRun` and `ZFSReplicationSchedule` objects only after
 choosing real node names and disposable test datasets for your cluster. The
-sender and receiver Jobs are created in the namespace of the run object, not in
-`zfsreplication-system`.
+sender Job, per-run Secret, and `ZFSReceiveTask` are created in the namespace of
+the run object. The receiver DaemonSet runs in `zfsreplication-system`.
 
 ## One-Shot Run
 
@@ -196,18 +206,22 @@ the replication behavior:
 
 ## Object Lifecycle
 
-Each run gets its own SSH `Secret`. The sender connects to the receiver pod
-address, and the receiver accepts only the per-run key.
+Each run gets its own SSH `Secret` and `ZFSReceiveTask`. The sender connects to
+the receiver pod address from task status, verifies the receiver host key with a
+controller-written `known_hosts` file, and the receiver accepts only active,
+unexpired per-run keys.
 
-After a run succeeds or fails, the controller deletes the receiver Job and SSH
-Secret. The sender Job has `ttlSecondsAfterFinished: 86400` so Kubernetes can
-keep it briefly for inspection before TTL cleanup.
+After a run succeeds or fails, the controller marks the receive task Completed or
+Failed and deletes the SSH Secret. The receiver DaemonSet stops authorizing
+terminal or expired tasks. The sender Job has `ttlSecondsAfterFinished: 86400`
+so Kubernetes can keep it briefly for inspection before TTL cleanup.
 
-Sender and receiver Jobs pin pods with `spec.template.spec.nodeName`. At
-startup, each container compares the downward API node name with the expected
-node and exits before running ZFS or SSH commands on a mismatch.
+Sender Jobs pin pods with `spec.template.spec.nodeName`. At startup, the sender
+compares the downward API node name with the expected source node and exits
+before running ZFS commands on a mismatch. Receiver DaemonSet pods publish their
+own node and pod IP through `ZFSReceiveTask.status`.
 
-Jobs use `backoffLimit: 0`, `restartPolicy: Never`, and
+Sender Jobs use `backoffLimit: 0`, `restartPolicy: Never`, and
 `automountServiceAccountToken: false`.
 
 ## Operational Notes
