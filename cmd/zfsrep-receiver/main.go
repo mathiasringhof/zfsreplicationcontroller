@@ -204,7 +204,7 @@ func reconcileReceiveTasks(ctx context.Context, kubeClient client.Client, cfg re
 		if task.Spec.NodeName != cfg.NodeName {
 			continue
 		}
-		if receiveTaskTerminal(task.Status.Phase) {
+		if task.Status.Phase.Terminal() {
 			continue
 		}
 		if task.Spec.SSH.ExpiresAt.Time.Before(now) {
@@ -295,14 +295,10 @@ func latestNonTerminalTask(ctx context.Context, kubeClient client.Client, task *
 	if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(task), &latest); err != nil {
 		return nil, false, err
 	}
-	if receiveTaskTerminal(latest.Status.Phase) {
+	if latest.Status.Phase.Terminal() {
 		return &latest, false, nil
 	}
 	return &latest, true, nil
-}
-
-func receiveTaskTerminal(phase zfsv1.ReceiveTaskPhase) bool {
-	return phase == zfsv1.ReceiveTaskPhaseCompleted || phase == zfsv1.ReceiveTaskPhaseFailed
 }
 
 func writeAuthorizedKeys(path string, keys []string) error {

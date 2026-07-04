@@ -13,6 +13,25 @@ const (
 	PhaseFailed           Phase = "Failed"
 )
 
+func (p Phase) Terminal() bool {
+	return p == PhaseSucceeded || p == PhaseFailed
+}
+
+func (p Phase) Active() bool {
+	return !p.Terminal()
+}
+
+func (p Phase) ReceiveTaskTerminalPhase() ReceiveTaskPhase {
+	switch p {
+	case PhaseSucceeded:
+		return ReceiveTaskPhaseCompleted
+	case PhaseFailed:
+		return ReceiveTaskPhaseFailed
+	default:
+		return ""
+	}
+}
+
 type ReceiveTaskPhase string
 
 const (
@@ -21,6 +40,10 @@ const (
 	ReceiveTaskPhaseCompleted ReceiveTaskPhase = "Completed"
 	ReceiveTaskPhaseFailed    ReceiveTaskPhase = "Failed"
 )
+
+func (p ReceiveTaskPhase) Terminal() bool {
+	return p == ReceiveTaskPhaseCompleted || p == ReceiveTaskPhaseFailed
+}
 
 type DatasetRef struct {
 	NodeName string `json:"nodeName"`
@@ -51,7 +74,6 @@ type ZFSReplicationRunSpec struct {
 type ZFSReplicationRunStatus struct {
 	Phase           Phase        `json:"phase,omitempty"`
 	SenderJobName   string       `json:"senderJobName,omitempty"`
-	ReceiverJobName string       `json:"receiverJobName,omitempty"`
 	ReceiveTaskName string       `json:"receiveTaskName,omitempty"`
 	ReceiverPodName string       `json:"receiverPodName,omitempty"`
 	ReceiverPodIP   string       `json:"receiverPodIP,omitempty"`

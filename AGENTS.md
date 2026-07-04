@@ -18,6 +18,8 @@
 - Test: `go test ./...`
 - Check: `golangci-lint run`
 - Tidy modules after import or dependency changes: `go mod tidy`
+- E2E: `./test/e2e/run.sh`
+- E2E against an already-running test cluster: `GOCACHE=/private/tmp/zfsreplicationcontroller-go-build KUBECONFIG=/Users/mathias/Developer/zfsreplicationcontroller/test/e2e/.artifacts/kubeconfig go test ./test/e2e -run TestE2E -count=1 -timeout=10m -v`
 
 ## Go style
 

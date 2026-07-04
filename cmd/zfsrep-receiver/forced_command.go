@@ -17,6 +17,7 @@ import (
 	"unicode"
 
 	zfsv1 "github.com/mathias/zfsreplicationcontroller/api/v1alpha1"
+	"github.com/mathias/zfsreplicationcontroller/internal/replication"
 )
 
 const receiverCommandPath = "/usr/local/bin/zfsrep-receiver"
@@ -34,15 +35,8 @@ type receiverTaskAuthorization struct {
 }
 
 type receiverCommandPolicy struct {
-	TargetDataset            string `json:"targetDataset"`
-	ReceiveUnmounted         bool   `json:"receiveUnmounted"`
-	ReceiveResumable         bool   `json:"receiveResumable"`
-	AllowRollback            bool   `json:"allowRollback,omitempty"`
-	AllowDestroy             bool   `json:"allowDestroy,omitempty"`
-	AllowMount               bool   `json:"allowMount,omitempty"`
-	AllowSyncSnapshotDestroy bool   `json:"allowSyncSnapshotDestroy,omitempty"`
-	SyncSnapshotIdentifier   string `json:"syncSnapshotIdentifier,omitempty"`
-	Compression              string `json:"compression"`
+	TargetDataset string `json:"targetDataset"`
+	zfsv1.ReceiveTaskPolicy
 }
 
 type forcedCommandConfig struct {
@@ -154,7 +148,7 @@ func readReceiverPolicy(path string) (receiverCommandPolicy, error) {
 	if err := json.Unmarshal(data, &policy); err != nil {
 		return receiverCommandPolicy{}, fmt.Errorf("parse receiver policy: %w", err)
 	}
-	policy.Compression = compressionDefault(policy.Compression)
+	policy.Compression = replication.CompressionDefault(policy.Compression)
 	return policy, nil
 }
 
@@ -165,16 +159,10 @@ func receiveTaskAuthorization(cfg receiverConfig, task *zfsv1.ZFSReceiveTask) re
 		panic(err)
 	}
 	policy := receiverCommandPolicy{
-		TargetDataset:            task.Spec.Destination.Dataset,
-		ReceiveUnmounted:         task.Spec.Policy.ReceiveUnmounted,
-		ReceiveResumable:         task.Spec.Policy.ReceiveResumable,
-		AllowRollback:            task.Spec.Policy.AllowRollback,
-		AllowDestroy:             task.Spec.Policy.AllowDestroy,
-		AllowMount:               task.Spec.Policy.AllowMount,
-		AllowSyncSnapshotDestroy: task.Spec.Policy.AllowSyncSnapshotDestroy,
-		SyncSnapshotIdentifier:   task.Spec.Policy.SyncSnapshotIdentifier,
-		Compression:              compressionDefault(task.Spec.Policy.Compression),
+		TargetDataset:     task.Spec.Destination.Dataset,
+		ReceiveTaskPolicy: task.Spec.Policy,
 	}
+	policy.Compression = replication.CompressionDefault(policy.Compression)
 	forcedCommand := receiverCommandPath + " exec --policy-id " + policyID
 	key := "restrict,command=\"" + escapeAuthorizedKeysOption(forcedCommand) + "\" " + strings.TrimSpace(task.Spec.SSH.AuthorizedPublicKey)
 	return receiverTaskAuthorization{
@@ -345,14 +333,14 @@ func authorizeReceiverCommand(raw string, policy receiverCommandPolicy) (receive
 	if strings.Contains(raw, ";") {
 		return authorizeReceiverCommandBatch(raw, policy)
 	}
-	policy.Compression = compressionDefault(policy.Compression)
+	policy.Compression = replication.CompressionDefault(policy.Compression)
 	if policy.TargetDataset == "" {
 		return receiverCommandPlan{}, fmt.Errorf("target dataset is empty")
 	}
-	if !validReceiverDatasetName(policy.TargetDataset) {
+	if !replication.ValidDatasetName(policy.TargetDataset) {
 		return receiverCommandPlan{}, fmt.Errorf("target dataset is invalid")
 	}
-	if policy.SyncSnapshotIdentifier != "" && !validSyncoidIdentifier(policy.SyncSnapshotIdentifier) {
+	if policy.SyncSnapshotIdentifier != "" && !replication.ValidSyncoidIdentifier(policy.SyncSnapshotIdentifier) {
 		return receiverCommandPlan{}, fmt.Errorf("sync snapshot identifier is invalid")
 	}
 	tokens, err := tokenizeReceiverCommand(raw)
@@ -555,7 +543,7 @@ func commandLookupAllowed(name string, policy receiverCommandPolicy) bool {
 	if name == "mbuffer" {
 		return true
 	}
-	return policy.Compression != "none" && name == policy.Compression && compressorAllowed(name)
+	return policy.Compression != replication.CompressionNone && name == policy.Compression && replication.CompressorAllowed(name)
 }
 
 func validateSingleReceiverStep(step receiverCommandStep, policy receiverCommandPolicy) error {
@@ -641,7 +629,7 @@ func validateZpoolFeatureCheck(steps []receiverCommandStep, policy receiverComma
 func zpoolFeatureGetAllowed(step receiverCommandStep, policy receiverCommandPolicy) bool {
 	return step.Name == "zpool" &&
 		receiverStepHasNoStdoutRedirects(step) &&
-		stringSlicesEqual(step.Args, []string{"get", "-o", "value", "-H", "feature@extensible_dataset", targetPool(policy.TargetDataset)})
+		stringSlicesEqual(step.Args, []string{"get", "-o", "value", "-H", "feature@extensible_dataset", replication.TargetPool(policy.TargetDataset)})
 }
 
 func validateReceivePipeline(steps []receiverCommandStep, policy receiverCommandPolicy) error {
@@ -661,7 +649,7 @@ func validateReceivePipeline(steps []receiverCommandStep, policy receiverCommand
 			if err := validateMbufferStep(previous[0]); err != nil {
 				return err
 			}
-			if policy.Compression != "none" {
+			if policy.Compression != replication.CompressionNone {
 				return fmt.Errorf("receive pipeline is missing decompressor")
 			}
 			return validateZFSReceiveStep(last, policy)
@@ -723,42 +711,21 @@ func safeMbufferValue(value string) bool {
 }
 
 func validateDecompressorStep(step receiverCommandStep, policy receiverCommandPolicy) error {
-	if policy.Compression == "none" {
+	if policy.Compression == replication.CompressionNone {
 		return fmt.Errorf("decompressor is not allowed when compression is none")
 	}
 	if !receiverStepHasNoRedirects(step) {
 		return fmt.Errorf("unsupported decompressor command")
 	}
-	switch policy.Compression {
-	case "gzip":
-		if step.Name == "zcat" && len(step.Args) == 0 {
-			return nil
-		}
-		if step.Name == "gzip" && stringSlicesEqual(step.Args, []string{"-dc"}) {
-			return nil
-		}
-	case "pigz", "zstd", "zstdmt", "lz4":
-		if step.Name == policy.Compression && stringSlicesEqual(step.Args, []string{"-dc"}) {
-			return nil
-		}
-	case "xz":
-		if step.Name == "xz" && (stringSlicesEqual(step.Args, []string{"-d"}) ||
-			stringSlicesEqual(step.Args, []string{"-dc"}) ||
-			stringSlicesEqual(step.Args, []string{"-d", "-c"})) {
-			return nil
-		}
-	case "lzop":
-		if step.Name == "lzop" && (stringSlicesEqual(step.Args, []string{"-dfc"}) ||
-			stringSlicesEqual(step.Args, []string{"-dc"})) {
-			return nil
-		}
+	if replication.DecompressorAllowed(step.Name, step.Args, policy.Compression) {
+		return nil
 	}
 	return fmt.Errorf("unsupported decompressor arguments")
 }
 
 func validateZFSReceiveStep(step receiverCommandStep, policy receiverCommandPolicy) error {
 	if len(step.Args) == 3 && step.Args[0] == "receive" && step.Args[1] == "-A" {
-		if !validReceiverDatasetName(step.Args[2]) || step.Args[2] != policy.TargetDataset {
+		if !replication.ValidDatasetName(step.Args[2]) || step.Args[2] != policy.TargetDataset {
 			return fmt.Errorf("zfs receive abort target is outside policy")
 		}
 		if !policy.ReceiveResumable {
@@ -770,7 +737,7 @@ func validateZFSReceiveStep(step receiverCommandStep, policy receiverCommandPoli
 		return fmt.Errorf("unsupported zfs receive command")
 	}
 	target := step.Args[len(step.Args)-1]
-	if !validReceiverDatasetName(target) || target != policy.TargetDataset {
+	if !replication.ValidDatasetName(target) || target != policy.TargetDataset {
 		return fmt.Errorf("zfs receive target is outside policy")
 	}
 	seenUnmounted := false
@@ -804,89 +771,17 @@ func validateZFSReceiveStep(step receiverCommandStep, policy receiverCommandPoli
 
 func zfsDestroyAllowed(args []string, policy receiverCommandPolicy) bool {
 	if len(args) == 2 && args[0] == "destroy" {
-		if dataset, snapshot, ok := splitSnapshotTarget(args[1]); ok {
+		if dataset, snapshot, ok := replication.SplitSnapshotTarget(args[1]); ok {
 			return policy.AllowSyncSnapshotDestroy &&
 				dataset == policy.TargetDataset &&
-				syncoidSnapshotTarget(snapshot, policy.SyncSnapshotIdentifier)
+				replication.SyncoidSnapshotTarget(snapshot, policy.SyncSnapshotIdentifier)
 		}
-		return policy.AllowDestroy && datasetOrChild(args[1], policy.TargetDataset) && !strings.Contains(args[1], "@")
+		return policy.AllowDestroy && replication.DatasetOrChild(args[1], policy.TargetDataset) && !strings.Contains(args[1], "@")
 	}
 	if len(args) == 3 && args[0] == "destroy" && args[1] == "-r" {
-		return policy.AllowDestroy && datasetOrChild(args[2], policy.TargetDataset) && !strings.Contains(args[2], "@")
+		return policy.AllowDestroy && replication.DatasetOrChild(args[2], policy.TargetDataset) && !strings.Contains(args[2], "@")
 	}
 	return false
-}
-
-func syncoidSnapshotTarget(snapshot, identifier string) bool {
-	if identifier == "" || !validSyncoidIdentifier(identifier) || !validReceiverSnapshotName(snapshot) {
-		return false
-	}
-	return strings.HasPrefix(snapshot, "syncoid_"+identifier+"_")
-}
-
-func datasetOrChild(value, target string) bool {
-	return validReceiverDatasetName(value) &&
-		validReceiverDatasetName(target) &&
-		(value == target || strings.HasPrefix(value, target+"/"))
-}
-
-func splitSnapshotTarget(value string) (string, string, bool) {
-	dataset, snapshot, ok := strings.Cut(value, "@")
-	if !ok || strings.Contains(snapshot, "@") || !validReceiverDatasetName(dataset) || !validReceiverSnapshotName(snapshot) {
-		return "", "", false
-	}
-	return dataset, snapshot, true
-}
-
-func validReceiverDatasetName(dataset string) bool {
-	if dataset == "" ||
-		strings.HasPrefix(dataset, "/") ||
-		strings.HasSuffix(dataset, "/") ||
-		strings.Contains(dataset, "//") ||
-		strings.ContainsAny(dataset, "@# \t\r\n;|&`$()<>\\\"'*?[") {
-		return false
-	}
-	for _, part := range strings.Split(dataset, "/") {
-		if part == "" || part == "." || part == ".." || strings.ContainsFunc(part, unicode.IsControl) {
-			return false
-		}
-	}
-	return true
-}
-
-func validReceiverSnapshotName(snapshot string) bool {
-	if snapshot == "" || snapshot == "." || snapshot == ".." {
-		return false
-	}
-	for _, r := range snapshot {
-		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' ||
-			r == '_' || r == '-' || r == '.' || r == ':' {
-			continue
-		}
-		return false
-	}
-	return true
-}
-
-func validSyncoidIdentifier(identifier string) bool {
-	if identifier == "" {
-		return false
-	}
-	for _, r := range identifier {
-		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' ||
-			r == '_' || r == '-' || r == '.' || r == ':' {
-			continue
-		}
-		return false
-	}
-	return true
-}
-
-func targetPool(dataset string) string {
-	if i := strings.IndexByte(dataset, '/'); i >= 0 {
-		return dataset[:i]
-	}
-	return dataset
 }
 
 func receiverStepHasNoRedirects(step receiverCommandStep) bool {
@@ -907,22 +802,6 @@ func stringSlicesEqual(left, right []string) bool {
 		}
 	}
 	return true
-}
-
-func compressorAllowed(name string) bool {
-	switch name {
-	case "gzip", "pigz", "zstd", "zstdmt", "xz", "lzop", "lz4":
-		return true
-	default:
-		return false
-	}
-}
-
-func compressionDefault(compression string) string {
-	if compression == "" {
-		return "none"
-	}
-	return compression
 }
 
 func executeReceiverCommandPlan(ctx context.Context, cfg forcedCommandConfig, plan receiverCommandPlan) error {

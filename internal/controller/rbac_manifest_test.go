@@ -439,6 +439,15 @@ func TestCRDSchemaExposesSyncoidOptions(t *testing.T) {
 	if !hasValidationRule(runSpec.XKubernetesValidations, "self == oldSelf", "spec is immutable") {
 		t.Fatalf("spec validations = %#v, want immutable spec rule", runSpec.XKubernetesValidations)
 	}
+	statusProps := crd.Spec.Versions[0].Schema.OpenAPIV3Schema.Properties["status"].Properties
+	for _, field := range []string{"senderJobName", "receiveTaskName", "receiverPodName", "receiverPodIP", "sshSecretName"} {
+		if statusProps[field].Type != "string" {
+			t.Fatalf("status.%s schema = %#v, want string", field, statusProps[field])
+		}
+	}
+	if _, ok := statusProps["receiverJobName"]; ok {
+		t.Fatalf("status.receiverJobName is present, want removed")
+	}
 }
 
 func TestReceiveTaskCRDSchemaExposesMVP1Fields(t *testing.T) {

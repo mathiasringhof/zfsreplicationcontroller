@@ -132,7 +132,7 @@ func (r *ZFSReplicationScheduleReconciler) hasActiveRun(ctx context.Context, sch
 		return false, err
 	}
 	for _, run := range runs.Items {
-		if run.Status.Phase != zfsv1.PhaseSucceeded && run.Status.Phase != zfsv1.PhaseFailed {
+		if run.Status.Phase.Active() {
 			return true, nil
 		}
 	}

@@ -5,6 +5,34 @@ import (
 	"fmt"
 	"os"
 	"strings"
+
+	"github.com/mathias/zfsreplicationcontroller/internal/replication"
+)
+
+const (
+	EnvRole              = "ZFSREP_ROLE"
+	EnvSrcDataset        = "SRC_DATASET"
+	EnvDstHost           = "DST_HOST"
+	EnvDstDataset        = "DST_DATASET"
+	EnvSSHKeyFile        = "SSH_KEY_FILE"
+	EnvKnownHostsFile    = "KNOWN_HOSTS_FILE"
+	EnvSSHPort           = "SSH_PORT"
+	EnvNoSyncSnap        = "SYNCOID_NO_SYNC_SNAP"
+	EnvNoRollback        = "SYNCOID_NO_ROLLBACK"
+	EnvForceDelete       = "SYNCOID_FORCE_DELETE"
+	EnvCompress          = "SYNCOID_COMPRESS"
+	EnvSyncoidIdentifier = "SYNCOID_IDENTIFIER"
+	EnvReceiveUnmounted  = "RECEIVE_UNMOUNTED"
+	EnvReceiveResumable  = "RECEIVE_RESUMABLE"
+	EnvIncludeSnaps      = "SYNCOID_INCLUDE_SNAPS"
+	EnvExcludeSnaps      = "SYNCOID_EXCLUDE_SNAPS"
+	EnvExpectedNodeName  = "EXPECTED_NODE_NAME"
+	EnvActualNodeName    = "ACTUAL_NODE_NAME"
+
+	RoleSender            = "sender"
+	DefaultSSHKeyFile     = "/var/run/zfsrep/ssh/id_rsa"
+	DefaultKnownHostsFile = "/var/run/zfsrep/ssh/known_hosts"
+	DefaultSSHPort        = "2222"
 )
 
 type SenderConfig struct {
@@ -28,24 +56,28 @@ type SenderConfig struct {
 }
 
 func SenderConfigFromEnv() SenderConfig {
+	return SenderConfigFromLookup(os.Getenv)
+}
+
+func SenderConfigFromLookup(lookup func(string) string) SenderConfig {
 	return SenderConfig{
-		SrcDataset:        os.Getenv("SRC_DATASET"),
-		DstHost:           os.Getenv("DST_HOST"),
-		DstDataset:        os.Getenv("DST_DATASET"),
-		SSHKeyFile:        os.Getenv("SSH_KEY_FILE"),
-		KnownHostsFile:    os.Getenv("KNOWN_HOSTS_FILE"),
-		SSHPort:           os.Getenv("SSH_PORT"),
-		NoSyncSnap:        boolEnvDefault("SYNCOID_NO_SYNC_SNAP", false),
-		NoRollback:        boolEnvDefault("SYNCOID_NO_ROLLBACK", true),
-		ForceDelete:       boolEnvDefault("SYNCOID_FORCE_DELETE", false),
-		Compress:          getenv("SYNCOID_COMPRESS", "none"),
-		SyncoidIdentifier: os.Getenv("SYNCOID_IDENTIFIER"),
-		ReceiveUnmounted:  getenv("RECEIVE_UNMOUNTED", "true") == "true",
-		ReceiveResumable:  getenv("RECEIVE_RESUMABLE", "true") == "true",
-		IncludeSnaps:      listEnv("SYNCOID_INCLUDE_SNAPS"),
-		ExcludeSnaps:      listEnv("SYNCOID_EXCLUDE_SNAPS"),
-		ExpectedNode:      os.Getenv("EXPECTED_NODE_NAME"),
-		ActualNode:        os.Getenv("ACTUAL_NODE_NAME"),
+		SrcDataset:        lookup(EnvSrcDataset),
+		DstHost:           lookup(EnvDstHost),
+		DstDataset:        lookup(EnvDstDataset),
+		SSHKeyFile:        lookup(EnvSSHKeyFile),
+		KnownHostsFile:    lookup(EnvKnownHostsFile),
+		SSHPort:           lookup(EnvSSHPort),
+		NoSyncSnap:        boolLookupDefault(lookup, EnvNoSyncSnap, false),
+		NoRollback:        boolLookupDefault(lookup, EnvNoRollback, true),
+		ForceDelete:       boolLookupDefault(lookup, EnvForceDelete, false),
+		Compress:          lookupDefault(lookup, EnvCompress, replication.CompressionNone),
+		SyncoidIdentifier: lookup(EnvSyncoidIdentifier),
+		ReceiveUnmounted:  lookupDefault(lookup, EnvReceiveUnmounted, "true") == "true",
+		ReceiveResumable:  lookupDefault(lookup, EnvReceiveResumable, "true") == "true",
+		IncludeSnaps:      listLookup(lookup, EnvIncludeSnaps),
+		ExcludeSnaps:      listLookup(lookup, EnvExcludeSnaps),
+		ExpectedNode:      lookup(EnvExpectedNodeName),
+		ActualNode:        lookup(EnvActualNodeName),
 	}
 }
 
@@ -53,7 +85,7 @@ func RunSender(ctx context.Context, cfg SenderConfig, r CommandRunner) error {
 	if err := validateNode(cfg.ExpectedNode, cfg.ActualNode); err != nil {
 		return err
 	}
-	compress, err := syncoidCompression(cfg.Compress)
+	compress, err := replication.SyncoidCompression(cfg.Compress)
 	if err != nil {
 		return err
 	}
@@ -69,7 +101,7 @@ func RunSender(ctx context.Context, cfg SenderConfig, r CommandRunner) error {
 		args = append(args, "--compress="+compress)
 	}
 	if cfg.SyncoidIdentifier != "" {
-		if !validSyncoidIdentifier(cfg.SyncoidIdentifier) {
+		if !replication.ValidSyncoidIdentifier(cfg.SyncoidIdentifier) {
 			return fmt.Errorf("unsupported syncoid identifier %q", cfg.SyncoidIdentifier)
 		}
 		args = append(args, "--identifier="+cfg.SyncoidIdentifier)
@@ -112,36 +144,6 @@ func RunSender(ctx context.Context, cfg SenderConfig, r CommandRunner) error {
 	return nil
 }
 
-func validSyncoidIdentifier(identifier string) bool {
-	for _, r := range identifier {
-		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' ||
-			r == '_' || r == '-' || r == '.' || r == ':' {
-			continue
-		}
-		return false
-	}
-	return identifier != ""
-}
-
-func syncoidCompression(compress string) (string, error) {
-	switch compress {
-	case "", "none":
-		return "none", nil
-	case "gzip", "xz", "lz4":
-		return compress, nil
-	case "pigz":
-		return "pigz-fast", nil
-	case "zstd":
-		return "zstd-fast", nil
-	case "zstdmt":
-		return "zstdmt-fast", nil
-	case "lzop":
-		return "lzo", nil
-	default:
-		return "", fmt.Errorf("unsupported compression %q", compress)
-	}
-}
-
 func syncoidTarget(host, dataset string) string {
 	if host == "" {
 		return dataset
@@ -149,24 +151,24 @@ func syncoidTarget(host, dataset string) string {
 	return host + ":" + dataset
 }
 
-func getenv(key, def string) string {
-	if v := os.Getenv(key); v != "" {
+func lookupDefault(lookup func(string) string, key, def string) string {
+	if v := lookup(key); v != "" {
 		return v
 	}
 	return def
 }
 
-func boolEnvDefault(key string, def bool) bool {
-	v := os.Getenv(key)
+func boolLookupDefault(lookup func(string) string, key string, def bool) bool {
+	v := lookup(key)
 	if v == "" {
 		return def
 	}
 	return v == "true"
 }
 
-func listEnv(key string) []string {
+func listLookup(lookup func(string) string, key string) []string {
 	var out []string
-	for _, line := range strings.Split(os.Getenv(key), "\n") {
+	for _, line := range strings.Split(lookup(key), "\n") {
 		line = strings.TrimSpace(line)
 		if line != "" {
 			out = append(out, line)

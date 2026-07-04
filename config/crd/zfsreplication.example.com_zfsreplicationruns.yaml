@@ -115,8 +115,6 @@ spec:
                     - Failed
                 senderJobName:
                   type: string
-                receiverJobName:
-                  type: string
                 receiveTaskName:
                   type: string
                 receiverPodName:

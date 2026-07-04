@@ -11,6 +11,8 @@ import (
 	"time"
 
 	zfsv1 "github.com/mathias/zfsreplicationcontroller/api/v1alpha1"
+	"github.com/mathias/zfsreplicationcontroller/internal/datamover"
+	"github.com/mathias/zfsreplicationcontroller/internal/replication"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -35,9 +37,9 @@ func (r *ZFSReplicationRunReconciler) Reconcile(ctx context.Context, req ctrl.Re
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 	names := objectNamesForRun(run.Name)
-	if run.Status.Phase == zfsv1.PhaseSucceeded || run.Status.Phase == zfsv1.PhaseFailed {
+	if run.Status.Phase.Terminal() {
 		return ctrl.Result{}, errors.Join(
-			r.markReceiveTaskTerminal(ctx, &run, names, receiveTaskTerminalPhase(run.Status.Phase), run.Status.LastError),
+			r.markReceiveTaskTerminal(ctx, &run, names, run.Status.Phase.ReceiveTaskTerminalPhase(), run.Status.LastError),
 			r.cleanupRunEphemeralObjects(ctx, &run, names),
 		)
 	}
@@ -411,17 +413,6 @@ func (r *ZFSReplicationRunReconciler) markReceiveTaskTerminal(ctx context.Contex
 	return r.Status().Patch(ctx, copy, client.MergeFrom(&task))
 }
 
-func receiveTaskTerminalPhase(phase zfsv1.Phase) zfsv1.ReceiveTaskPhase {
-	switch phase {
-	case zfsv1.PhaseSucceeded:
-		return zfsv1.ReceiveTaskPhaseCompleted
-	case zfsv1.PhaseFailed:
-		return zfsv1.ReceiveTaskPhaseFailed
-	default:
-		return ""
-	}
-}
-
 func (r *ZFSReplicationRunReconciler) patchRunStatus(ctx context.Context, run *zfsv1.ZFSReplicationRun, mutate func(*zfsv1.ZFSReplicationRunStatus)) error {
 	copy := run.DeepCopy()
 	mutate(&copy.Status)
@@ -447,7 +438,7 @@ func validateRunSpec(spec zfsv1.ZFSReplicationRunSpec) error {
 	if spec.Source.Dataset == "" {
 		return fmt.Errorf("spec.source.dataset must not be empty")
 	}
-	if !validZFSDatasetName(spec.Source.Dataset) {
+	if !replication.ValidDatasetName(spec.Source.Dataset) {
 		return fmt.Errorf("spec.source.dataset must be a valid zfs dataset name")
 	}
 	if spec.Target.NodeName == "" {
@@ -456,49 +447,16 @@ func validateRunSpec(spec zfsv1.ZFSReplicationRunSpec) error {
 	if spec.Target.Dataset == "" {
 		return fmt.Errorf("spec.target.dataset must not be empty")
 	}
-	if !validZFSDatasetName(spec.Target.Dataset) {
+	if !replication.ValidDatasetName(spec.Target.Dataset) {
 		return fmt.Errorf("spec.target.dataset must be a valid zfs dataset name")
 	}
 	if spec.Source.NodeName == spec.Target.NodeName && spec.Source.Dataset == spec.Target.Dataset {
 		return fmt.Errorf("source and target must not reference the same dataset on the same node")
 	}
-	if !compressionSupported(spec.Syncoid.Compress) {
+	if !replication.CompressionSupported(spec.Syncoid.Compress) {
 		return fmt.Errorf("spec.syncoid.compress has unsupported value %q", spec.Syncoid.Compress)
 	}
 	return nil
-}
-
-func compressionDefault(compress string) string {
-	if compress == "" {
-		return "none"
-	}
-	return compress
-}
-
-func compressionSupported(compress string) bool {
-	switch compress {
-	case "", "none", "gzip", "pigz", "zstd", "zstdmt", "xz", "lzop", "lz4":
-		return true
-	default:
-		return false
-	}
-}
-
-func validZFSDatasetName(dataset string) bool {
-	if dataset == "" ||
-		strings.HasPrefix(dataset, "/") ||
-		strings.HasSuffix(dataset, "/") ||
-		strings.Contains(dataset, "//") ||
-		strings.Contains(dataset, "@") ||
-		strings.ContainsAny(dataset, " \t\r\n;|&`$()<>\\") {
-		return false
-	}
-	for _, part := range strings.Split(dataset, "/") {
-		if part == "" || part == "." || part == ".." {
-			return false
-		}
-	}
-	return true
 }
 
 func (r *ZFSReplicationRunReconciler) destinationLocked(ctx context.Context, run *zfsv1.ZFSReplicationRun) (bool, string, error) {
@@ -507,7 +465,7 @@ func (r *ZFSReplicationRunReconciler) destinationLocked(ctx context.Context, run
 		return false, "", err
 	}
 	for _, other := range runs.Items {
-		if other.Name == run.Name || !activeRunPhase(other.Status.Phase) {
+		if other.Name == run.Name || !other.Status.Phase.Active() {
 			continue
 		}
 		if other.Spec.Target.NodeName != run.Spec.Target.NodeName || other.Spec.Target.Dataset != run.Spec.Target.Dataset {
@@ -519,10 +477,6 @@ func (r *ZFSReplicationRunReconciler) destinationLocked(ctx context.Context, run
 		}
 	}
 	return false, "", nil
-}
-
-func activeRunPhase(phase zfsv1.Phase) bool {
-	return phase != zfsv1.PhaseSucceeded && phase != zfsv1.PhaseFailed
 }
 
 func shouldWaitForDestinationRun(run, other *zfsv1.ZFSReplicationRun) bool {
@@ -543,7 +497,6 @@ func fillRunStatusNames(st *zfsv1.ZFSReplicationRunStatus, names runObjects) {
 		st.StartedAt = &now
 	}
 	st.SenderJobName = names.SenderName
-	st.ReceiverJobName = ""
 	st.ReceiveTaskName = names.ReceiveTaskName
 	st.SSHSecretName = names.SecretName
 }
@@ -553,10 +506,7 @@ func objectNamesForRun(runName string) runObjects {
 		labelPrefix + "/run": runName,
 	}
 	return runObjects{
-		BaseName:        sanitizeName("zfsrep", runName),
-		RunName:         runName,
 		SecretName:      sanitizeName("zfsrep", runName, "ssh"),
-		ReceiverName:    sanitizeName("zfsrep", runName, "receiver"),
 		ReceiveTaskName: sanitizeName("zfsrep", runName, "receiver"),
 		SenderName:      sanitizeName("zfsrep", runName, "sender"),
 		Labels:          labels,
@@ -606,7 +556,7 @@ func runReceiveTask(run *zfsv1.ZFSReplicationRun, names runObjects, publicKey st
 				AllowDestroy:             boolDefault(run.Spec.Syncoid.ForceDelete, false),
 				AllowSyncSnapshotDestroy: !boolDefault(run.Spec.Syncoid.NoSyncSnap, false),
 				SyncSnapshotIdentifier:   syncSnapshotIdentifier,
-				Compression:              compressionDefault(run.Spec.Syncoid.Compress),
+				Compression:              replication.CompressionDefault(run.Spec.Syncoid.Compress),
 			},
 		},
 	}
@@ -616,14 +566,14 @@ func runSenderJob(run *zfsv1.ZFSReplicationRun, names runObjects, image, receive
 	labels := cloneLabels(names.Labels)
 	labels[labelPrefix+"/role"] = "sender"
 	env := []corev1.EnvVar{
-		{Name: "ZFSREP_ROLE", Value: "sender"},
-		{Name: "SRC_DATASET", Value: run.Spec.Source.Dataset},
-		{Name: "DST_HOST", Value: fmt.Sprintf("zfs-recv@%s", receiverPodIP)},
-		{Name: "SSH_KEY_FILE", Value: "/var/run/zfsrep/ssh/id_rsa"},
-		{Name: "KNOWN_HOSTS_FILE", Value: "/var/run/zfsrep/ssh/known_hosts"},
-		{Name: "SSH_PORT", Value: "2222"},
-		{Name: "DST_DATASET", Value: run.Spec.Target.Dataset},
-		{Name: "SYNCOID_IDENTIFIER", Value: syncSnapshotIdentifierForRun(run)},
+		{Name: datamover.EnvRole, Value: datamover.RoleSender},
+		{Name: datamover.EnvSrcDataset, Value: run.Spec.Source.Dataset},
+		{Name: datamover.EnvDstHost, Value: fmt.Sprintf("zfs-recv@%s", receiverPodIP)},
+		{Name: datamover.EnvSSHKeyFile, Value: datamover.DefaultSSHKeyFile},
+		{Name: datamover.EnvKnownHostsFile, Value: datamover.DefaultKnownHostsFile},
+		{Name: datamover.EnvSSHPort, Value: datamover.DefaultSSHPort},
+		{Name: datamover.EnvDstDataset, Value: run.Spec.Target.Dataset},
+		{Name: datamover.EnvSyncoidIdentifier, Value: syncSnapshotIdentifierForRun(run)},
 	}
 	env = append(env, syncoidEnv(run.Spec.Syncoid)...)
 	return dataMoverJobForRun(run, names.SenderName, image, labels, run.Spec.Source.NodeName, "/usr/local/bin/zfsrep-sender", env, names.SecretName, false)
@@ -642,14 +592,14 @@ func syncSnapshotIdentifierForRun(run *zfsv1.ZFSReplicationRun) string {
 
 func syncoidEnv(spec zfsv1.SyncoidSpec) []corev1.EnvVar {
 	return []corev1.EnvVar{
-		{Name: "SYNCOID_NO_SYNC_SNAP", Value: strconv.FormatBool(boolDefault(spec.NoSyncSnap, false))},
-		{Name: "SYNCOID_NO_ROLLBACK", Value: strconv.FormatBool(boolDefault(spec.NoRollback, true))},
-		{Name: "SYNCOID_FORCE_DELETE", Value: strconv.FormatBool(boolDefault(spec.ForceDelete, false))},
-		{Name: "SYNCOID_COMPRESS", Value: spec.Compress},
-		{Name: "RECEIVE_UNMOUNTED", Value: strconv.FormatBool(boolDefault(spec.ReceiveUnmounted, true))},
-		{Name: "RECEIVE_RESUMABLE", Value: strconv.FormatBool(boolDefault(spec.ReceiveResumable, true))},
-		{Name: "SYNCOID_INCLUDE_SNAPS", Value: strings.Join(spec.IncludeSnaps, "\n")},
-		{Name: "SYNCOID_EXCLUDE_SNAPS", Value: strings.Join(spec.ExcludeSnaps, "\n")},
+		{Name: datamover.EnvNoSyncSnap, Value: strconv.FormatBool(boolDefault(spec.NoSyncSnap, false))},
+		{Name: datamover.EnvNoRollback, Value: strconv.FormatBool(boolDefault(spec.NoRollback, true))},
+		{Name: datamover.EnvForceDelete, Value: strconv.FormatBool(boolDefault(spec.ForceDelete, false))},
+		{Name: datamover.EnvCompress, Value: spec.Compress},
+		{Name: datamover.EnvReceiveUnmounted, Value: strconv.FormatBool(boolDefault(spec.ReceiveUnmounted, true))},
+		{Name: datamover.EnvReceiveResumable, Value: strconv.FormatBool(boolDefault(spec.ReceiveResumable, true))},
+		{Name: datamover.EnvIncludeSnaps, Value: strings.Join(spec.IncludeSnaps, "\n")},
+		{Name: datamover.EnvExcludeSnaps, Value: strings.Join(spec.ExcludeSnaps, "\n")},
 	}
 }
 

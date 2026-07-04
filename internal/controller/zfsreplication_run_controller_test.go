@@ -8,6 +8,7 @@ import (
 	"time"
 
 	zfsv1 "github.com/mathias/zfsreplicationcontroller/api/v1alpha1"
+	"github.com/mathias/zfsreplicationcontroller/internal/datamover"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -52,6 +53,30 @@ func TestRunReconcileSenderJobUsesSyncoidOptions(t *testing.T) {
 	}
 	if got := envValue(sender, "SYNCOID_EXCLUDE_SNAPS"); got != ".*-tmp$" {
 		t.Fatalf("SYNCOID_EXCLUDE_SNAPS = %q", got)
+	}
+	cfg := datamover.SenderConfigFromLookup(func(name string) string {
+		return envValue(sender, name)
+	})
+	if cfg.SrcDataset != run.Spec.Source.Dataset {
+		t.Fatalf("round-tripped SrcDataset = %q, want %q", cfg.SrcDataset, run.Spec.Source.Dataset)
+	}
+	if cfg.DstDataset != run.Spec.Target.Dataset {
+		t.Fatalf("round-tripped DstDataset = %q, want %q", cfg.DstDataset, run.Spec.Target.Dataset)
+	}
+	if cfg.DstHost != "zfs-recv@10.0.0.42" {
+		t.Fatalf("round-tripped DstHost = %q", cfg.DstHost)
+	}
+	if !cfg.NoSyncSnap || !cfg.NoRollback || cfg.ForceDelete || cfg.Compress != "zstd" {
+		t.Fatalf("round-tripped Syncoid config = %#v", cfg)
+	}
+	if cfg.ReceiveUnmounted || cfg.ReceiveResumable {
+		t.Fatalf("round-tripped receive flags = %#v, want both false", cfg)
+	}
+	if strings.Join(cfg.IncludeSnaps, "\n") != strings.Join(run.Spec.Syncoid.IncludeSnaps, "\n") {
+		t.Fatalf("round-tripped IncludeSnaps = %#v", cfg.IncludeSnaps)
+	}
+	if strings.Join(cfg.ExcludeSnaps, "\n") != strings.Join(run.Spec.Syncoid.ExcludeSnaps, "\n") {
+		t.Fatalf("round-tripped ExcludeSnaps = %#v", cfg.ExcludeSnaps)
 	}
 	if hasEnv(sender, "ZFSREP_MANAGED_SNAPSHOT") {
 		t.Fatalf("sender still has stale ZFSREP_MANAGED_SNAPSHOT env")
@@ -110,7 +135,6 @@ func TestRunReconcileCreatesReceiveTaskBeforeSenderJob(t *testing.T) {
 		t.Fatalf("task sync snapshot identifier = %q, want non-empty shell-safe identifier", task.Spec.Policy.SyncSnapshotIdentifier)
 	}
 	assertObjectDeleted(t, r.Client, &batchv1.Job{}, names.SenderName)
-	assertObjectDeleted(t, r.Client, &batchv1.Job{}, names.ReceiverName)
 }
 
 func TestRunReconcileRetriesCleanupForTerminalRun(t *testing.T) {
@@ -141,7 +165,7 @@ func TestRunReconcileRetriesCleanupForTerminalRun(t *testing.T) {
 				t.Fatalf("second Reconcile() error = %v, want nil", err)
 			}
 			assertObjectDeleted(t, r.Client, &corev1.Secret{}, names.SecretName)
-			assertReceiveTaskPhase(t, r.Client, names.ReceiveTaskName, receiveTaskTerminalPhase(phase))
+			assertReceiveTaskPhase(t, r.Client, names.ReceiveTaskName, phase.ReceiveTaskTerminalPhase())
 		})
 
 		t.Run(string(phase)+"/receiver pod delete failure", func(t *testing.T) {
@@ -173,7 +197,7 @@ func TestRunReconcileRetriesCleanupForTerminalRun(t *testing.T) {
 			}
 			assertObjectDeleted(t, r.Client, &corev1.Pod{}, receiverPod.Name)
 			assertObjectDeleted(t, r.Client, &corev1.Secret{}, names.SecretName)
-			assertReceiveTaskPhase(t, r.Client, names.ReceiveTaskName, receiveTaskTerminalPhase(phase))
+			assertReceiveTaskPhase(t, r.Client, names.ReceiveTaskName, phase.ReceiveTaskTerminalPhase())
 		})
 	}
 }
@@ -261,6 +285,26 @@ func TestRunValidationRejectsSameDatasetOnSameNode(t *testing.T) {
 	err := validateRunSpec(spec)
 	if err == nil || err.Error() != "source and target must not reference the same dataset on the same node" {
 		t.Fatalf("validateRunSpec() error = %v", err)
+	}
+}
+
+func TestRunValidationRejectsReceiverUnsafeDatasets(t *testing.T) {
+	for _, dataset := range []string{
+		"tank/a#b",
+		"tank/a*b",
+		"tank/a\"b",
+		"tank/a[b",
+		"tank/a\x01b",
+	} {
+		t.Run(dataset, func(t *testing.T) {
+			spec := replicationRun("manual-1").Spec
+			spec.Target.Dataset = dataset
+
+			err := validateRunSpec(spec)
+			if err == nil || !strings.Contains(err.Error(), "spec.target.dataset") {
+				t.Fatalf("validateRunSpec() error = %v, want target dataset rejection", err)
+			}
+		})
 	}
 }
 

@@ -12,10 +12,7 @@ import (
 const labelPrefix = "zfsreplication.example.com"
 
 type runObjects struct {
-	BaseName        string
-	RunName         string
 	SecretName      string
-	ReceiverName    string
 	ReceiveTaskName string
 	SenderName      string
 	Labels          map[string]string

@@ -163,6 +163,54 @@ func TestSenderConfigFromEnvExplicitValuesOverrideDefaults(t *testing.T) {
 	}
 }
 
+func TestSenderConfigFromLookupParsesControllerEnvContract(t *testing.T) {
+	values := map[string]string{
+		EnvSrcDataset:        "tank/src",
+		EnvDstHost:           "zfs-recv@10.0.0.42",
+		EnvDstDataset:        "tank/dst",
+		EnvSSHKeyFile:        DefaultSSHKeyFile,
+		EnvKnownHostsFile:    DefaultKnownHostsFile,
+		EnvSSHPort:           DefaultSSHPort,
+		EnvNoSyncSnap:        "true",
+		EnvNoRollback:        "false",
+		EnvForceDelete:       "true",
+		EnvCompress:          "zstd",
+		EnvSyncoidIdentifier: "zrc-123",
+		EnvReceiveUnmounted:  "false",
+		EnvReceiveResumable:  "false",
+		EnvIncludeSnaps:      "^snap-.*\n^manual$",
+		EnvExcludeSnaps:      ".*-tmp$",
+		EnvExpectedNodeName:  "worker-a",
+		EnvActualNodeName:    "worker-a",
+	}
+
+	cfg := SenderConfigFromLookup(func(key string) string {
+		return values[key]
+	})
+
+	if cfg.SrcDataset != "tank/src" || cfg.DstHost != "zfs-recv@10.0.0.42" || cfg.DstDataset != "tank/dst" {
+		t.Fatalf("dataset/host config = %#v", cfg)
+	}
+	if cfg.SSHKeyFile != DefaultSSHKeyFile || cfg.KnownHostsFile != DefaultKnownHostsFile || cfg.SSHPort != DefaultSSHPort {
+		t.Fatalf("ssh config = %#v", cfg)
+	}
+	if !cfg.NoSyncSnap || cfg.NoRollback || !cfg.ForceDelete || cfg.Compress != "zstd" || cfg.SyncoidIdentifier != "zrc-123" {
+		t.Fatalf("syncoid config = %#v", cfg)
+	}
+	if cfg.ReceiveUnmounted || cfg.ReceiveResumable {
+		t.Fatalf("receive flags = %#v, want both false", cfg)
+	}
+	if strings.Join(cfg.IncludeSnaps, " ") != "^snap-.* ^manual$" {
+		t.Fatalf("IncludeSnaps = %#v", cfg.IncludeSnaps)
+	}
+	if strings.Join(cfg.ExcludeSnaps, " ") != ".*-tmp$" {
+		t.Fatalf("ExcludeSnaps = %#v", cfg.ExcludeSnaps)
+	}
+	if cfg.ExpectedNode != "worker-a" || cfg.ActualNode != "worker-a" {
+		t.Fatalf("node config = %#v", cfg)
+	}
+}
+
 func TestSenderExitsBeforeWorkWhenNodeMismatch(t *testing.T) {
 	runner := &fakeRunner{}
 	err := RunSender(context.Background(), SenderConfig{
