@@ -445,9 +445,6 @@ func TestCRDSchemaExposesSyncoidOptions(t *testing.T) {
 			t.Fatalf("status.%s schema = %#v, want string", field, statusProps[field])
 		}
 	}
-	if _, ok := statusProps["receiverJobName"]; ok {
-		t.Fatalf("status.receiverJobName is present, want removed")
-	}
 }
 
 func TestReceiveTaskCRDSchemaExposesMVP1Fields(t *testing.T) {

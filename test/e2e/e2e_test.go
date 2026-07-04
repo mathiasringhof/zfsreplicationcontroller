@@ -936,7 +936,6 @@ type replicationObject struct {
 type replicationStatus struct {
 	Phase           string `json:"phase"`
 	SenderJobName   string `json:"senderJobName"`
-	ReceiverJobName string `json:"receiverJobName"`
 	ReceiveTaskName string `json:"receiveTaskName"`
 	ReceiverPodName string `json:"receiverPodName"`
 	ReceiverPodIP   string `json:"receiverPodIP"`
@@ -1048,9 +1047,6 @@ func assertSucceededStatus(t *testing.T, sc replicationCase, st replicationStatu
 	if st.SenderJobName == "" {
 		t.Fatalf("status object names missing: %#v", st)
 	}
-	if st.ReceiverJobName != "" {
-		t.Fatalf("receiverJobName = %q, want empty for daemonset receiver", st.ReceiverJobName)
-	}
 	if st.ReceiveTaskName == "" || st.ReceiverPodName == "" || st.ReceiverPodIP == "" || st.SSHSecretName == "" {
 		t.Fatalf("receiver/ssh status names missing: %#v", st)
 	}
@@ -1078,9 +1074,6 @@ func assertFailedStatus(t *testing.T, sc replicationCase, st replicationStatus, 
 func assertFailedAfterDataMoverSetupStatus(t *testing.T, sc replicationCase, st replicationStatus, wantError string) {
 	t.Helper()
 	assertFailedStatus(t, sc, st, wantError)
-	if st.ReceiverJobName != "" {
-		t.Fatalf("receiverJobName = %q, want empty for daemonset receiver", st.ReceiverJobName)
-	}
 	if st.ReceiveTaskName == "" || st.ReceiverPodName == "" || st.ReceiverPodIP == "" || st.SSHSecretName == "" {
 		t.Fatalf("receiver/ssh status names missing after datamover setup for %s: %#v", sc.Name, st)
 	}

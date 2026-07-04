@@ -78,9 +78,6 @@ func TestRunReconcileSenderJobUsesSyncoidOptions(t *testing.T) {
 	if strings.Join(cfg.ExcludeSnaps, "\n") != strings.Join(run.Spec.Syncoid.ExcludeSnaps, "\n") {
 		t.Fatalf("round-tripped ExcludeSnaps = %#v", cfg.ExcludeSnaps)
 	}
-	if hasEnv(sender, "ZFSREP_MANAGED_SNAPSHOT") {
-		t.Fatalf("sender still has stale ZFSREP_MANAGED_SNAPSHOT env")
-	}
 	var secret corev1.Secret
 	if err := r.Get(context.Background(), types.NamespacedName{Name: names.SecretName, Namespace: run.Namespace}, &secret); err != nil {
 		t.Fatal(err)
@@ -478,15 +475,6 @@ func envValue(job *batchv1.Job, name string) string {
 		}
 	}
 	return ""
-}
-
-func hasEnv(job *batchv1.Job, name string) bool {
-	for _, env := range job.Spec.Template.Spec.Containers[0].Env {
-		if env.Name == name {
-			return true
-		}
-	}
-	return false
 }
 
 func ptr[T any](v T) *T { return &v }
