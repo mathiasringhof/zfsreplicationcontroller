@@ -425,16 +425,58 @@ func validateRunSpec(spec zfsv1.ZFSReplicationRunSpec) error {
 	if spec.Source.Dataset == "" {
 		return fmt.Errorf("spec.source.dataset must not be empty")
 	}
+	if !validZFSDatasetName(spec.Source.Dataset) {
+		return fmt.Errorf("spec.source.dataset must be a valid zfs dataset name")
+	}
 	if spec.Target.NodeName == "" {
 		return fmt.Errorf("spec.target.nodeName must not be empty")
 	}
 	if spec.Target.Dataset == "" {
 		return fmt.Errorf("spec.target.dataset must not be empty")
 	}
+	if !validZFSDatasetName(spec.Target.Dataset) {
+		return fmt.Errorf("spec.target.dataset must be a valid zfs dataset name")
+	}
 	if spec.Source.NodeName == spec.Target.NodeName && spec.Source.Dataset == spec.Target.Dataset {
 		return fmt.Errorf("source and target must not reference the same dataset on the same node")
 	}
+	if !compressionSupported(spec.Syncoid.Compress) {
+		return fmt.Errorf("spec.syncoid.compress has unsupported value %q", spec.Syncoid.Compress)
+	}
 	return nil
+}
+
+func compressionDefault(compress string) string {
+	if compress == "" {
+		return "none"
+	}
+	return compress
+}
+
+func compressionSupported(compress string) bool {
+	switch compress {
+	case "", "none", "gzip", "pigz", "zstd", "zstdmt", "xz", "lzop", "lz4":
+		return true
+	default:
+		return false
+	}
+}
+
+func validZFSDatasetName(dataset string) bool {
+	if dataset == "" ||
+		strings.HasPrefix(dataset, "/") ||
+		strings.HasSuffix(dataset, "/") ||
+		strings.Contains(dataset, "//") ||
+		strings.Contains(dataset, "@") ||
+		strings.ContainsAny(dataset, " \t\r\n;|&`$()<>\\") {
+		return false
+	}
+	for _, part := range strings.Split(dataset, "/") {
+		if part == "" || part == "." || part == ".." {
+			return false
+		}
+	}
+	return true
 }
 
 func (r *ZFSReplicationRunReconciler) destinationLocked(ctx context.Context, run *zfsv1.ZFSReplicationRun) (bool, string, error) {
@@ -535,8 +577,12 @@ func runReceiveTask(run *zfsv1.ZFSReplicationRun, names runObjects, publicKey st
 				ExpiresAt:           expiresAt,
 			},
 			Policy: zfsv1.ReceiveTaskPolicy{
-				ReceiveUnmounted: boolDefault(run.Spec.Syncoid.ReceiveUnmounted, true),
-				AllowRollback:    !boolDefault(run.Spec.Syncoid.NoRollback, true),
+				ReceiveUnmounted:         boolDefault(run.Spec.Syncoid.ReceiveUnmounted, true),
+				ReceiveResumable:         boolDefault(run.Spec.Syncoid.ReceiveResumable, true),
+				AllowRollback:            !boolDefault(run.Spec.Syncoid.NoRollback, true),
+				AllowDestroy:             boolDefault(run.Spec.Syncoid.ForceDelete, false),
+				AllowSyncSnapshotDestroy: !boolDefault(run.Spec.Syncoid.NoSyncSnap, false),
+				Compression:              compressionDefault(run.Spec.Syncoid.Compress),
 			},
 		},
 	}

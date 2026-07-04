@@ -43,7 +43,7 @@ func TestSenderRunsSyncoidWithConfiguredSnapshotOptions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := "--no-sync-snap --no-rollback --no-privilege-elevation --compress=zstd --sshoption=UserKnownHostsFile=/var/run/zfsrep/ssh/known_hosts --sshoption=StrictHostKeyChecking=yes --sshoption=IdentitiesOnly=yes --sshkey=/var/run/zfsrep/ssh/id_rsa --sshport=2222 --no-resume --include-snaps=^snap-.* --include-snaps=^manual$ --exclude-snaps=.*-tmp$ tank/src root@10.0.0.42:tank/dst"
+	want := "--no-sync-snap --no-rollback --no-privilege-elevation --compress=zstd-fast --sshoption=UserKnownHostsFile=/var/run/zfsrep/ssh/known_hosts --sshoption=StrictHostKeyChecking=yes --sshoption=IdentitiesOnly=yes --sshkey=/var/run/zfsrep/ssh/id_rsa --sshport=2222 --no-resume --include-snaps=^snap-.* --include-snaps=^manual$ --exclude-snaps=.*-tmp$ tank/src root@10.0.0.42:tank/dst"
 	if !hasNamedCall(runner.calls, "syncoid", want) {
 		t.Fatalf("syncoid was not called with %q: %#v", want, runner.calls)
 	}
@@ -189,6 +189,67 @@ func TestSenderPassesForceDelete(t *testing.T) {
 	want := "--no-rollback --no-privilege-elevation --compress=none --sshoption=UserKnownHostsFile=/var/run/zfsrep/ssh/known_hosts --sshoption=StrictHostKeyChecking=yes --sshoption=IdentitiesOnly=yes --sshkey=/var/run/zfsrep/ssh/id_rsa --sshport=2222 --recvoptions=u --force-delete tank/src root@10.0.0.42:tank/dst"
 	if !hasNamedCall(runner.calls, "syncoid", want) {
 		t.Fatalf("force-delete syncoid call missing %q: %#v", want, runner.calls)
+	}
+}
+
+func TestSenderRejectsUnknownCompression(t *testing.T) {
+	runner := &fakeRunner{}
+	err := RunSender(context.Background(), SenderConfig{
+		SrcDataset:       "tank/src",
+		DstHost:          "root@10.0.0.42",
+		DstDataset:       "tank/dst",
+		SSHKeyFile:       "/var/run/zfsrep/ssh/id_rsa",
+		KnownHostsFile:   "/var/run/zfsrep/ssh/known_hosts",
+		SSHPort:          "2222",
+		NoRollback:       true,
+		Compress:         "sh",
+		ReceiveUnmounted: true,
+		ReceiveResumable: true,
+	}, runner)
+	if err == nil || !strings.Contains(err.Error(), "unsupported compression") {
+		t.Fatalf("RunSender() error = %v, want unsupported compression", err)
+	}
+	if len(runner.calls) != 0 {
+		t.Fatalf("syncoid calls = %#v, want none", runner.calls)
+	}
+}
+
+func TestSenderNormalizesCompressionAliasesForSyncoid(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		compress string
+		want     string
+	}{
+		{name: "none", compress: "none", want: "--compress=none"},
+		{name: "pigz", compress: "pigz", want: "--compress=pigz-fast"},
+		{name: "zstd", compress: "zstd", want: "--compress=zstd-fast"},
+		{name: "zstdmt", compress: "zstdmt", want: "--compress=zstdmt-fast"},
+		{name: "lzop", compress: "lzop", want: "--compress=lzo"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			runner := &fakeRunner{}
+			err := RunSender(context.Background(), SenderConfig{
+				SrcDataset:       "tank/src",
+				DstHost:          "root@10.0.0.42",
+				DstDataset:       "tank/dst",
+				SSHKeyFile:       "/var/run/zfsrep/ssh/id_rsa",
+				KnownHostsFile:   "/var/run/zfsrep/ssh/known_hosts",
+				SSHPort:          "2222",
+				NoRollback:       true,
+				Compress:         tt.compress,
+				ReceiveUnmounted: true,
+				ReceiveResumable: true,
+			}, runner)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(runner.calls) != 1 {
+				t.Fatalf("calls = %#v, want one syncoid call", runner.calls)
+			}
+			if !strings.Contains(strings.Join(runner.calls[0].args, " "), tt.want) {
+				t.Fatalf("syncoid args = %q, want %q", strings.Join(runner.calls[0].args, " "), tt.want)
+			}
+		})
 	}
 }
 

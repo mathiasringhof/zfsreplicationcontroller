@@ -51,6 +51,10 @@ func RunSender(ctx context.Context, cfg SenderConfig, r CommandRunner) error {
 	if err := validateNode(cfg.ExpectedNode, cfg.ActualNode); err != nil {
 		return err
 	}
+	compress, err := syncoidCompression(cfg.Compress)
+	if err != nil {
+		return err
+	}
 	var args []string
 	if cfg.NoSyncSnap {
 		args = append(args, "--no-sync-snap")
@@ -59,8 +63,8 @@ func RunSender(ctx context.Context, cfg SenderConfig, r CommandRunner) error {
 		args = append(args, "--no-rollback")
 	}
 	args = append(args, "--no-privilege-elevation")
-	if cfg.Compress != "" {
-		args = append(args, "--compress="+cfg.Compress)
+	if compress != "" {
+		args = append(args, "--compress="+compress)
 	}
 	if cfg.DstHost != "" && cfg.KnownHostsFile == "" {
 		return fmt.Errorf("known hosts file is required for SSH replication")
@@ -98,6 +102,25 @@ func RunSender(ctx context.Context, cfg SenderConfig, r CommandRunner) error {
 		return fmt.Errorf("syncoid failed: %s", clean(stderr, err))
 	}
 	return nil
+}
+
+func syncoidCompression(compress string) (string, error) {
+	switch compress {
+	case "", "none":
+		return "none", nil
+	case "gzip", "xz", "lz4":
+		return compress, nil
+	case "pigz":
+		return "pigz-fast", nil
+	case "zstd":
+		return "zstd-fast", nil
+	case "zstdmt":
+		return "zstdmt-fast", nil
+	case "lzop":
+		return "lzo", nil
+	default:
+		return "", fmt.Errorf("unsupported compression %q", compress)
+	}
 }
 
 func syncoidTarget(host, dataset string) string {

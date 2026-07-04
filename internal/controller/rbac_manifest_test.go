@@ -479,6 +479,15 @@ func TestReceiveTaskCRDSchemaExposesMVP1Fields(t *testing.T) {
 	if spec.Properties["policy"].Properties["allowRollback"].Type != "boolean" {
 		t.Fatalf("allowRollback schema = %#v", spec.Properties["policy"].Properties["allowRollback"])
 	}
+	if spec.Properties["policy"].Properties["receiveResumable"].Type != "boolean" {
+		t.Fatalf("receiveResumable schema = %#v", spec.Properties["policy"].Properties["receiveResumable"])
+	}
+	if spec.Properties["policy"].Properties["allowSyncSnapshotDestroy"].Type != "boolean" {
+		t.Fatalf("allowSyncSnapshotDestroy schema = %#v", spec.Properties["policy"].Properties["allowSyncSnapshotDestroy"])
+	}
+	if spec.Properties["policy"].Properties["compression"].Type != "string" {
+		t.Fatalf("compression schema = %#v", spec.Properties["policy"].Properties["compression"])
+	}
 	status := crd.Spec.Versions[0].Schema.OpenAPIV3Schema.Properties["status"]
 	if status.Properties["endpoint"].Properties["host"].Type != "string" {
 		t.Fatalf("endpoint.host schema = %#v", status.Properties["endpoint"].Properties["host"])

@@ -88,10 +88,13 @@ type ReceiveTaskSSHSpec struct {
 }
 
 type ReceiveTaskPolicy struct {
-	ReceiveUnmounted bool `json:"receiveUnmounted"`
-	AllowRollback    bool `json:"allowRollback,omitempty"`
-	AllowDestroy     bool `json:"allowDestroy,omitempty"`
-	AllowMount       bool `json:"allowMount,omitempty"`
+	ReceiveUnmounted         bool   `json:"receiveUnmounted"`
+	ReceiveResumable         bool   `json:"receiveResumable,omitempty"`
+	AllowRollback            bool   `json:"allowRollback,omitempty"`
+	AllowDestroy             bool   `json:"allowDestroy,omitempty"`
+	AllowMount               bool   `json:"allowMount,omitempty"`
+	AllowSyncSnapshotDestroy bool   `json:"allowSyncSnapshotDestroy,omitempty"`
+	Compression              string `json:"compression,omitempty"`
 }
 
 type ZFSReceiveTaskSpec struct {

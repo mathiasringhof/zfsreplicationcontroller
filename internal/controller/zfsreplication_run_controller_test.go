@@ -94,6 +94,15 @@ func TestRunReconcileCreatesReceiveTaskBeforeSenderJob(t *testing.T) {
 	if task.Spec.Policy.AllowRollback {
 		t.Fatal("task allows rollback by default")
 	}
+	if task.Spec.Policy.ReceiveResumable {
+		t.Fatal("task allows resumable receive when the run disabled it")
+	}
+	if task.Spec.Policy.AllowSyncSnapshotDestroy {
+		t.Fatal("task allows Syncoid snapshot pruning when noSyncSnap is true")
+	}
+	if task.Spec.Policy.Compression != "zstd" {
+		t.Fatalf("task compression = %q, want zstd", task.Spec.Policy.Compression)
+	}
 	assertObjectDeleted(t, r.Client, &batchv1.Job{}, names.SenderName)
 	assertObjectDeleted(t, r.Client, &batchv1.Job{}, names.ReceiverName)
 }

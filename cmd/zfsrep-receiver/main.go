@@ -38,6 +38,21 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	if len(os.Args) > 1 && os.Args[1] == "exec" {
+		if err := runForcedCommandFromArgs(ctx, os.Args[2:]); err != nil {
+			var exitErr forcedCommandExitError
+			if errors.As(err, &exitErr) {
+				if exitErr.Error() != "" {
+					fmt.Fprintln(os.Stderr, exitErr)
+				}
+				os.Exit(exitErr.ExitCode())
+			}
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(126)
+		}
+		return
+	}
+
 	if err := run(ctx, configFromEnv()); err != nil {
 		log.Fatal(err)
 	}
@@ -68,6 +83,12 @@ func run(ctx context.Context, cfg receiverConfig) error {
 	}
 	if err := os.Chmod(filepath.Dir(cfg.AuthorizedKeysFile), 0o700); err != nil {
 		return fmt.Errorf("set authorized_keys directory mode: %w", err)
+	}
+	if err := os.MkdirAll(receiverPolicyDir(cfg), 0o700); err != nil {
+		return fmt.Errorf("create receiver policy directory: %w", err)
+	}
+	if err := os.Chmod(receiverPolicyDir(cfg), 0o700); err != nil {
+		return fmt.Errorf("set receiver policy directory mode: %w", err)
 	}
 	if err := os.MkdirAll("/run/sshd", 0o755); err != nil {
 		return fmt.Errorf("create sshd runtime directory: %w", err)
@@ -176,6 +197,7 @@ func reconcileReceiveTasks(ctx context.Context, kubeClient client.Client, cfg re
 
 	now := time.Now()
 	activeKeys := map[string]struct{}{}
+	activePolicies := map[string]receiverCommandPolicy{}
 	var readyTasks []*zfsv1.ZFSReceiveTask
 	for i := range tasks.Items {
 		task := &tasks.Items[i]
@@ -204,10 +226,15 @@ func reconcileReceiveTasks(ctx context.Context, kubeClient client.Client, cfg re
 			}
 			continue
 		}
-		activeKeys["restrict "+key] = struct{}{}
+		auth := receiveTaskAuthorization(cfg, task)
+		activeKeys[auth.AuthorizedKey] = struct{}{}
+		activePolicies[auth.PolicyPath] = auth.Policy
 		readyTasks = append(readyTasks, task)
 	}
 
+	if err := writeReceiverPolicies(receiverPolicyDir(cfg), activePolicies); err != nil {
+		return err
+	}
 	keys := make([]string, 0, len(activeKeys))
 	for key := range activeKeys {
 		keys = append(keys, key)

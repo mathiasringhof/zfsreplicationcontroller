@@ -78,6 +78,9 @@ spec:
                     receiveUnmounted:
                       type: boolean
                       default: true
+                    receiveResumable:
+                      type: boolean
+                      default: true
                     allowRollback:
                       type: boolean
                       default: false
@@ -87,6 +90,21 @@ spec:
                     allowMount:
                       type: boolean
                       default: false
+                    allowSyncSnapshotDestroy:
+                      type: boolean
+                      default: false
+                    compression:
+                      type: string
+                      default: none
+                      enum:
+                        - none
+                        - gzip
+                        - pigz
+                        - zstd
+                        - zstdmt
+                        - xz
+                        - lzop
+                        - lz4
             status:
               type: object
               properties:
