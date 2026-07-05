@@ -28,7 +28,7 @@ const (
 	e2eSourceNode = "worker-a"
 	e2eTargetNode = "worker-b"
 
-	e2eLabelPrefix = "zfsreplication.example.com"
+	e2eLabelPrefix = "zfsreplication.ringhof.io"
 
 	e2eReceiveTaskPhaseCompleted = "Completed"
 	e2eReceiveTaskPhaseFailed    = "Failed"
@@ -209,19 +209,19 @@ func TestE2EControllerServiceAccountRBAC(t *testing.T) {
 		resource    string
 		subresource string
 	}{
-		{verb: "get", resource: "zfsreplicationruns.zfsreplication.example.com"},
-		{verb: "list", resource: "zfsreplicationruns.zfsreplication.example.com"},
-		{verb: "watch", resource: "zfsreplicationruns.zfsreplication.example.com"},
-		{verb: "create", resource: "zfsreplicationruns.zfsreplication.example.com"},
-		{verb: "get", resource: "zfsreplicationruns.zfsreplication.example.com", subresource: "status"},
-		{verb: "update", resource: "zfsreplicationruns.zfsreplication.example.com", subresource: "status"},
-		{verb: "patch", resource: "zfsreplicationruns.zfsreplication.example.com", subresource: "status"},
-		{verb: "get", resource: "zfsreplicationschedules.zfsreplication.example.com"},
-		{verb: "list", resource: "zfsreplicationschedules.zfsreplication.example.com"},
-		{verb: "watch", resource: "zfsreplicationschedules.zfsreplication.example.com"},
-		{verb: "get", resource: "zfsreplicationschedules.zfsreplication.example.com", subresource: "status"},
-		{verb: "update", resource: "zfsreplicationschedules.zfsreplication.example.com", subresource: "status"},
-		{verb: "patch", resource: "zfsreplicationschedules.zfsreplication.example.com", subresource: "status"},
+		{verb: "get", resource: "zfsreplicationruns.zfsreplication.ringhof.io"},
+		{verb: "list", resource: "zfsreplicationruns.zfsreplication.ringhof.io"},
+		{verb: "watch", resource: "zfsreplicationruns.zfsreplication.ringhof.io"},
+		{verb: "create", resource: "zfsreplicationruns.zfsreplication.ringhof.io"},
+		{verb: "get", resource: "zfsreplicationruns.zfsreplication.ringhof.io", subresource: "status"},
+		{verb: "update", resource: "zfsreplicationruns.zfsreplication.ringhof.io", subresource: "status"},
+		{verb: "patch", resource: "zfsreplicationruns.zfsreplication.ringhof.io", subresource: "status"},
+		{verb: "get", resource: "zfsreplicationschedules.zfsreplication.ringhof.io"},
+		{verb: "list", resource: "zfsreplicationschedules.zfsreplication.ringhof.io"},
+		{verb: "watch", resource: "zfsreplicationschedules.zfsreplication.ringhof.io"},
+		{verb: "get", resource: "zfsreplicationschedules.zfsreplication.ringhof.io", subresource: "status"},
+		{verb: "update", resource: "zfsreplicationschedules.zfsreplication.ringhof.io", subresource: "status"},
+		{verb: "patch", resource: "zfsreplicationschedules.zfsreplication.ringhof.io", subresource: "status"},
 		{verb: "create", resource: "jobs.batch"},
 		{verb: "get", resource: "jobs.batch"},
 		{verb: "list", resource: "jobs.batch"},
@@ -320,7 +320,7 @@ func (c replicationCase) manifestJSONInNamespace(t *testing.T, namespace string)
 		metadata["annotations"] = c.Annotations
 	}
 	doc := map[string]any{
-		"apiVersion": "zfsreplication.example.com/v1alpha1",
+		"apiVersion": "zfsreplication.ringhof.io/v1alpha1",
 		"kind":       "ZFSReplicationRun",
 		"metadata":   metadata,
 		"spec": map[string]any{
@@ -1078,7 +1078,7 @@ func assertFailedAfterDataMoverSetupStatus(t *testing.T, sc replicationCase, st 
 func receiveTaskManifest(t *testing.T, namespace string, sc replicationCase) []byte {
 	t.Helper()
 	doc := map[string]any{
-		"apiVersion": "zfsreplication.example.com/v1alpha1",
+		"apiVersion": "zfsreplication.ringhof.io/v1alpha1",
 		"kind":       "ZFSReceiveTask",
 		"metadata": map[string]any{
 			"name":      runObjectName(sc.Name, "receiver"),

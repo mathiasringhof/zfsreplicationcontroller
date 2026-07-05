@@ -93,6 +93,31 @@ func TestContainerWorkflowGatesTagReleasePublication(t *testing.T) {
 	}
 }
 
+func TestE2EScriptsUseFullyQualifiedCustomResources(t *testing.T) {
+	t.Parallel()
+
+	for _, script := range []string{
+		"../../test/e2e/collect.sh",
+		"../../test/e2e/status.sh",
+	} {
+		contents := artifactReadFile(t, script)
+		for _, want := range []string{
+			"zfsreceivetasks.zfsreplication.ringhof.io",
+			"zfsreplicationruns.zfsreplication.ringhof.io",
+			"zfsreplicationschedules.zfsreplication.ringhof.io",
+		} {
+			artifactRequireContains(t, script, contents, want)
+		}
+		for _, forbidden := range []string{
+			"get zfsreceivetasks ",
+			"get zfsreplicationruns ",
+			"get zfsreplicationschedules ",
+		} {
+			artifactRequireNotContains(t, script, contents, forbidden)
+		}
+	}
+}
+
 func artifactReadFile(t *testing.T, path string) string {
 	t.Helper()
 	data, err := os.ReadFile(path)

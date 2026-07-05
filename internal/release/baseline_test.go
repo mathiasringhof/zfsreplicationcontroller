@@ -7,6 +7,7 @@ import (
 	"go/token"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -31,7 +32,10 @@ func TestSupportedDependencyBaseline(t *testing.T) {
 
 	requireEqual(t, "Dockerfile first line", firstLine(files["Dockerfile"]), "FROM docker.io/library/golang:1.26.4 AS build")
 	requireContains(t, "test/e2e/env.sh", files["test/e2e/env.sh"], `K3S_VERSION="${E2E_K3S_VERSION:-v1.35.6+k3s1}"`)
-	requireEqual(t, "api/v1alpha1 Version const", versionConst(t, "../../api/v1alpha1/groupversion_info.go"), "v1alpha1")
+	group, version := groupVersionConsts(t, "../../api/v1alpha1/groupversion_info.go")
+	requireEqual(t, "api/v1alpha1 Group const", group, "zfsreplication.ringhof.io")
+	requireEqual(t, "api/v1alpha1 Version const", version, "v1alpha1")
+	requireNoOldAPIGroupReferences(t)
 }
 
 func readFile(t *testing.T, path string) string {
@@ -117,7 +121,7 @@ func requireContains(t *testing.T, name, haystack, needle string) {
 	}
 }
 
-func versionConst(t *testing.T, path string) string {
+func groupVersionConsts(t *testing.T, path string) (string, string) {
 	t.Helper()
 	file, err := parser.ParseFile(token.NewFileSet(), path, nil, 0)
 	if err != nil {
@@ -126,6 +130,7 @@ func versionConst(t *testing.T, path string) string {
 	if file.Name.Name != "v1alpha1" {
 		t.Fatalf("%s package = %q, want %q", path, file.Name.Name, "v1alpha1")
 	}
+	constants := make(map[string]string)
 	for _, decl := range file.Decls {
 		general, ok := decl.(*ast.GenDecl)
 		if !ok || general.Tok != token.CONST {
@@ -137,24 +142,59 @@ func versionConst(t *testing.T, path string) string {
 				continue
 			}
 			for i, name := range value.Names {
-				if name.Name != "Version" {
+				if name.Name != "Group" && name.Name != "Version" {
 					continue
 				}
 				if i >= len(value.Values) {
-					t.Fatalf("%s Version const has no value", path)
+					t.Fatalf("%s %s const has no value", path, name.Name)
 				}
 				lit, ok := value.Values[i].(*ast.BasicLit)
 				if !ok || lit.Kind != token.STRING {
-					t.Fatalf("%s Version const is not a string literal", path)
+					t.Fatalf("%s %s const is not a string literal", path, name.Name)
 				}
-				version, err := strconv.Unquote(lit.Value)
+				constValue, err := strconv.Unquote(lit.Value)
 				if err != nil {
-					t.Fatalf("unquote %s Version const: %v", path, err)
+					t.Fatalf("unquote %s %s const: %v", path, name.Name, err)
 				}
-				return version
+				constants[name.Name] = constValue
 			}
 		}
 	}
-	t.Fatalf("%s missing Version const", path)
-	return ""
+	if constants["Group"] == "" {
+		t.Fatalf("%s missing Group const", path)
+	}
+	if constants["Version"] == "" {
+		t.Fatalf("%s missing Version const", path)
+	}
+	return constants["Group"], constants["Version"]
+}
+
+func requireNoOldAPIGroupReferences(t *testing.T) {
+	t.Helper()
+	oldAPIGroup := "zfsreplication." + "example.com"
+	root := filepath.Clean("../..")
+
+	cmd := exec.Command("git", "ls-files", "-z", "--cached", "--others", "--exclude-standard")
+	cmd.Dir = root
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("list repository files: %v", err)
+	}
+
+	for _, file := range strings.Split(string(out), "\x00") {
+		if file == "" {
+			continue
+		}
+		path := filepath.Join(root, file)
+		contents, err := os.ReadFile(path)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			t.Fatalf("read %s: %v", path, err)
+		}
+		if strings.Contains(string(contents), oldAPIGroup) {
+			t.Fatalf("%s still references %s", path, oldAPIGroup)
+		}
+	}
 }

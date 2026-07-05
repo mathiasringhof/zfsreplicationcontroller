@@ -5,7 +5,7 @@ metadata:
   namespace: zfsreplication-smoke
 rules:
   - apiGroups:
-      - zfsreplication.example.com
+      - zfsreplication.ringhof.io
     resources:
       - zfsreplicationschedules
     verbs:
@@ -13,7 +13,7 @@ rules:
       - list
       - watch
   - apiGroups:
-      - zfsreplication.example.com
+      - zfsreplication.ringhof.io
     resources:
       - zfsreceivetasks
       - zfsreplicationruns
@@ -23,7 +23,7 @@ rules:
       - list
       - watch
   - apiGroups:
-      - zfsreplication.example.com
+      - zfsreplication.ringhof.io
     resources:
       - zfsreceivetasks/status
       - zfsreplicationruns/status

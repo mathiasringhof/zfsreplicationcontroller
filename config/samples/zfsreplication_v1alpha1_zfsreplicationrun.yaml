@@ -1,4 +1,4 @@
-apiVersion: zfsreplication.example.com/v1alpha1
+apiVersion: zfsreplication.ringhof.io/v1alpha1
 kind: ZFSReplicationRun
 metadata:
   name: pg-a-to-b-manual-001

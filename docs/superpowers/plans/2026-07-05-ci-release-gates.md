@@ -315,7 +315,7 @@ Release tags require both CI workflows:
   `zfsreplication-e2e`.
 
 For an alpha `0.1.x` release, the Kubernetes API remains
-`zfsreplication.example.com/v1alpha1`; compatibility-breaking API changes may
+`zfsreplication.ringhof.io/v1alpha1`; compatibility-breaking API changes may
 still happen before a stable `1.0.0`.
 ```
 

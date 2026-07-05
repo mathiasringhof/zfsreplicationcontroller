@@ -9,7 +9,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 )
 
-const labelPrefix = "zfsreplication.example.com"
+const labelPrefix = "zfsreplication.ringhof.io"
 
 type runObjects struct {
 	SecretName      string

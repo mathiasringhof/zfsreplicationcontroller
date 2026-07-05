@@ -10,9 +10,9 @@ if [[ -f "${KUBECONFIG_PATH}" ]] && command -v kubectl >/dev/null 2>&1; then
   log "collecting Kubernetes state into ${dest}"
   kubectl_cmd get all -A -o wide > "${dest}/all.txt" || true
   kubectl_cmd get events -A --sort-by=.lastTimestamp > "${dest}/events.txt" || true
-  kubectl_cmd get zfsreceivetasks -A -o yaml > "${dest}/zfsreceivetasks.yaml" || true
-  kubectl_cmd get zfsreplicationruns -A -o yaml > "${dest}/zfsreplicationruns.yaml" || true
-  kubectl_cmd get zfsreplicationschedules -A -o yaml > "${dest}/zfsreplicationschedules.yaml" || true
+  kubectl_cmd get zfsreceivetasks.zfsreplication.ringhof.io -A -o yaml > "${dest}/zfsreceivetasks.yaml" || true
+  kubectl_cmd get zfsreplicationruns.zfsreplication.ringhof.io -A -o yaml > "${dest}/zfsreplicationruns.yaml" || true
+  kubectl_cmd get zfsreplicationschedules.zfsreplication.ringhof.io -A -o yaml > "${dest}/zfsreplicationschedules.yaml" || true
   kubectl_cmd logs -n zfsreplication-system deployment/zfsreplication-controller > "${dest}/manager.log" || true
   kubectl_cmd get pods -A -o yaml > "${dest}/pods.yaml" || true
   while read -r namespace pod; do

@@ -1,5 +1,9 @@
 # ZFS Replication Controller
 
+> **Agentic engineering notice:** This project is intentionally developed with
+> agentic engineering. AI coding agents help plan, implement, test, review, and
+> verify changes; release decisions and project ownership remain human.
+
 ZFS Replication Controller runs Syncoid replication between ZFS datasets on two
 Kubernetes nodes.
 
@@ -31,7 +35,7 @@ whose source and target refer to the same dataset on the same node.
 
 - Kubernetes nodes with the required ZFS datasets and `/dev/zfs`.
 - Permission to run privileged pods with a `/dev/zfs` hostPath mount.
-- Destination nodes labelled `zfsreplication.example.com/enabled=true` so the
+- Destination nodes labelled `zfsreplication.ringhof.io/enabled=true` so the
   receiver DaemonSet is scheduled there.
 - A controller image that contains `manager`, `zfsrep-sender`,
   `zfsrep-receiver`, `zfsutils-linux`, OpenSSH, and Syncoid.
@@ -91,7 +95,7 @@ kubectl apply -f zfsreplicationcontroller-v0.1.0.yaml
 ```
 
 The `0.1.x` releases are alpha releases. The Kubernetes API remains
-`zfsreplication.example.com/v1alpha1`, and incompatible API changes may happen
+`zfsreplication.ringhof.io/v1alpha1`, and incompatible API changes may happen
 before a stable `1.0.0`.
 
 To install from the repository checkout:
@@ -141,7 +145,7 @@ the run object. The receiver DaemonSet runs in `zfsreplication-system`.
 ## One-Shot Run
 
 ```yaml
-apiVersion: zfsreplication.example.com/v1alpha1
+apiVersion: zfsreplication.ringhof.io/v1alpha1
 kind: ZFSReplicationRun
 metadata:
   name: pg-a-to-b-manual-001
@@ -173,7 +177,7 @@ snapshot.
 ## Scheduled Runs
 
 ```yaml
-apiVersion: zfsreplication.example.com/v1alpha1
+apiVersion: zfsreplication.ringhof.io/v1alpha1
 kind: ZFSReplicationSchedule
 metadata:
   name: pg-a-to-b-hourly
@@ -269,7 +273,7 @@ Release tags require both CI workflows:
   `zfsreplication-e2e`.
 
 For an alpha `0.1.x` release, the Kubernetes API remains
-`zfsreplication.example.com/v1alpha1`; compatibility-breaking API changes may
+`zfsreplication.ringhof.io/v1alpha1`; compatibility-breaking API changes may
 still happen before a stable `1.0.0`.
 
 The VM e2e environment is documented in `test/e2e/README.md`.

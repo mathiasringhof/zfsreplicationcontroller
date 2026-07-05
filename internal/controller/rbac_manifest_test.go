@@ -64,35 +64,35 @@ func TestControllerClusterRoleHasRequiredPermissions(t *testing.T) {
 		t.Fatalf("parse %s: %v", rolePath, err)
 	}
 
-	verbs := verbsForResource(role.Rules, "zfsreplication.example.com", "zfsreplicationruns")
+	verbs := verbsForResource(role.Rules, "zfsreplication.ringhof.io", "zfsreplicationruns")
 	for _, verb := range []string{"create", "get", "list", "watch"} {
 		if !contains(verbs, verb) {
 			t.Fatalf("zfsreplicationruns RBAC verbs = %v, missing %q", verbs, verb)
 		}
 	}
 
-	verbs = verbsForResource(role.Rules, "zfsreplication.example.com", "zfsreceivetasks")
+	verbs = verbsForResource(role.Rules, "zfsreplication.ringhof.io", "zfsreceivetasks")
 	for _, verb := range []string{"create", "get", "list", "watch"} {
 		if !contains(verbs, verb) {
 			t.Fatalf("zfsreceivetasks RBAC verbs = %v, missing %q", verbs, verb)
 		}
 	}
 
-	verbs = verbsForResource(role.Rules, "zfsreplication.example.com", "zfsreplicationruns/status")
+	verbs = verbsForResource(role.Rules, "zfsreplication.ringhof.io", "zfsreplicationruns/status")
 	for _, verb := range []string{"get", "update", "patch"} {
 		if !contains(verbs, verb) {
 			t.Fatalf("zfsreplicationruns/status RBAC verbs = %v, missing %q", verbs, verb)
 		}
 	}
 
-	verbs = verbsForResource(role.Rules, "zfsreplication.example.com", "zfsreceivetasks/status")
+	verbs = verbsForResource(role.Rules, "zfsreplication.ringhof.io", "zfsreceivetasks/status")
 	for _, verb := range []string{"get", "update", "patch"} {
 		if !contains(verbs, verb) {
 			t.Fatalf("zfsreceivetasks/status RBAC verbs = %v, missing %q", verbs, verb)
 		}
 	}
 
-	verbs = verbsForResource(role.Rules, "zfsreplication.example.com", "zfsreplicationschedules/status")
+	verbs = verbsForResource(role.Rules, "zfsreplication.ringhof.io", "zfsreplicationschedules/status")
 	for _, verb := range []string{"get", "update", "patch"} {
 		if !contains(verbs, verb) {
 			t.Fatalf("zfsreplicationschedules/status RBAC verbs = %v, missing %q", verbs, verb)
@@ -154,12 +154,12 @@ func TestNamespacedRBACRestrictsWorkloadPermissionsToWatchedNamespace(t *testing
 		resource string
 		verbs    []string
 	}{
-		{apiGroup: "zfsreplication.example.com", resource: "zfsreplicationschedules", verbs: []string{"get", "list", "watch"}},
-		{apiGroup: "zfsreplication.example.com", resource: "zfsreplicationruns", verbs: []string{"create", "get", "list", "watch"}},
-		{apiGroup: "zfsreplication.example.com", resource: "zfsreceivetasks", verbs: []string{"create", "get", "list", "watch"}},
-		{apiGroup: "zfsreplication.example.com", resource: "zfsreplicationruns/status", verbs: []string{"get", "update", "patch"}},
-		{apiGroup: "zfsreplication.example.com", resource: "zfsreceivetasks/status", verbs: []string{"get", "update", "patch"}},
-		{apiGroup: "zfsreplication.example.com", resource: "zfsreplicationschedules/status", verbs: []string{"get", "update", "patch"}},
+		{apiGroup: "zfsreplication.ringhof.io", resource: "zfsreplicationschedules", verbs: []string{"get", "list", "watch"}},
+		{apiGroup: "zfsreplication.ringhof.io", resource: "zfsreplicationruns", verbs: []string{"create", "get", "list", "watch"}},
+		{apiGroup: "zfsreplication.ringhof.io", resource: "zfsreceivetasks", verbs: []string{"create", "get", "list", "watch"}},
+		{apiGroup: "zfsreplication.ringhof.io", resource: "zfsreplicationruns/status", verbs: []string{"get", "update", "patch"}},
+		{apiGroup: "zfsreplication.ringhof.io", resource: "zfsreceivetasks/status", verbs: []string{"get", "update", "patch"}},
+		{apiGroup: "zfsreplication.ringhof.io", resource: "zfsreplicationschedules/status", verbs: []string{"get", "update", "patch"}},
 		{apiGroup: "batch", resource: "jobs", verbs: []string{"create", "get", "list", "watch", "update", "patch", "delete"}},
 		{apiGroup: "", resource: "secrets", verbs: []string{"create", "get", "list", "watch", "update", "patch", "delete"}},
 		{apiGroup: "", resource: "pods", verbs: []string{"get", "list", "watch", "delete"}},
@@ -211,7 +211,7 @@ func TestReceiverNamespacedRBACRestrictsTaskPermissionsToWatchedNamespace(t *tes
 		{resource: "zfsreceivetasks", verbs: []string{"get", "list", "watch"}},
 		{resource: "zfsreceivetasks/status", verbs: []string{"get", "update", "patch"}},
 	} {
-		verbs := verbsForResource(role.Rules, "zfsreplication.example.com", tt.resource)
+		verbs := verbsForResource(role.Rules, "zfsreplication.ringhof.io", tt.resource)
 		for _, verb := range tt.verbs {
 			if !contains(verbs, verb) {
 				t.Fatalf("%s receiver namespaced RBAC verbs = %v, missing %q", tt.resource, verbs, verb)
@@ -240,7 +240,7 @@ func TestNamespacedOverlayUsesNamespacedRBACAndWatchNamespace(t *testing.T) {
 		}
 	}
 	for _, required := range []string{
-		"config/crd/zfsreplication.example.com_zfsreceivetasks.yaml",
+		"config/crd/zfsreplication.ringhof.io_zfsreceivetasks.yaml",
 		"config/rbac/namespaced_role.yaml",
 		"config/rbac/namespaced_role_binding.yaml",
 		"config/rbac/receiver_namespaced_role.yaml",
@@ -396,7 +396,7 @@ func TestNamespacedOverlayRenderedManifestStaysNamespaced(t *testing.T) {
 func TestCRDSchemaExposesSyncoidOptions(t *testing.T) {
 	t.Helper()
 
-	crdPath := filepath.Join("..", "..", "config", "crd", "zfsreplication.example.com_zfsreplicationruns.yaml")
+	crdPath := filepath.Join("..", "..", "config", "crd", "zfsreplication.ringhof.io_zfsreplicationruns.yaml")
 	data, err := os.ReadFile(crdPath)
 	if err != nil {
 		t.Fatalf("read %s: %v", crdPath, err)
@@ -451,7 +451,7 @@ func TestCRDSchemaExposesSyncoidOptions(t *testing.T) {
 func TestReceiveTaskCRDSchemaExposesMVP1Fields(t *testing.T) {
 	t.Helper()
 
-	crdPath := filepath.Join("..", "..", "config", "crd", "zfsreplication.example.com_zfsreceivetasks.yaml")
+	crdPath := filepath.Join("..", "..", "config", "crd", "zfsreplication.ringhof.io_zfsreceivetasks.yaml")
 	data, err := os.ReadFile(crdPath)
 	if err != nil {
 		t.Fatalf("read %s: %v", crdPath, err)

@@ -14,7 +14,7 @@ spec:
     spec:
       serviceAccountName: zfs-receiver
       nodeSelector:
-        zfsreplication.example.com/enabled: "true"
+        zfsreplication.ringhof.io/enabled: "true"
       containers:
         - name: receiver
           image: ghcr.io/mathiasringhof/zfsreplicationcontroller:main

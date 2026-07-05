@@ -314,7 +314,7 @@ kubectl apply -f zfsreplicationcontroller-v0.1.0.yaml
 ```
 
 The `0.1.x` releases are alpha releases. The Kubernetes API remains
-`zfsreplication.example.com/v1alpha1`, and incompatible API changes may happen
+`zfsreplication.ringhof.io/v1alpha1`, and incompatible API changes may happen
 before a stable `1.0.0`.
 ````
 

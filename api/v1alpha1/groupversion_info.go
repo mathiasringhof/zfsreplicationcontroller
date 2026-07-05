@@ -7,7 +7,7 @@ import (
 )
 
 const (
-	Group   = "zfsreplication.example.com"
+	Group   = "zfsreplication.ringhof.io"
 	Version = "v1alpha1"
 )
 

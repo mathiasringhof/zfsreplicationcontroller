@@ -5,9 +5,9 @@ kind: Kustomization
 resources:
   - config/namespaced/watched_namespace.yaml
   - config/manager/namespace.yaml
-  - config/crd/zfsreplication.example.com_zfsreceivetasks.yaml
-  - config/crd/zfsreplication.example.com_zfsreplicationruns.yaml
-  - config/crd/zfsreplication.example.com_zfsreplicationschedules.yaml
+  - config/crd/zfsreplication.ringhof.io_zfsreceivetasks.yaml
+  - config/crd/zfsreplication.ringhof.io_zfsreplicationruns.yaml
+  - config/crd/zfsreplication.ringhof.io_zfsreplicationschedules.yaml
   - config/rbac/service_account.yaml
   - config/rbac/receiver_service_account.yaml
   - config/rbac/namespaced_role.yaml

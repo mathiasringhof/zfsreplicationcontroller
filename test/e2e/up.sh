@@ -71,8 +71,8 @@ wait_for_nodes
 
 kubectl_cmd label node "${WORKER_A}" zfsreplicationcontroller.e2e/source=true --overwrite
 kubectl_cmd label node "${WORKER_B}" zfsreplicationcontroller.e2e/target=true --overwrite
-kubectl_cmd label node "${WORKER_A}" zfsreplication.example.com/enabled=true --overwrite
-kubectl_cmd label node "${WORKER_B}" zfsreplication.example.com/enabled=true --overwrite
+kubectl_cmd label node "${WORKER_A}" zfsreplication.ringhof.io/enabled=true --overwrite
+kubectl_cmd label node "${WORKER_B}" zfsreplication.ringhof.io/enabled=true --overwrite
 
 log "cluster is ready"
 log "kubeconfig: ${KUBECONFIG_PATH}"

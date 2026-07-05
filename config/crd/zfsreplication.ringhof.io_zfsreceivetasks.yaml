@@ -1,9 +1,9 @@
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
-  name: zfsreceivetasks.zfsreplication.example.com
+  name: zfsreceivetasks.zfsreplication.ringhof.io
 spec:
-  group: zfsreplication.example.com
+  group: zfsreplication.ringhof.io
   names:
     kind: ZFSReceiveTask
     listKind: ZFSReceiveTaskList

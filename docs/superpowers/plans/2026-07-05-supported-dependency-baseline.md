@@ -329,7 +329,7 @@ If `docs/release.md` exists after the release artifact plan is implemented, add 
 - Kubernetes libraries: 1.35.x / `v0.35.x`
 - E2E Kubernetes: k3s 1.35.x
 - Runtime base image: Ubuntu 24.04
-- Public API: `zfsreplication.example.com/v1alpha1`
+- Public API: `zfsreplication.ringhof.io/v1alpha1`
 ```
 
 Then commit:
