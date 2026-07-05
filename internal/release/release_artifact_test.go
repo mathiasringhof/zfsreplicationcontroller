@@ -84,12 +84,28 @@ func TestContainerWorkflowGatesTagReleasePublication(t *testing.T) {
 	workflow := artifactReadFile(t, "../../.github/workflows/container.yaml")
 	for _, want := range []string{
 		"release-go-checks:",
-		"release-e2e:",
 		"publish-release:",
-		"needs: [release-go-checks, release-e2e]",
+		"needs: [release-go-checks]",
 		"if: github.event_name != 'push' || !startsWith(github.ref, 'refs/tags/v')",
 	} {
 		artifactRequireContains(t, ".github/workflows/container.yaml", workflow, want)
+	}
+	artifactRequireNotContains(t, ".github/workflows/container.yaml", workflow, "release-e2e:")
+	artifactRequireNotContains(t, ".github/workflows/container.yaml", workflow, "zfsreplication-e2e")
+}
+
+func TestE2EWorkflowRunsSeparatelyFromReleasePublication(t *testing.T) {
+	t.Parallel()
+
+	workflow := artifactReadFile(t, "../../.github/workflows/e2e.yaml")
+	for _, want := range []string{
+		"workflow_dispatch:",
+		"- \"v*\"",
+		"zfsreplication-e2e",
+		"./test/e2e/doctor.sh",
+		"./test/e2e/run.sh",
+	} {
+		artifactRequireContains(t, ".github/workflows/e2e.yaml", workflow, want)
 	}
 }
 

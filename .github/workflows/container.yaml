@@ -91,34 +91,10 @@ jobs:
       - name: Race test
         run: go test -race ./... -count=1
 
-  release-e2e:
-    name: Release VM k3s ZFS E2E
-    if: startsWith(github.ref, 'refs/tags/v')
-    runs-on:
-      - self-hosted
-      - zfsreplication-e2e
-    timeout-minutes: 60
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-          cache: true
-
-      - name: Doctor
-        run: ./test/e2e/doctor.sh
-
-      - name: Run full E2E
-        run: ./test/e2e/run.sh
-
   publish-release:
     name: Publish release image and manifest
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [release-go-checks, release-e2e]
+    needs: [release-go-checks]
     runs-on: ubuntu-latest
 
     steps:
