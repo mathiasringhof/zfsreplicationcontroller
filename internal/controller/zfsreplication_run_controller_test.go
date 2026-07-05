@@ -298,6 +298,70 @@ func TestRunValidationRejectsReceiverUnsafeDatasets(t *testing.T) {
 	}
 }
 
+func TestDestinationLockedHandlesOverlappingTargetDatasets(t *testing.T) {
+	for _, tt := range []struct {
+		name               string
+		targetDataset      string
+		otherTargetNode    string
+		otherTargetDataset string
+		wantLocked         bool
+	}{
+		{
+			name:               "same dataset",
+			targetDataset:      "tank/dst",
+			otherTargetNode:    "worker-b",
+			otherTargetDataset: "tank/dst",
+			wantLocked:         true,
+		},
+		{
+			name:               "active parent blocks child",
+			targetDataset:      "tank/dst/child",
+			otherTargetNode:    "worker-b",
+			otherTargetDataset: "tank/dst",
+			wantLocked:         true,
+		},
+		{
+			name:               "active child blocks parent",
+			targetDataset:      "tank/dst",
+			otherTargetNode:    "worker-b",
+			otherTargetDataset: "tank/dst/child",
+			wantLocked:         true,
+		},
+		{
+			name:               "siblings do not block",
+			targetDataset:      "tank/dst/a",
+			otherTargetNode:    "worker-b",
+			otherTargetDataset: "tank/dst/b",
+			wantLocked:         false,
+		},
+		{
+			name:               "same hierarchy on different node does not block",
+			targetDataset:      "tank/dst/child",
+			otherTargetNode:    "worker-c",
+			otherTargetDataset: "tank/dst",
+			wantLocked:         false,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			run := replicationRun("manual-1")
+			run.Spec.Target.Dataset = tt.targetDataset
+			other := replicationRun("manual-2")
+			other.Spec.Target.NodeName = tt.otherTargetNode
+			other.Spec.Target.Dataset = tt.otherTargetDataset
+			other.Status.Phase = zfsv1.PhaseRunning
+			r := newRunReconciler(t, run, other)
+
+			locked, _, err := r.destinationLocked(context.Background(), run)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if locked != tt.wantLocked {
+				t.Fatalf("destinationLocked() locked = %v, want %v", locked, tt.wantLocked)
+			}
+		})
+	}
+}
+
 func replicationRun(name string) *zfsv1.ZFSReplicationRun {
 	return &zfsv1.ZFSReplicationRun{
 		TypeMeta:   metav1.TypeMeta{APIVersion: zfsv1.Group + "/" + zfsv1.Version, Kind: "ZFSReplicationRun"},

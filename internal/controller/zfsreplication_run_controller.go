@@ -505,7 +505,7 @@ func (r *ZFSReplicationRunReconciler) destinationLocked(ctx context.Context, run
 		if other.Name == run.Name || !other.Status.Phase.Active() {
 			continue
 		}
-		if other.Spec.Target.NodeName != run.Spec.Target.NodeName || other.Spec.Target.Dataset != run.Spec.Target.Dataset {
+		if other.Spec.Target.NodeName != run.Spec.Target.NodeName || !targetDatasetsOverlap(run.Spec.Target.Dataset, other.Spec.Target.Dataset) {
 			continue
 		}
 		if shouldWaitForDestinationRun(run, &other) {
@@ -514,6 +514,10 @@ func (r *ZFSReplicationRunReconciler) destinationLocked(ctx context.Context, run
 		}
 	}
 	return false, "", nil
+}
+
+func targetDatasetsOverlap(a, b string) bool {
+	return replication.DatasetOrChild(a, b) || replication.DatasetOrChild(b, a)
 }
 
 func shouldWaitForDestinationRun(run, other *zfsv1.ZFSReplicationRun) bool {

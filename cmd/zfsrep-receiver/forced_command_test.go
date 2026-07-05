@@ -277,6 +277,42 @@ func TestReadReceiverPolicyRejectsSymlink(t *testing.T) {
 	}
 }
 
+func TestReadReceiverPolicyNormalizesLegacyMountedReceivePolicy(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "policy-0123456789abcdef0123456789abcdef.json")
+	if err := os.WriteFile(path, []byte(`{"targetDataset":"tank/dst","receiveUnmounted":false,"receiveResumable":true,"compression":"none"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	policy, err := readReceiverPolicy(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !policy.AllowMount {
+		t.Fatal("AllowMount = false, want legacy receiveUnmounted=false policy to allow mounted receive")
+	}
+	if _, err := authorizeReceiverCommand("zfs receive -s tank/dst", policy); err != nil {
+		t.Fatalf("authorizeReceiverCommand() error = %v, want mounted receive allowed", err)
+	}
+}
+
+func TestReadReceiverPolicyPreservesExplicitMountedReceiveDenial(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "policy-0123456789abcdef0123456789abcdef.json")
+	if err := os.WriteFile(path, []byte(`{"targetDataset":"tank/dst","receiveUnmounted":false,"allowMount":false,"receiveResumable":true,"compression":"none"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	policy, err := readReceiverPolicy(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if policy.AllowMount {
+		t.Fatal("AllowMount = true, want explicit allowMount=false preserved")
+	}
+	if _, err := authorizeReceiverCommand("zfs receive -s tank/dst", policy); err == nil {
+		t.Fatal("authorizeReceiverCommand() error = nil, want mounted receive rejected")
+	}
+}
+
 func TestAuthorizeReceiverCommandUsesCompressionPolicy(t *testing.T) {
 	policy := testReceiverPolicy("tank/dst", zfsv1.ReceiveTaskPolicy{
 		ReceiveUnmounted: true,

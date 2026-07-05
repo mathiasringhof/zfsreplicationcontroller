@@ -38,8 +38,22 @@ func readReceiverPolicy(path string) (receiverCommandPolicy, error) {
 	if err := json.Unmarshal(data, &policy); err != nil {
 		return receiverCommandPolicy{}, fmt.Errorf("parse receiver policy: %w", err)
 	}
+	if err := normalizeReceiverPolicy(data, &policy); err != nil {
+		return receiverCommandPolicy{}, fmt.Errorf("parse receiver policy fields: %w", err)
+	}
 	policy.Compression = replication.CompressionDefault(policy.Compression)
 	return policy, nil
+}
+
+func normalizeReceiverPolicy(data []byte, policy *receiverCommandPolicy) error {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	if _, ok := fields["allowMount"]; !ok && !policy.ReceiveUnmounted {
+		policy.AllowMount = true
+	}
+	return nil
 }
 
 func receiveTaskAuthorization(cfg receiverConfig, task *zfsv1.ZFSReceiveTask) (receiverTaskAuthorization, error) {
