@@ -148,6 +148,9 @@ func TestRunReconcileCreatesReceiveTaskBeforeSenderJob(t *testing.T) {
 	if task.Spec.Policy.ReceiveResumable {
 		t.Fatal("task allows resumable receive when the run disabled it")
 	}
+	if !task.Spec.Policy.AllowMount {
+		t.Fatal("task does not allow mounted receive when the run disabled receiveUnmounted")
+	}
 	if task.Spec.Policy.AllowSyncSnapshotDestroy {
 		t.Fatal("task allows Syncoid snapshot pruning when noSyncSnap is true")
 	}

@@ -328,8 +328,8 @@ func validateZFSReceiveStep(step receiverCommandStep, policy receiverCommandPoli
 			return fmt.Errorf("unsupported zfs receive argument %q", arg)
 		}
 	}
-	if policy.ReceiveUnmounted && !seenUnmounted {
-		return fmt.Errorf("zfs receive must include -u")
+	if !seenUnmounted && !policy.AllowMount {
+		return fmt.Errorf("zfs receive mounted receive is not allowed by policy")
 	}
 	if len(step.Args) > 1 && step.Args[1] == "-A" && step.StderrToStdout {
 		return fmt.Errorf("zfs receive -A must not redirect stderr")

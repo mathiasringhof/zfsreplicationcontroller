@@ -200,6 +200,7 @@ the replication behavior:
 - `forceDelete`: pass `--force-delete`. Defaults to false.
 - `compress`: pass `--compress=<value>`. Defaults to `none` in the sender.
 - `receiveUnmounted`: pass `--recvoptions=u` when true. Defaults to true.
+  Mounted receives are only authorized when this is false.
 - `receiveResumable`: pass `--no-resume` when false. Defaults to true.
 - `includeSnaps`: one `--include-snaps=<regex>` per item.
 - `excludeSnaps`: one `--exclude-snaps=<regex>` per item.

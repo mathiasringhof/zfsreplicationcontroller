@@ -199,6 +199,7 @@ func reconcileReceiveTasks(ctx context.Context, kubeClient client.Client, cfg re
 	activeKeys := map[string]struct{}{}
 	activePolicies := map[string]receiverCommandPolicy{}
 	var readyTasks []*zfsv1.ZFSReceiveTask
+	var reconcileErrs []error
 	for i := range tasks.Items {
 		task := &tasks.Items[i]
 		if task.Spec.NodeName != cfg.NodeName {
@@ -209,24 +210,23 @@ func reconcileReceiveTasks(ctx context.Context, kubeClient client.Client, cfg re
 		}
 		if task.Spec.SSH.ExpiresAt.Time.Before(now) {
 			if err := patchTaskFailed(ctx, kubeClient, task, "receive task expired"); err != nil {
-				return err
+				reconcileErrs = append(reconcileErrs, err)
 			}
 			continue
 		}
 		if !datasetAllowed(task.Spec.Destination.Dataset, cfg.AllowedPrefixes) {
 			if err := patchTaskFailed(ctx, kubeClient, task, "destination dataset is not allowed on this receiver"); err != nil {
-				return err
+				reconcileErrs = append(reconcileErrs, err)
 			}
 			continue
 		}
-		key := strings.TrimSpace(task.Spec.SSH.AuthorizedPublicKey)
-		if key == "" {
-			if err := patchTaskFailed(ctx, kubeClient, task, "authorized public key is empty"); err != nil {
-				return err
+		auth, err := receiveTaskAuthorization(cfg, task)
+		if err != nil {
+			if patchErr := patchTaskFailed(ctx, kubeClient, task, err.Error()); patchErr != nil {
+				reconcileErrs = append(reconcileErrs, patchErr)
 			}
 			continue
 		}
-		auth := receiveTaskAuthorization(cfg, task)
 		activeKeys[auth.AuthorizedKey] = struct{}{}
 		activePolicies[auth.PolicyID] = auth.Policy
 		readyTasks = append(readyTasks, task)
@@ -245,10 +245,10 @@ func reconcileReceiveTasks(ctx context.Context, kubeClient client.Client, cfg re
 	}
 	for _, task := range readyTasks {
 		if err := patchTaskReady(ctx, kubeClient, task, cfg, hostKey); err != nil {
-			return err
+			reconcileErrs = append(reconcileErrs, err)
 		}
 	}
-	return nil
+	return errors.Join(reconcileErrs...)
 }
 
 func patchTaskReady(ctx context.Context, kubeClient client.Client, task *zfsv1.ZFSReceiveTask, cfg receiverConfig, hostKey string) error {

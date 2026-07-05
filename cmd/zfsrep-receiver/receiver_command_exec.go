@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 )
 
 func executeReceiverCommandPlan(ctx context.Context, cfg forcedCommandConfig, plan receiverCommandPlan) error {
@@ -60,6 +61,9 @@ func executeReceiverCommandPlan(ctx context.Context, cfg forcedCommandConfig, pl
 func executeReceiverPipeline(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer, steps []receiverCommandStep) error {
 	cmds := make([]*exec.Cmd, 0, len(steps))
 	previousStdout := stdin
+	var outputMu sync.Mutex
+	stdout = lockedWriter{mu: &outputMu, w: stdout}
+	stderr = lockedWriter{mu: &outputMu, w: stderr}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	for i, step := range steps {
@@ -117,6 +121,17 @@ func executeReceiverPipeline(ctx context.Context, stdin io.Reader, stdout, stder
 		}
 	}
 	return firstErr
+}
+
+type lockedWriter struct {
+	mu *sync.Mutex
+	w  io.Writer
+}
+
+func (w lockedWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.w.Write(p)
 }
 
 func receiverChildEnvironment() []string {

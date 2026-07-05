@@ -13,6 +13,7 @@ import (
 
 	zfsv1 "github.com/mathias/zfsreplicationcontroller/api/v1alpha1"
 	"github.com/mathias/zfsreplicationcontroller/internal/replication"
+	"golang.org/x/crypto/ssh"
 )
 
 func readReceiverPolicy(path string) (receiverCommandPolicy, error) {
@@ -41,11 +42,15 @@ func readReceiverPolicy(path string) (receiverCommandPolicy, error) {
 	return policy, nil
 }
 
-func receiveTaskAuthorization(cfg receiverConfig, task *zfsv1.ZFSReceiveTask) receiverTaskAuthorization {
+func receiveTaskAuthorization(cfg receiverConfig, task *zfsv1.ZFSReceiveTask) (receiverTaskAuthorization, error) {
+	publicKey, err := canonicalAuthorizedPublicKey(task.Spec.SSH.AuthorizedPublicKey)
+	if err != nil {
+		return receiverTaskAuthorization{}, err
+	}
 	policyID := receiverPolicyID(task)
 	policyPath, err := receiverPolicyPathForID(receiverPolicyDir(cfg), policyID)
 	if err != nil {
-		panic(err)
+		return receiverTaskAuthorization{}, err
 	}
 	policy := receiverCommandPolicy{
 		TargetDataset:     task.Spec.Destination.Dataset,
@@ -53,13 +58,31 @@ func receiveTaskAuthorization(cfg receiverConfig, task *zfsv1.ZFSReceiveTask) re
 	}
 	policy.Compression = replication.CompressionDefault(policy.Compression)
 	forcedCommand := receiverCommandPath + " exec --policy-id " + policyID
-	key := "restrict,command=\"" + escapeAuthorizedKeysOption(forcedCommand) + "\" " + strings.TrimSpace(task.Spec.SSH.AuthorizedPublicKey)
+	key := "restrict,command=\"" + escapeAuthorizedKeysOption(forcedCommand) + "\" " + publicKey
 	return receiverTaskAuthorization{
 		AuthorizedKey: key,
 		PolicyID:      policyID,
 		PolicyPath:    policyPath,
 		Policy:        policy,
+	}, nil
+}
+
+func canonicalAuthorizedPublicKey(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", fmt.Errorf("authorized public key is empty")
 	}
+	key, _, options, rest, err := ssh.ParseAuthorizedKey([]byte(raw))
+	if err != nil {
+		return "", fmt.Errorf("parse authorized public key: %w", err)
+	}
+	if len(options) > 0 {
+		return "", fmt.Errorf("authorized public key must not include authorized_keys options")
+	}
+	if strings.TrimSpace(string(rest)) != "" {
+		return "", fmt.Errorf("authorized public key contains trailing data")
+	}
+	return strings.TrimSpace(string(ssh.MarshalAuthorizedKey(key))), nil
 }
 
 func receiverPolicyDir(cfg receiverConfig) string {

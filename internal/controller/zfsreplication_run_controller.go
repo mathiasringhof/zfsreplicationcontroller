@@ -592,6 +592,7 @@ func runReceiveTask(run *zfsv1.ZFSReplicationRun, names runObjects, publicKey st
 				ReceiveResumable:         options.ReceiveResumable,
 				AllowRollback:            !options.NoRollback,
 				AllowDestroy:             options.ForceDelete,
+				AllowMount:               !options.ReceiveUnmounted,
 				AllowSyncSnapshotDestroy: !options.NoSyncSnap,
 				SyncSnapshotIdentifier:   syncSnapshotIdentifier,
 				Compression:              options.Compress,

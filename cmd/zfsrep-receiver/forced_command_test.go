@@ -104,6 +104,30 @@ func TestAuthorizeReceiverCommandRejectsUnsafeReceiveFlags(t *testing.T) {
 	}
 }
 
+func TestAuthorizeReceiverCommandAllowsMountedReceiveOnlyWhenPolicyAllowsMount(t *testing.T) {
+	policy := testReceiverPolicy("tank/dst", zfsv1.ReceiveTaskPolicy{
+		ReceiveUnmounted: true,
+		ReceiveResumable: true,
+		Compression:      "none",
+	})
+	cmd := "zfs receive -s tank/dst"
+
+	if _, err := authorizeReceiverCommand(cmd, policy); err == nil {
+		t.Fatal("authorizeReceiverCommand() error = nil, want mounted receive rejection")
+	}
+
+	policy.AllowMount = true
+	if _, err := authorizeReceiverCommand(cmd, policy); err != nil {
+		t.Fatalf("authorizeReceiverCommand() error = %v, want mounted receive allowed", err)
+	}
+
+	policy.ReceiveUnmounted = false
+	policy.AllowMount = false
+	if _, err := authorizeReceiverCommand(cmd, policy); err == nil {
+		t.Fatal("authorizeReceiverCommand() error = nil, want mounted receive rejection without allowMount")
+	}
+}
+
 func TestAuthorizeReceiverCommandEnforcesDatasetAndSnapshotBoundaries(t *testing.T) {
 	policy := testReceiverPolicy("tank/app", zfsv1.ReceiveTaskPolicy{
 		ReceiveUnmounted:         true,
