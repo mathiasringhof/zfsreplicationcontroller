@@ -80,7 +80,21 @@ If you use a different registry or a pinned image, set it in both places in
 - `spec.template.spec.containers[0].image`
 - `DATA_MOVER_IMAGE`
 
-Install the CRDs, RBAC, namespace, and controller Deployment:
+Install the CRDs, RBAC, namespace, and controller Deployment.
+
+For an alpha release, prefer the rendered release manifest attached to the
+GitHub release instead of the mutable `main` manifests in the repository:
+
+```sh
+curl -LO https://github.com/mathiasringhof/zfsreplicationcontroller/releases/download/v0.1.0/zfsreplicationcontroller-v0.1.0.yaml
+kubectl apply -f zfsreplicationcontroller-v0.1.0.yaml
+```
+
+The `0.1.x` releases are alpha releases. The Kubernetes API remains
+`zfsreplication.example.com/v1alpha1`, and incompatible API changes may happen
+before a stable `1.0.0`.
+
+To install from the repository checkout:
 
 ```sh
 kubectl apply -k config
@@ -247,6 +261,16 @@ go fmt ./...
 go test ./...
 golangci-lint run
 ```
+
+Release tags require both CI workflows:
+
+- `Test`: format, lint, unit/integration tests, and race tests.
+- `E2E`: full Lima/k3s real-ZFS E2E on a self-hosted runner labelled
+  `zfsreplication-e2e`.
+
+For an alpha `0.1.x` release, the Kubernetes API remains
+`zfsreplication.example.com/v1alpha1`; compatibility-breaking API changes may
+still happen before a stable `1.0.0`.
 
 The VM e2e environment is documented in `test/e2e/README.md`.
 
