@@ -60,6 +60,7 @@ func SenderConfigFromEnv() SenderConfig {
 }
 
 func SenderConfigFromLookup(lookup func(string) string) SenderConfig {
+	defaults := replication.DefaultSyncoidOptions()
 	return SenderConfig{
 		SrcDataset:        lookup(EnvSrcDataset),
 		DstHost:           lookup(EnvDstHost),
@@ -67,13 +68,13 @@ func SenderConfigFromLookup(lookup func(string) string) SenderConfig {
 		SSHKeyFile:        lookup(EnvSSHKeyFile),
 		KnownHostsFile:    lookup(EnvKnownHostsFile),
 		SSHPort:           lookup(EnvSSHPort),
-		NoSyncSnap:        boolLookupDefault(lookup, EnvNoSyncSnap, false),
-		NoRollback:        boolLookupDefault(lookup, EnvNoRollback, true),
-		ForceDelete:       boolLookupDefault(lookup, EnvForceDelete, false),
-		Compress:          lookupDefault(lookup, EnvCompress, replication.CompressionNone),
+		NoSyncSnap:        boolLookupDefault(lookup, EnvNoSyncSnap, defaults.NoSyncSnap),
+		NoRollback:        boolLookupDefault(lookup, EnvNoRollback, defaults.NoRollback),
+		ForceDelete:       boolLookupDefault(lookup, EnvForceDelete, defaults.ForceDelete),
+		Compress:          lookupDefault(lookup, EnvCompress, defaults.Compress),
 		SyncoidIdentifier: lookup(EnvSyncoidIdentifier),
-		ReceiveUnmounted:  lookupDefault(lookup, EnvReceiveUnmounted, "true") == "true",
-		ReceiveResumable:  lookupDefault(lookup, EnvReceiveResumable, "true") == "true",
+		ReceiveUnmounted:  boolLookupDefault(lookup, EnvReceiveUnmounted, defaults.ReceiveUnmounted),
+		ReceiveResumable:  boolLookupDefault(lookup, EnvReceiveResumable, defaults.ReceiveResumable),
 		IncludeSnaps:      listLookup(lookup, EnvIncludeSnaps),
 		ExcludeSnaps:      listLookup(lookup, EnvExcludeSnaps),
 		ExpectedNode:      lookup(EnvExpectedNodeName),

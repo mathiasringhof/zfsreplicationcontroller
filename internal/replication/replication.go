@@ -9,6 +9,50 @@ import (
 
 const CompressionNone = "none"
 
+type SyncoidOptions struct {
+	NoSyncSnap       bool
+	NoRollback       bool
+	ForceDelete      bool
+	Compress         string
+	ReceiveUnmounted bool
+	ReceiveResumable bool
+	IncludeSnaps     []string
+	ExcludeSnaps     []string
+}
+
+type SyncoidOptionInput struct {
+	NoSyncSnap       *bool
+	NoRollback       *bool
+	ForceDelete      *bool
+	Compress         string
+	ReceiveUnmounted *bool
+	ReceiveResumable *bool
+	IncludeSnaps     []string
+	ExcludeSnaps     []string
+}
+
+func DefaultSyncoidOptions() SyncoidOptions {
+	return SyncoidOptions{
+		NoRollback:       true,
+		Compress:         CompressionNone,
+		ReceiveUnmounted: true,
+		ReceiveResumable: true,
+	}
+}
+
+func NormalizeSyncoidOptions(in SyncoidOptionInput) SyncoidOptions {
+	out := DefaultSyncoidOptions()
+	out.NoSyncSnap = boolDefault(in.NoSyncSnap, out.NoSyncSnap)
+	out.NoRollback = boolDefault(in.NoRollback, out.NoRollback)
+	out.ForceDelete = boolDefault(in.ForceDelete, out.ForceDelete)
+	out.Compress = CompressionDefault(in.Compress)
+	out.ReceiveUnmounted = boolDefault(in.ReceiveUnmounted, out.ReceiveUnmounted)
+	out.ReceiveResumable = boolDefault(in.ReceiveResumable, out.ReceiveResumable)
+	out.IncludeSnaps = slices.Clone(in.IncludeSnaps)
+	out.ExcludeSnaps = slices.Clone(in.ExcludeSnaps)
+	return out
+}
+
 type compressionSpec struct {
 	syncoid      string
 	decompressor string
@@ -134,6 +178,13 @@ func ValidSyncoidIdentifier(identifier string) bool {
 func validSyncoidIdentifierRune(r rune) bool {
 	return r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' ||
 		r == '_' || r == '-' || r == '.' || r == ':'
+}
+
+func boolDefault(value *bool, def bool) bool {
+	if value == nil {
+		return def
+	}
+	return *value
 }
 
 func TargetPool(dataset string) string {

@@ -34,6 +34,11 @@ type ZFSReplicationRunReconciler struct {
 	PodLogs        PodLogReader
 }
 
+type runReceiverStatus struct {
+	podName string
+	podIP   string
+}
+
 func (r *ZFSReplicationRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	var run zfsv1.ZFSReplicationRun
 	if err := r.Get(ctx, req.NamespacedName, &run); err != nil {
@@ -41,10 +46,7 @@ func (r *ZFSReplicationRunReconciler) Reconcile(ctx context.Context, req ctrl.Re
 	}
 	names := objectNamesForRun(run.Name)
 	if run.Status.Phase.Terminal() {
-		return ctrl.Result{}, errors.Join(
-			r.markReceiveTaskTerminal(ctx, &run, names, run.Status.Phase.ReceiveTaskTerminalPhase(), run.Status.LastError),
-			r.cleanupRunEphemeralObjects(ctx, &run, names),
-		)
+		return ctrl.Result{}, r.reconcileTerminalRun(ctx, &run, names)
 	}
 	if err := validateRunSpec(run.Spec); err != nil {
 		return ctrl.Result{}, r.failRunValidation(ctx, &run, err.Error())
@@ -66,79 +68,108 @@ func (r *ZFSReplicationRunReconciler) Reconcile(ctx context.Context, req ctrl.Re
 		return ctrl.Result{}, err
 	}
 
+	receiver := runReceiverStatus{
+		podName: run.Status.ReceiverPodName,
+		podIP:   run.Status.ReceiverPodIP,
+	}
 	senderExists, err := r.jobExists(ctx, run.Namespace, names.SenderName)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	receiverPodName := run.Status.ReceiverPodName
-	receiverPodIP := run.Status.ReceiverPodIP
 	if !senderExists {
-		task, ready, msg, err := r.readyReceiveTask(ctx, &run, names)
-		if err != nil {
-			return ctrl.Result{}, err
+		nextReceiver, result, done, err := r.ensureSenderStarted(ctx, &run, names)
+		if err != nil || done {
+			return result, err
 		}
-		if msg != "" {
-			return ctrl.Result{}, r.failRunObject(ctx, &run, names, msg)
-		}
-		if !ready {
-			return ctrl.Result{RequeueAfter: 5 * time.Second}, r.patchRunStatus(ctx, &run, func(st *zfsv1.ZFSReplicationRunStatus) {
-				st.Phase = zfsv1.PhaseStartingReceiver
-				fillRunStatusNames(st, names)
-			})
-		}
-		receiverPodName = task.Status.ReceiverPod.Name
-		receiverPodIP = task.Status.Endpoint.Host
-		if err := r.ensureRunKnownHosts(ctx, &run, names, task); err != nil {
-			return ctrl.Result{}, err
-		}
-		if err := r.patchRunStatus(ctx, &run, func(st *zfsv1.ZFSReplicationRunStatus) {
-			st.Phase = zfsv1.PhaseReceiverReady
-			st.ReceiverPodName = receiverPodName
-			st.ReceiverPodIP = receiverPodIP
-			fillRunStatusNames(st, names)
-		}); err != nil {
-			return ctrl.Result{}, err
-		}
-		if err := r.ensureRunSenderJob(ctx, &run, names, receiverPodIP); err != nil {
-			return ctrl.Result{}, err
-		}
+		receiver = nextReceiver
 	}
 
-	if failed, msg, err := r.jobFailed(ctx, run.Namespace, names.SenderName, "sender Job failed"); err != nil || failed {
-		if err != nil {
-			return ctrl.Result{}, err
-		}
-		return ctrl.Result{}, r.failRunObject(ctx, &run, names, msg)
-	}
-
-	senderDone, err := r.jobSucceeded(ctx, run.Namespace, names.SenderName)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-	if senderDone {
-		now := metav1.Now()
-		if err := r.patchRunStatus(ctx, &run, func(st *zfsv1.ZFSReplicationRunStatus) {
-			st.Phase = zfsv1.PhaseSucceeded
-			st.ReceiverPodName = receiverPodName
-			st.ReceiverPodIP = receiverPodIP
-			st.CompletedAt = &now
-			st.LastError = ""
-			fillRunStatusNames(st, names)
-		}); err != nil {
-			return ctrl.Result{}, err
-		}
-		return ctrl.Result{}, errors.Join(
-			r.markReceiveTaskTerminal(ctx, &run, names, zfsv1.ReceiveTaskPhaseCompleted, ""),
-			r.cleanupRunEphemeralObjects(ctx, &run, names),
-		)
+	if result, done, err := r.finishFromSenderJob(ctx, &run, names, receiver); err != nil || done {
+		return result, err
 	}
 
 	return ctrl.Result{RequeueAfter: 5 * time.Second}, r.patchRunStatus(ctx, &run, func(st *zfsv1.ZFSReplicationRunStatus) {
 		st.Phase = zfsv1.PhaseRunning
-		st.ReceiverPodName = receiverPodName
-		st.ReceiverPodIP = receiverPodIP
+		st.ReceiverPodName = receiver.podName
+		st.ReceiverPodIP = receiver.podIP
 		fillRunStatusNames(st, names)
 	})
+}
+
+func (r *ZFSReplicationRunReconciler) reconcileTerminalRun(ctx context.Context, run *zfsv1.ZFSReplicationRun, names runObjects) error {
+	return errors.Join(
+		r.markReceiveTaskTerminal(ctx, run, names, run.Status.Phase.ReceiveTaskTerminalPhase(), run.Status.LastError),
+		r.cleanupRunEphemeralObjects(ctx, run, names),
+	)
+}
+
+func (r *ZFSReplicationRunReconciler) ensureSenderStarted(ctx context.Context, run *zfsv1.ZFSReplicationRun, names runObjects) (runReceiverStatus, ctrl.Result, bool, error) {
+	task, ready, msg, err := r.readyReceiveTask(ctx, run, names)
+	if err != nil {
+		return runReceiverStatus{}, ctrl.Result{}, false, err
+	}
+	if msg != "" {
+		return runReceiverStatus{}, ctrl.Result{}, true, r.failRunObject(ctx, run, names, msg)
+	}
+	if !ready {
+		return runReceiverStatus{}, ctrl.Result{RequeueAfter: 5 * time.Second}, true, r.patchRunStatus(ctx, run, func(st *zfsv1.ZFSReplicationRunStatus) {
+			st.Phase = zfsv1.PhaseStartingReceiver
+			fillRunStatusNames(st, names)
+		})
+	}
+
+	receiver := runReceiverStatus{
+		podName: task.Status.ReceiverPod.Name,
+		podIP:   task.Status.Endpoint.Host,
+	}
+	if err := r.ensureRunKnownHosts(ctx, run, names, task); err != nil {
+		return runReceiverStatus{}, ctrl.Result{}, false, err
+	}
+	if err := r.patchRunStatus(ctx, run, func(st *zfsv1.ZFSReplicationRunStatus) {
+		st.Phase = zfsv1.PhaseReceiverReady
+		st.ReceiverPodName = receiver.podName
+		st.ReceiverPodIP = receiver.podIP
+		fillRunStatusNames(st, names)
+	}); err != nil {
+		return runReceiverStatus{}, ctrl.Result{}, false, err
+	}
+	if err := r.ensureRunSenderJob(ctx, run, names, receiver.podIP); err != nil {
+		return runReceiverStatus{}, ctrl.Result{}, false, err
+	}
+	return receiver, ctrl.Result{}, false, nil
+}
+
+func (r *ZFSReplicationRunReconciler) finishFromSenderJob(ctx context.Context, run *zfsv1.ZFSReplicationRun, names runObjects, receiver runReceiverStatus) (ctrl.Result, bool, error) {
+	if failed, msg, err := r.jobFailed(ctx, run.Namespace, names.SenderName, "sender Job failed"); err != nil || failed {
+		if err != nil {
+			return ctrl.Result{}, false, err
+		}
+		return ctrl.Result{}, true, r.failRunObject(ctx, run, names, msg)
+	}
+
+	senderDone, err := r.jobSucceeded(ctx, run.Namespace, names.SenderName)
+	if err != nil {
+		return ctrl.Result{}, false, err
+	}
+	if senderDone {
+		now := metav1.Now()
+		if err := r.patchRunStatus(ctx, run, func(st *zfsv1.ZFSReplicationRunStatus) {
+			st.Phase = zfsv1.PhaseSucceeded
+			st.ReceiverPodName = receiver.podName
+			st.ReceiverPodIP = receiver.podIP
+			st.CompletedAt = &now
+			st.LastError = ""
+			fillRunStatusNames(st, names)
+		}); err != nil {
+			return ctrl.Result{}, false, err
+		}
+		return ctrl.Result{}, true, errors.Join(
+			r.markReceiveTaskTerminal(ctx, run, names, zfsv1.ReceiveTaskPhaseCompleted, ""),
+			r.cleanupRunEphemeralObjects(ctx, run, names),
+		)
+	}
+
+	return ctrl.Result{}, false, nil
 }
 
 func (r *ZFSReplicationRunReconciler) SetupWithManager(mgr ctrl.Manager) error {
@@ -541,6 +572,7 @@ func runReceiveTask(run *zfsv1.ZFSReplicationRun, names runObjects, publicKey st
 	labels := cloneLabels(names.Labels)
 	labels[labelPrefix+"/role"] = "receiver"
 	syncSnapshotIdentifier := syncSnapshotIdentifierForRun(run)
+	options := normalizedSyncoidOptions(run.Spec.Syncoid)
 	return &zfsv1.ZFSReceiveTask{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      names.ReceiveTaskName,
@@ -556,13 +588,13 @@ func runReceiveTask(run *zfsv1.ZFSReplicationRun, names runObjects, publicKey st
 				ExpiresAt:           expiresAt,
 			},
 			Policy: zfsv1.ReceiveTaskPolicy{
-				ReceiveUnmounted:         boolDefault(run.Spec.Syncoid.ReceiveUnmounted, true),
-				ReceiveResumable:         boolDefault(run.Spec.Syncoid.ReceiveResumable, true),
-				AllowRollback:            !boolDefault(run.Spec.Syncoid.NoRollback, true),
-				AllowDestroy:             boolDefault(run.Spec.Syncoid.ForceDelete, false),
-				AllowSyncSnapshotDestroy: !boolDefault(run.Spec.Syncoid.NoSyncSnap, false),
+				ReceiveUnmounted:         options.ReceiveUnmounted,
+				ReceiveResumable:         options.ReceiveResumable,
+				AllowRollback:            !options.NoRollback,
+				AllowDestroy:             options.ForceDelete,
+				AllowSyncSnapshotDestroy: !options.NoSyncSnap,
 				SyncSnapshotIdentifier:   syncSnapshotIdentifier,
-				Compression:              replication.CompressionDefault(run.Spec.Syncoid.Compress),
+				Compression:              options.Compress,
 			},
 		},
 	}
@@ -597,16 +629,30 @@ func syncSnapshotIdentifierForRun(run *zfsv1.ZFSReplicationRun) string {
 }
 
 func syncoidEnv(spec zfsv1.SyncoidSpec) []corev1.EnvVar {
+	options := normalizedSyncoidOptions(spec)
 	return []corev1.EnvVar{
-		{Name: datamover.EnvNoSyncSnap, Value: strconv.FormatBool(boolDefault(spec.NoSyncSnap, false))},
-		{Name: datamover.EnvNoRollback, Value: strconv.FormatBool(boolDefault(spec.NoRollback, true))},
-		{Name: datamover.EnvForceDelete, Value: strconv.FormatBool(boolDefault(spec.ForceDelete, false))},
-		{Name: datamover.EnvCompress, Value: spec.Compress},
-		{Name: datamover.EnvReceiveUnmounted, Value: strconv.FormatBool(boolDefault(spec.ReceiveUnmounted, true))},
-		{Name: datamover.EnvReceiveResumable, Value: strconv.FormatBool(boolDefault(spec.ReceiveResumable, true))},
-		{Name: datamover.EnvIncludeSnaps, Value: strings.Join(spec.IncludeSnaps, "\n")},
-		{Name: datamover.EnvExcludeSnaps, Value: strings.Join(spec.ExcludeSnaps, "\n")},
+		{Name: datamover.EnvNoSyncSnap, Value: strconv.FormatBool(options.NoSyncSnap)},
+		{Name: datamover.EnvNoRollback, Value: strconv.FormatBool(options.NoRollback)},
+		{Name: datamover.EnvForceDelete, Value: strconv.FormatBool(options.ForceDelete)},
+		{Name: datamover.EnvCompress, Value: options.Compress},
+		{Name: datamover.EnvReceiveUnmounted, Value: strconv.FormatBool(options.ReceiveUnmounted)},
+		{Name: datamover.EnvReceiveResumable, Value: strconv.FormatBool(options.ReceiveResumable)},
+		{Name: datamover.EnvIncludeSnaps, Value: strings.Join(options.IncludeSnaps, "\n")},
+		{Name: datamover.EnvExcludeSnaps, Value: strings.Join(options.ExcludeSnaps, "\n")},
 	}
+}
+
+func normalizedSyncoidOptions(spec zfsv1.SyncoidSpec) replication.SyncoidOptions {
+	return replication.NormalizeSyncoidOptions(replication.SyncoidOptionInput{
+		NoSyncSnap:       spec.NoSyncSnap,
+		NoRollback:       spec.NoRollback,
+		ForceDelete:      spec.ForceDelete,
+		Compress:         spec.Compress,
+		ReceiveUnmounted: spec.ReceiveUnmounted,
+		ReceiveResumable: spec.ReceiveResumable,
+		IncludeSnaps:     spec.IncludeSnaps,
+		ExcludeSnaps:     spec.ExcludeSnaps,
+	})
 }
 
 func dataMoverJobForRun(run *zfsv1.ZFSReplicationRun, name, image string, labels map[string]string, nodeName, command string, env []corev1.EnvVar, secretName string, readiness bool) *batchv1.Job {

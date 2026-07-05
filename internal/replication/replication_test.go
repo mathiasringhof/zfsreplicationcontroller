@@ -119,3 +119,46 @@ func TestCompressionMetadata(t *testing.T) {
 		t.Fatalf("DecompressorAllowed(gzip, -dc, zstd) = true, want false")
 	}
 }
+
+func TestNormalizeSyncoidOptions(t *testing.T) {
+	include := []string{"^snap-.*"}
+	exclude := []string{".*-tmp$"}
+
+	opts := NormalizeSyncoidOptions(SyncoidOptionInput{
+		NoSyncSnap:       ptr(true),
+		NoRollback:       ptr(false),
+		ForceDelete:      ptr(true),
+		Compress:         "zstd",
+		ReceiveUnmounted: ptr(false),
+		ReceiveResumable: ptr(false),
+		IncludeSnaps:     include,
+		ExcludeSnaps:     exclude,
+	})
+
+	if !opts.NoSyncSnap || opts.NoRollback || !opts.ForceDelete || opts.Compress != "zstd" {
+		t.Fatalf("normalized syncoid behavior = %#v", opts)
+	}
+	if opts.ReceiveUnmounted || opts.ReceiveResumable {
+		t.Fatalf("normalized receive flags = %#v, want both false", opts)
+	}
+	include[0] = "mutated"
+	exclude[0] = "mutated"
+	if opts.IncludeSnaps[0] != "^snap-.*" || opts.ExcludeSnaps[0] != ".*-tmp$" {
+		t.Fatalf("normalized slices share caller storage: %#v", opts)
+	}
+}
+
+func TestDefaultSyncoidOptions(t *testing.T) {
+	opts := NormalizeSyncoidOptions(SyncoidOptionInput{})
+	if opts.NoSyncSnap || !opts.NoRollback || opts.ForceDelete {
+		t.Fatalf("default syncoid behavior = %#v", opts)
+	}
+	if opts.Compress != CompressionNone {
+		t.Fatalf("default compression = %q, want none", opts.Compress)
+	}
+	if !opts.ReceiveUnmounted || !opts.ReceiveResumable {
+		t.Fatalf("default receive flags = %#v, want both true", opts)
+	}
+}
+
+func ptr[T any](v T) *T { return &v }
