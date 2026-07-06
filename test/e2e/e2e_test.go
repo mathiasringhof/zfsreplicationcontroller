@@ -156,6 +156,40 @@ func TestE2ESyncoidFailure(t *testing.T) {
 	k.assertRunEphemeralCleanup(sc.Name)
 }
 
+func TestE2EDestinationContentionWaits(t *testing.T) {
+	k := newKubectlRunner(t)
+	suffix := uniqueSuffix()
+	pool := realZFSPool()
+	blocker := replicationCase{
+		Name:          "e2e-lock-a-" + suffix,
+		SourceNode:    "missing-source-" + suffix,
+		TargetNode:    e2eTargetNode,
+		SourceDataset: pool + "/src-lock-a-" + suffix,
+		TargetDataset: pool + "/dst-lock-" + suffix,
+	}
+	blocked := replicationCase{
+		Name:          "e2e-lock-b-" + suffix,
+		SourceNode:    e2eSourceNode,
+		TargetNode:    e2eTargetNode,
+		SourceDataset: pool + "/src-lock-b-" + suffix,
+		TargetDataset: blocker.TargetDataset,
+	}
+	k.cleanupReplicationOnExit(blocker.Name)
+	k.cleanupReplicationOnExit(blocked.Name)
+	k.cleanupReplication(blocker.Name)
+	k.cleanupReplication(blocked.Name)
+
+	k.applyReplication(blocker)
+	k.patchRunPhase(e2eNamespace, blocker.Name, "Running")
+	k.applyReplication(blocked)
+
+	k.waitForDestinationLock(blocked, blocker.Name, blocker.TargetDataset, 90*time.Second)
+	k.assertNoSenderJob(blocked.Name)
+
+	k.cleanupReplication(blocker.Name)
+	k.waitForRunPastPending(blocked, 2*time.Minute)
+}
+
 func TestE2ETerminalCleanupCurrentStateMatrix(t *testing.T) {
 	k := newKubectlRunner(t)
 	suffix := uniqueSuffix()
@@ -441,6 +475,37 @@ func (k kubectlRunner) waitForFailedInNamespace(namespace string, sc replication
 	}, "Failed")
 }
 
+func (k kubectlRunner) waitForDestinationLock(sc replicationCase, blockerName, targetDataset string, timeout time.Duration) replicationStatus {
+	k.t.Helper()
+	return k.waitForStatusInNamespace(e2eNamespace, sc, timeout, func(st replicationStatus) bool {
+		return st.Phase == "Pending" &&
+			strings.Contains(st.LastError, "waiting for active run "+blockerName) &&
+			strings.Contains(st.LastError, targetDataset)
+	}, "Pending destination lock")
+}
+
+func (k kubectlRunner) waitForRunPastPending(sc replicationCase, timeout time.Duration) replicationStatus {
+	k.t.Helper()
+	deadline := time.Now().Add(timeout)
+	var last replicationStatus
+	var lastErr error
+	for time.Now().Before(deadline) {
+		status, err := k.getStatusInNamespace(e2eNamespace, sc.Name)
+		if err == nil {
+			last = status
+			if status.Phase != "" && status.Phase != "Pending" {
+				return status
+			}
+		} else {
+			lastErr = err
+		}
+		time.Sleep(2 * time.Second)
+	}
+	k.collectDiagnosticsInNamespace(e2eNamespace, sc.Name)
+	k.t.Fatalf("timed out waiting for %s to move past Pending; last status=%#v last error=%v", sc.Name, last, lastErr)
+	return replicationStatus{}
+}
+
 func (k kubectlRunner) waitForStatusInNamespace(namespace string, sc replicationCase, timeout time.Duration, ready func(replicationStatus) bool, want string) replicationStatus {
 	k.t.Helper()
 	deadline := time.Now().Add(timeout)
@@ -589,6 +654,19 @@ func (k kubectlRunner) assertNoJobsOrSecretsInNamespace(namespace, name string) 
 	}
 	if strings.TrimSpace(out) != "" {
 		k.t.Fatalf("jobs/secrets exist for %s/%s:\n%s", namespace, name, out)
+	}
+}
+
+func (k kubectlRunner) assertNoSenderJob(name string) {
+	k.t.Helper()
+	selector := e2eLabelPrefix + "/run=" + name + "," + e2eLabelPrefix + "/role=sender"
+	out, err := k.runOutput(20*time.Second, "get", "jobs", "-n", e2eNamespace, "-l", selector, "-o", "name")
+	if err != nil && !strings.Contains(err.Error(), "No resources found") {
+		k.t.Fatal(err)
+	}
+	if strings.TrimSpace(out) != "" {
+		k.collectDiagnosticsInNamespace(e2eNamespace, name)
+		k.t.Fatalf("sender job exists for blocked run %s:\n%s", name, out)
 	}
 }
 
