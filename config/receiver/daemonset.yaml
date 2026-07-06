@@ -51,8 +51,15 @@ spec:
             - name: SSH_LISTEN_PORT
               value: "2222"
           readinessProbe:
-            tcpSocket:
-              port: ssh
+            exec:
+              command:
+                - /bin/sh
+                - -ec
+                - |
+                  pidfile=/run/zfs-receiver/sshd.pid
+                  test -s "$pidfile"
+                  kill -0 "$(cat "$pidfile")"
+                  /usr/sbin/sshd -t -f /run/zfs-receiver/sshd_config
           volumeMounts:
             - name: dev-zfs
               mountPath: /dev/zfs

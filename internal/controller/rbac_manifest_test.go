@@ -34,9 +34,23 @@ type manifestObject struct {
 }
 
 type manifestContainer struct {
-	Name string           `yaml:"name"`
-	Args []string         `yaml:"args"`
-	Env  []manifestEnvVar `yaml:"env"`
+	Name           string           `yaml:"name"`
+	Args           []string         `yaml:"args"`
+	Env            []manifestEnvVar `yaml:"env"`
+	ReadinessProbe manifestProbe    `yaml:"readinessProbe"`
+}
+
+type manifestProbe struct {
+	Exec      *manifestExecAction      `yaml:"exec"`
+	TCPSocket *manifestTCPSocketAction `yaml:"tcpSocket"`
+}
+
+type manifestExecAction struct {
+	Command []string `yaml:"command"`
+}
+
+type manifestTCPSocketAction struct {
+	Port string `yaml:"port"`
 }
 
 type manifestEnvVar struct {
@@ -115,6 +129,44 @@ func TestControllerClusterRoleHasRequiredPermissions(t *testing.T) {
 	for _, verb := range []string{"create", "get", "list", "watch", "update", "patch", "delete"} {
 		if !contains(verbs, verb) {
 			t.Fatalf("secrets RBAC verbs = %v, missing %q", verbs, verb)
+		}
+	}
+}
+
+func TestReceiverDaemonSetReadinessProbeDoesNotOpenSSHConnection(t *testing.T) {
+	t.Helper()
+
+	daemonSetPath := filepath.Join("..", "..", "config", "receiver", "daemonset.yaml")
+	data, err := os.ReadFile(daemonSetPath)
+	if err != nil {
+		t.Fatalf("read %s: %v", daemonSetPath, err)
+	}
+
+	var daemonSet manifestObject
+	if err := yaml.Unmarshal(data, &daemonSet); err != nil {
+		t.Fatalf("parse %s: %v", daemonSetPath, err)
+	}
+
+	receiver := findContainer(daemonSet.Spec.Template.Spec.Containers, "receiver")
+	if receiver == nil {
+		t.Fatalf("receiver DaemonSet has no receiver container")
+	}
+	if receiver.ReadinessProbe.TCPSocket != nil {
+		t.Fatalf("receiver readiness probe opens SSH port %q; want quiet exec probe", receiver.ReadinessProbe.TCPSocket.Port)
+	}
+	if receiver.ReadinessProbe.Exec == nil {
+		t.Fatalf("receiver readiness probe has no exec command")
+	}
+
+	command := strings.Join(receiver.ReadinessProbe.Exec.Command, " ")
+	for _, want := range []string{
+		"/bin/sh",
+		"-ec",
+		"/run/zfs-receiver/sshd.pid",
+		"/usr/sbin/sshd -t -f /run/zfs-receiver/sshd_config",
+	} {
+		if !strings.Contains(command, want) {
+			t.Fatalf("receiver readiness exec command = %q, missing %q", command, want)
 		}
 	}
 }

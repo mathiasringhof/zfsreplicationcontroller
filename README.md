@@ -90,8 +90,8 @@ For an alpha release, prefer the rendered release manifest attached to the
 GitHub release instead of the mutable `main` manifests in the repository:
 
 ```sh
-curl -LO https://github.com/mathiasringhof/zfsreplicationcontroller/releases/download/v0.1.1/zfsreplicationcontroller-v0.1.1.yaml
-kubectl apply -f zfsreplicationcontroller-v0.1.1.yaml
+curl -LO https://github.com/mathiasringhof/zfsreplicationcontroller/releases/download/v0.1.2/zfsreplicationcontroller-v0.1.2.yaml
+kubectl apply -f zfsreplicationcontroller-v0.1.2.yaml
 ```
 
 The `0.1.x` releases are alpha releases. The Kubernetes API remains
