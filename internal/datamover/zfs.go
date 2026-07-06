@@ -3,8 +3,6 @@ package datamover
 import (
 	"bytes"
 	"context"
-	"io"
-	"os"
 	"os/exec"
 )
 
@@ -18,7 +16,7 @@ func (ExecRunner) Run(ctx context.Context, name string, args ...string) (string,
 	cmd := exec.CommandContext(ctx, name, args...)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
-	cmd.Stderr = io.MultiWriter(&stderr, os.Stderr)
+	cmd.Stderr = &stderr
 	err := cmd.Run()
 	return stdout.String(), stderr.String(), err
 }

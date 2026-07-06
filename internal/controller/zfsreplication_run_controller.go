@@ -24,6 +24,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
 type ZFSReplicationRunReconciler struct {
@@ -45,7 +46,11 @@ func (r *ZFSReplicationRunReconciler) Reconcile(ctx context.Context, req ctrl.Re
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 	names := objectNamesForRun(run.Name)
+	logger := log.FromContext(ctx).WithValues(runLogValues(&run, names)...)
+	ctx = log.IntoContext(ctx, logger)
+	logger.Info("reconciling replication run")
 	if run.Status.Phase.Terminal() {
+		logger.WithValues("phase", run.Status.Phase).Info("cleaning up terminal replication run")
 		return ctrl.Result{}, r.reconcileTerminalRun(ctx, &run, names)
 	}
 	if err := validateRunSpec(run.Spec); err != nil {
@@ -82,6 +87,8 @@ func (r *ZFSReplicationRunReconciler) Reconcile(ctx context.Context, req ctrl.Re
 			return result, err
 		}
 		receiver = nextReceiver
+	} else {
+		logger.WithValues("receiverPod", receiver.podName, "receiverPodIP", receiver.podIP).Info("sender job already present")
 	}
 
 	if result, done, err := r.finishFromSenderJob(ctx, &run, names, receiver); err != nil || done {
@@ -112,6 +119,7 @@ func (r *ZFSReplicationRunReconciler) ensureSenderStarted(ctx context.Context, r
 		return runReceiverStatus{}, ctrl.Result{}, true, r.failRunObject(ctx, run, names, msg)
 	}
 	if !ready {
+		log.FromContext(ctx).Info("waiting for replication receiver")
 		return runReceiverStatus{}, ctrl.Result{RequeueAfter: 5 * time.Second}, true, r.patchRunStatus(ctx, run, func(st *zfsv1.ZFSReplicationRunStatus) {
 			st.Phase = zfsv1.PhaseStartingReceiver
 			fillRunStatusNames(st, names)
@@ -122,6 +130,7 @@ func (r *ZFSReplicationRunReconciler) ensureSenderStarted(ctx context.Context, r
 		podName: task.Status.ReceiverPod.Name,
 		podIP:   task.Status.Endpoint.Host,
 	}
+	log.FromContext(ctx).WithValues("receiverPod", receiver.podName, "receiverPodIP", receiver.podIP).Info("replication receiver is ready")
 	if err := r.ensureRunKnownHosts(ctx, run, names, task); err != nil {
 		return runReceiverStatus{}, ctrl.Result{}, false, err
 	}
@@ -136,6 +145,7 @@ func (r *ZFSReplicationRunReconciler) ensureSenderStarted(ctx context.Context, r
 	if err := r.ensureRunSenderJob(ctx, run, names, receiver.podIP); err != nil {
 		return runReceiverStatus{}, ctrl.Result{}, false, err
 	}
+	log.FromContext(ctx).WithValues("receiverPod", receiver.podName, "receiverPodIP", receiver.podIP).Info("created sender job")
 	return receiver, ctrl.Result{}, false, nil
 }
 
@@ -144,6 +154,7 @@ func (r *ZFSReplicationRunReconciler) finishFromSenderJob(ctx context.Context, r
 		if err != nil {
 			return ctrl.Result{}, false, err
 		}
+		log.FromContext(ctx).WithValues("receiverPod", receiver.podName, "receiverPodIP", receiver.podIP, "reason", msg).Info("sender job failed")
 		return ctrl.Result{}, true, r.failRunObject(ctx, run, names, msg)
 	}
 
@@ -152,6 +163,7 @@ func (r *ZFSReplicationRunReconciler) finishFromSenderJob(ctx context.Context, r
 		return ctrl.Result{}, false, err
 	}
 	if senderDone {
+		log.FromContext(ctx).WithValues("receiverPod", receiver.podName, "receiverPodIP", receiver.podIP).Info("sender job succeeded")
 		now := metav1.Now()
 		if err := r.patchRunStatus(ctx, run, func(st *zfsv1.ZFSReplicationRunStatus) {
 			st.Phase = zfsv1.PhaseSucceeded
@@ -540,6 +552,21 @@ func fillRunStatusNames(st *zfsv1.ZFSReplicationRunStatus, names runObjects) {
 	st.SenderJobName = names.SenderName
 	st.ReceiveTaskName = names.ReceiveTaskName
 	st.SSHSecretName = names.SecretName
+}
+
+func runLogValues(run *zfsv1.ZFSReplicationRun, names runObjects) []any {
+	return []any{
+		"namespace", run.Namespace,
+		"run", run.Name,
+		"sourceNode", run.Spec.Source.NodeName,
+		"sourceDataset", run.Spec.Source.Dataset,
+		"targetNode", run.Spec.Target.NodeName,
+		"targetDataset", run.Spec.Target.Dataset,
+		"senderJob", names.SenderName,
+		"receiveTask", names.ReceiveTaskName,
+		"sshSecret", names.SecretName,
+		"syncoidIdentifier", syncSnapshotIdentifierForRun(run),
+	}
 }
 
 func objectNamesForRun(runName string) runObjects {

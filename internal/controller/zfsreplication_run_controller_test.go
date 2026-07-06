@@ -2,11 +2,13 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/go-logr/logr/funcr"
 	zfsv1 "github.com/mathias/zfsreplicationcontroller/api/v1alpha1"
 	"github.com/mathias/zfsreplicationcontroller/internal/datamover"
 	"golang.org/x/crypto/ssh"
@@ -21,6 +23,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
 const testReceiverHostKey = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOOBMEh4NBNCYArCdegKrXOfyIVEEhfvFoOYNYjsBP41 receiver"
@@ -161,6 +164,147 @@ func TestRunReconcileCreatesReceiveTaskBeforeSenderJob(t *testing.T) {
 		t.Fatalf("task sync snapshot identifier = %q, want non-empty shell-safe identifier", task.Spec.Policy.SyncSnapshotIdentifier)
 	}
 	assertObjectDeleted(t, r.Client, &batchv1.Job{}, names.SenderName)
+}
+
+func TestRunReconcileLogsReceiverAndSenderLifecycle(t *testing.T) {
+	run := replicationRun("manual-logs")
+	names := objectNamesForRun(run.Name)
+	r := newRunReconciler(t, run, readyReceiveTask(run, names, "10.0.0.42", testReceiverHostKey))
+	ctx, logs := captureRunLogger()
+
+	if _, err := r.Reconcile(ctx, request(run.Name)); err != nil {
+		t.Fatal(err)
+	}
+
+	baseFields := map[string]string{
+		"namespace":         run.Namespace,
+		"run":               run.Name,
+		"sourceDataset":     run.Spec.Source.Dataset,
+		"targetDataset":     run.Spec.Target.Dataset,
+		"senderJob":         names.SenderName,
+		"receiveTask":       names.ReceiveTaskName,
+		"syncoidIdentifier": syncSnapshotIdentifierForRun(run),
+	}
+	assertLogEntry(t, logs, "reconciling replication run", baseFields)
+	receiverFields := cloneStringMap(baseFields)
+	receiverFields["receiverPod"] = "zfs-receiver-worker-b"
+	receiverFields["receiverPodIP"] = "10.0.0.42"
+	assertLogEntry(t, logs, "replication receiver is ready", receiverFields)
+	assertLogEntry(t, logs, "created sender job", receiverFields)
+}
+
+func TestRunReconcileLogsReceiverWait(t *testing.T) {
+	run := replicationRun("manual-wait")
+	names := objectNamesForRun(run.Name)
+	r := newRunReconciler(t, run)
+	ctx, logs := captureRunLogger()
+
+	result, err := r.Reconcile(ctx, request(run.Name))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.RequeueAfter == 0 {
+		t.Fatalf("RequeueAfter = %v, want receiver wait", result.RequeueAfter)
+	}
+
+	assertLogEntry(t, logs, "waiting for replication receiver", map[string]string{
+		"namespace":     run.Namespace,
+		"run":           run.Name,
+		"sourceDataset": run.Spec.Source.Dataset,
+		"targetDataset": run.Spec.Target.Dataset,
+		"senderJob":     names.SenderName,
+		"receiveTask":   names.ReceiveTaskName,
+	})
+}
+
+func TestRunReconcileLogsSenderSuccess(t *testing.T) {
+	run := replicationRun("manual-success")
+	names := objectNamesForRun(run.Name)
+	run.Status.ReceiverPodName = "zfs-receiver-worker-b"
+	run.Status.ReceiverPodIP = "10.0.0.42"
+	task := readyReceiveTask(run, names, "10.0.0.42", testReceiverHostKey)
+	sender := runSenderJob(run, names, "datamover:test", "10.0.0.42")
+	sender.Status.Succeeded = 1
+	r := newRunReconciler(t, run, task, sender)
+	ctx, logs := captureRunLogger()
+
+	if _, err := r.Reconcile(ctx, request(run.Name)); err != nil {
+		t.Fatal(err)
+	}
+
+	assertLogEntry(t, logs, "sender job succeeded", map[string]string{
+		"namespace":     run.Namespace,
+		"run":           run.Name,
+		"senderJob":     names.SenderName,
+		"receiveTask":   names.ReceiveTaskName,
+		"receiverPod":   "zfs-receiver-worker-b",
+		"receiverPodIP": "10.0.0.42",
+	})
+}
+
+func TestRunReconcileLogsSenderJobAlreadyPresent(t *testing.T) {
+	run := replicationRun("manual-present")
+	names := objectNamesForRun(run.Name)
+	run.Status.ReceiverPodName = "zfs-receiver-worker-b"
+	run.Status.ReceiverPodIP = "10.0.0.42"
+	task := readyReceiveTask(run, names, "10.0.0.42", testReceiverHostKey)
+	sender := runSenderJob(run, names, "datamover:test", "10.0.0.42")
+	r := newRunReconciler(t, run, task, sender)
+	ctx, logs := captureRunLogger()
+
+	if _, err := r.Reconcile(ctx, request(run.Name)); err != nil {
+		t.Fatal(err)
+	}
+
+	assertLogEntry(t, logs, "sender job already present", map[string]string{
+		"namespace":     run.Namespace,
+		"run":           run.Name,
+		"senderJob":     names.SenderName,
+		"receiverPod":   "zfs-receiver-worker-b",
+		"receiverPodIP": "10.0.0.42",
+	})
+}
+
+func TestRunReconcileLogsSenderFailure(t *testing.T) {
+	run := replicationRun("manual-failure")
+	names := objectNamesForRun(run.Name)
+	run.Status.ReceiverPodName = "zfs-receiver-worker-b"
+	run.Status.ReceiverPodIP = "10.0.0.42"
+	task := readyReceiveTask(run, names, "10.0.0.42", testReceiverHostKey)
+	sender := runSenderJob(run, names, "datamover:test", "10.0.0.42")
+	sender.Status.Failed = 1
+	sender.Status.Conditions = []batchv1.JobCondition{
+		{Type: batchv1.JobFailed, Status: corev1.ConditionTrue, Message: "syncoid exited with status 1"},
+	}
+	r := newRunReconciler(t, run, task, sender)
+	ctx, logs := captureRunLogger()
+
+	if _, err := r.Reconcile(ctx, request(run.Name)); err != nil {
+		t.Fatal(err)
+	}
+
+	assertLogEntry(t, logs, "sender job failed", map[string]string{
+		"namespace": run.Namespace,
+		"run":       run.Name,
+		"reason":    "syncoid exited with status 1",
+	})
+}
+
+func TestRunReconcileLogsTerminalCleanup(t *testing.T) {
+	run := replicationRun("manual-terminal")
+	run.Status.Phase = zfsv1.PhaseSucceeded
+	r := newRunReconciler(t, run)
+	ctx, logs := captureRunLogger()
+
+	if _, err := r.Reconcile(ctx, request(run.Name)); err != nil {
+		t.Fatal(err)
+	}
+
+	assertLogEntry(t, logs, "cleaning up terminal replication run", map[string]string{
+		"namespace": run.Namespace,
+		"run":       run.Name,
+		"phase":     string(zfsv1.PhaseSucceeded),
+	})
 }
 
 func TestRunReconcileRetriesCleanupForTerminalRun(t *testing.T) {
@@ -472,6 +616,52 @@ func newTestScheme(t *testing.T) *runtime.Scheme {
 		t.Fatal(err)
 	}
 	return scheme
+}
+
+type capturedLogs struct {
+	entries []map[string]any
+}
+
+func captureRunLogger() (context.Context, *capturedLogs) {
+	var logs capturedLogs
+	logger := funcr.NewJSON(func(obj string) {
+		entry := map[string]any{}
+		if err := json.Unmarshal([]byte(obj), &entry); err == nil {
+			logs.entries = append(logs.entries, entry)
+		}
+	}, funcr.Options{})
+	return log.IntoContext(context.Background(), logger), &logs
+}
+
+func assertLogEntry(t *testing.T, logs *capturedLogs, msg string, fields map[string]string) {
+	t.Helper()
+	for _, entry := range logs.entries {
+		if entry["msg"] != msg {
+			continue
+		}
+		if logEntryHasFields(entry, fields) {
+			return
+		}
+	}
+	t.Fatalf("logs did not contain %q with fields %#v; got %#v", msg, fields, logs.entries)
+}
+
+func logEntryHasFields(entry map[string]any, fields map[string]string) bool {
+	for key, want := range fields {
+		got, ok := entry[key]
+		if !ok || got != want {
+			return false
+		}
+	}
+	return true
+}
+
+func cloneStringMap(in map[string]string) map[string]string {
+	out := make(map[string]string, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
 }
 
 func request(name string) ctrl.Request {

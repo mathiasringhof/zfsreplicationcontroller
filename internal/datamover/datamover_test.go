@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -15,12 +16,145 @@ type call struct {
 }
 
 type fakeRunner struct {
-	calls []call
+	calls  []call
+	stdout string
+	stderr string
+	err    error
 }
 
 func (f *fakeRunner) Run(_ context.Context, name string, args ...string) (string, string, error) {
 	f.calls = append(f.calls, call{name: name, args: args})
-	return "", "", nil
+	return f.stdout, f.stderr, f.err
+}
+
+func TestSenderLogsSuccessfulSyncoidRun(t *testing.T) {
+	runner := &fakeRunner{
+		stdout: "INFO: Sending oldest full snapshot tank/src@syncoid_zrc-123_2026-07-06:12:00:00-GUID-123456 --sshkey=/var/run/zfsrep/ssh/id_rsa\n",
+		stderr: "syncoid warning that should remain visible --sshkey=/var/run/zfsrep/ssh/id_rsa\n",
+	}
+	var logs strings.Builder
+
+	err := runSender(context.Background(), SenderConfig{
+		SrcDataset:        "tank/src",
+		DstHost:           "root@10.0.0.42",
+		DstDataset:        "tank/dst",
+		SSHKeyFile:        "/var/run/zfsrep/ssh/id_rsa",
+		KnownHostsFile:    "/var/run/zfsrep/ssh/known_hosts",
+		SSHPort:           "2222",
+		NoRollback:        true,
+		Compress:          "none",
+		SyncoidIdentifier: "zrc-123",
+		ReceiveUnmounted:  true,
+		ReceiveResumable:  true,
+	}, runner, &logs)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	out := logs.String()
+	for _, want := range []string{
+		"sender starting",
+		"srcDataset=tank/src",
+		"dstDataset=tank/dst",
+		"dstHost=root@10.0.0.42",
+		"syncoidIdentifier=zrc-123",
+		"syncoid command",
+		"--sshkey=<redacted>",
+		"syncoid stdout",
+		"INFO: Sending oldest full snapshot",
+		"syncoid stderr",
+		"syncoid warning that should remain visible",
+		"--sshkey=<redacted>",
+		"sender completed",
+		"result=success",
+		"exitCode=0",
+		"duration=",
+		"finalSnapshot=tank/src@syncoid_zrc-123_2026-07-06:12:00:00-GUID-123456",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("logs missing %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "--sshkey=/var/run/zfsrep/ssh/id_rsa") {
+		t.Fatalf("logs contain unredacted ssh key path:\n%s", out)
+	}
+}
+
+type fakeExitError struct {
+	code int
+	msg  string
+}
+
+func (e fakeExitError) Error() string {
+	return e.msg
+}
+
+func (e fakeExitError) ExitCode() int {
+	return e.code
+}
+
+func TestSenderLogsFailedSyncoidRunAndReturnsCombinedOutput(t *testing.T) {
+	runner := &fakeRunner{
+		stdout: "syncoid stdout detail --sshkey=/var/run/zfsrep/ssh/id_rsa\n",
+		stderr: "syncoid stderr detail --sshkey=/var/run/zfsrep/ssh/id_rsa\n",
+		err:    fakeExitError{code: 23, msg: "exit status 23\nretry marker --sshkey=/var/run/zfsrep/ssh/id_rsa"},
+	}
+	var logs strings.Builder
+
+	err := runSender(context.Background(), SenderConfig{
+		SrcDataset:       "tank/src",
+		DstHost:          "root@10.0.0.42",
+		DstDataset:       "tank/dst",
+		SSHKeyFile:       "/var/run/zfsrep/ssh/id_rsa",
+		KnownHostsFile:   "/var/run/zfsrep/ssh/known_hosts",
+		SSHPort:          "2222",
+		NoRollback:       true,
+		Compress:         "none",
+		ReceiveUnmounted: true,
+		ReceiveResumable: true,
+	}, runner, &logs)
+	if err == nil {
+		t.Fatal("runSender() error = nil, want syncoid failure")
+	}
+	for _, want := range []string{"syncoid stdout detail", "syncoid stderr detail", "exit status 23 retry marker", "--sshkey=<redacted>"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error missing %q: %v", want, err)
+		}
+	}
+	if strings.Contains(err.Error(), "--sshkey=/var/run/zfsrep/ssh/id_rsa") {
+		t.Fatalf("error contains unredacted ssh key path: %v", err)
+	}
+	out := logs.String()
+	for _, want := range []string{
+		"sender completed",
+		"result=failure",
+		"exitCode=23",
+		"syncoid stdout syncoid stdout detail --sshkey=<redacted>",
+		"syncoid stderr syncoid stderr detail --sshkey=<redacted>",
+		`error="stdout: syncoid stdout detail --sshkey=<redacted>; stderr: syncoid stderr detail --sshkey=<redacted>; error: exit status 23 retry marker --sshkey=<redacted>"`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("logs missing %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "--sshkey=/var/run/zfsrep/ssh/id_rsa") {
+		t.Fatalf("logs contain unredacted ssh key path:\n%s", out)
+	}
+	if last := failureMessageFromSenderLogs(out); last != "sender completed result=failure exitCode=23 duration=0s error=\"stdout: syncoid stdout detail --sshkey=<redacted>; stderr: syncoid stderr detail --sshkey=<redacted>; error: exit status 23 retry marker --sshkey=<redacted>\"" {
+		t.Fatalf("last failure line = %q", last)
+	}
+}
+
+func failureMessageFromSenderLogs(logs string) string {
+	var last string
+	for _, line := range strings.Split(logs, "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			last = line
+		}
+	}
+	last = strings.Replace(last, regexp.MustCompile(`duration=[^ ]+`).FindString(last), "duration=0s", 1)
+	return last
 }
 
 func TestSenderRunsSyncoidWithConfiguredSnapshotOptions(t *testing.T) {
@@ -85,7 +219,7 @@ func TestSenderConfigFromEnvDefaults(t *testing.T) {
 	}
 }
 
-func TestExecRunnerMirrorsSuccessfulStderr(t *testing.T) {
+func TestExecRunnerCapturesStderrWithoutMirroringRawOutput(t *testing.T) {
 	oldStderr := os.Stderr
 	readStderr, writeStderr, err := os.Pipe()
 	if err != nil {
@@ -99,7 +233,8 @@ func TestExecRunnerMirrorsSuccessfulStderr(t *testing.T) {
 	})
 	os.Stderr = writeStderr
 
-	stdout, stderr, err := ExecRunner{}.Run(context.Background(), "sh", "-c", "printf stdout; printf stderr >&2")
+	rawStderr := "--sshkey=/var/run/zfsrep/ssh/id_rsa"
+	stdout, stderr, err := ExecRunner{}.Run(context.Background(), "sh", "-c", "printf stdout; printf '%s' '"+rawStderr+"' >&2")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -114,11 +249,11 @@ func TestExecRunnerMirrorsSuccessfulStderr(t *testing.T) {
 	if stdout != "stdout" {
 		t.Fatalf("stdout = %q", stdout)
 	}
-	if stderr != "stderr" {
+	if stderr != rawStderr {
 		t.Fatalf("stderr = %q", stderr)
 	}
-	if string(mirrored) != "stderr" {
-		t.Fatalf("mirrored stderr = %q", string(mirrored))
+	if string(mirrored) != "" {
+		t.Fatalf("mirrored stderr = %q, want no raw mirror", string(mirrored))
 	}
 }
 

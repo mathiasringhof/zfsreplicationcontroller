@@ -2,9 +2,13 @@ package datamover
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"os"
+	"regexp"
 	"strings"
+	"time"
 
 	"github.com/mathias/zfsreplicationcontroller/internal/replication"
 )
@@ -34,6 +38,8 @@ const (
 	DefaultKnownHostsFile = "/var/run/zfsrep/ssh/known_hosts"
 	DefaultSSHPort        = "2222"
 )
+
+var sshKeyArgPattern = regexp.MustCompile(`--sshkey=\S+`)
 
 type SenderConfig struct {
 	SrcDataset        string
@@ -83,6 +89,11 @@ func SenderConfigFromLookup(lookup func(string) string) SenderConfig {
 }
 
 func RunSender(ctx context.Context, cfg SenderConfig, r CommandRunner) error {
+	return runSender(ctx, cfg, r, os.Stderr)
+}
+
+func runSender(ctx context.Context, cfg SenderConfig, r CommandRunner, logw io.Writer) error {
+	started := time.Now()
 	if err := validateNode(cfg.ExpectedNode, cfg.ActualNode); err != nil {
 		return err
 	}
@@ -90,6 +101,29 @@ func RunSender(ctx context.Context, cfg SenderConfig, r CommandRunner) error {
 	if err != nil {
 		return err
 	}
+	if cfg.SyncoidIdentifier != "" && !replication.ValidSyncoidIdentifier(cfg.SyncoidIdentifier) {
+		return fmt.Errorf("unsupported syncoid identifier %q", cfg.SyncoidIdentifier)
+	}
+	if cfg.DstHost != "" && cfg.KnownHostsFile == "" {
+		return fmt.Errorf("known hosts file is required for SSH replication")
+	}
+	args := syncoidArgs(cfg, compress)
+	logSenderStart(logw, cfg)
+	logSenderLine(logw, "syncoid command command=%s", strings.Join(sanitizeSyncoidArgs(args), " "))
+	stdout, stderr, err := r.Run(ctx, "syncoid", args...)
+	logCommandOutput(logw, "stdout", stdout)
+	logCommandOutput(logw, "stderr", stderr)
+	duration := time.Since(started).Round(time.Millisecond)
+	if err != nil {
+		summary := syncoidFailureSummary(stdout, stderr, err)
+		logSenderLine(logw, "sender completed result=failure exitCode=%d duration=%s error=%q", commandExitCode(err), duration, summary)
+		return fmt.Errorf("syncoid failed: %s", summary)
+	}
+	logSenderLine(logw, "sender completed result=success exitCode=0 duration=%s%s", duration, finalSnapshotLogSuffix(stdout+"\n"+stderr))
+	return nil
+}
+
+func syncoidArgs(cfg SenderConfig, compress string) []string {
 	var args []string
 	if cfg.NoSyncSnap {
 		args = append(args, "--no-sync-snap")
@@ -102,13 +136,7 @@ func RunSender(ctx context.Context, cfg SenderConfig, r CommandRunner) error {
 		args = append(args, "--compress="+compress)
 	}
 	if cfg.SyncoidIdentifier != "" {
-		if !replication.ValidSyncoidIdentifier(cfg.SyncoidIdentifier) {
-			return fmt.Errorf("unsupported syncoid identifier %q", cfg.SyncoidIdentifier)
-		}
 		args = append(args, "--identifier="+cfg.SyncoidIdentifier)
-	}
-	if cfg.DstHost != "" && cfg.KnownHostsFile == "" {
-		return fmt.Errorf("known hosts file is required for SSH replication")
 	}
 	if cfg.KnownHostsFile != "" {
 		args = append(args,
@@ -138,11 +166,102 @@ func RunSender(ctx context.Context, cfg SenderConfig, r CommandRunner) error {
 	if cfg.ForceDelete {
 		args = append(args, "--force-delete")
 	}
-	args = append(args, cfg.SrcDataset, syncoidTarget(cfg.DstHost, cfg.DstDataset))
-	if _, stderr, err := r.Run(ctx, "syncoid", args...); err != nil {
-		return fmt.Errorf("syncoid failed: %s", clean(stderr, err))
+	return append(args, cfg.SrcDataset, syncoidTarget(cfg.DstHost, cfg.DstDataset))
+}
+
+func logSenderStart(w io.Writer, cfg SenderConfig) {
+	logSenderLine(w, "sender starting srcDataset=%s dstDataset=%s dstHost=%s sshPort=%s syncoidIdentifier=%s noSyncSnap=%t noRollback=%t forceDelete=%t compress=%s receiveUnmounted=%t receiveResumable=%t includeSnaps=%q excludeSnaps=%q",
+		cfg.SrcDataset, cfg.DstDataset, cfg.DstHost, cfg.SSHPort, cfg.SyncoidIdentifier, cfg.NoSyncSnap, cfg.NoRollback, cfg.ForceDelete, cfg.Compress, cfg.ReceiveUnmounted, cfg.ReceiveResumable, strings.Join(cfg.IncludeSnaps, ","), strings.Join(cfg.ExcludeSnaps, ","))
+}
+
+func logSenderLine(w io.Writer, format string, args ...any) {
+	if w == nil {
+		return
 	}
-	return nil
+	if _, err := fmt.Fprintf(w, format+"\n", args...); err != nil {
+		return
+	}
+}
+
+func logCommandOutput(w io.Writer, stream, value string) {
+	value = strings.TrimSpace(redactSensitiveText(value))
+	if value == "" {
+		return
+	}
+	for _, line := range strings.Split(value, "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			logSenderLine(w, "syncoid %s %s", stream, line)
+		}
+	}
+}
+
+func sanitizeSyncoidArgs(args []string) []string {
+	out := append([]string(nil), args...)
+	for i, arg := range out {
+		if strings.HasPrefix(arg, "--sshkey=") {
+			out[i] = "--sshkey=<redacted>"
+		}
+	}
+	return out
+}
+
+func redactSensitiveText(value string) string {
+	return sshKeyArgPattern.ReplaceAllString(value, "--sshkey=<redacted>")
+}
+
+func finalSnapshotLogSuffix(output string) string {
+	if snapshot := lastSnapshotToken(output); snapshot != "" {
+		return " finalSnapshot=" + snapshot
+	}
+	return ""
+}
+
+func lastSnapshotToken(output string) string {
+	var last string
+	for _, field := range strings.Fields(output) {
+		field = strings.Trim(field, `"'.,;()[]{}<>`)
+		if _, _, ok := replication.SplitSnapshotTarget(field); ok {
+			last = field
+		}
+	}
+	return last
+}
+
+type exitCoder interface {
+	ExitCode() int
+}
+
+func commandExitCode(err error) int {
+	if err == nil {
+		return 0
+	}
+	var exitErr exitCoder
+	if errors.As(err, &exitErr) {
+		return exitErr.ExitCode()
+	}
+	return -1
+}
+
+func syncoidFailureSummary(stdout, stderr string, err error) string {
+	var parts []string
+	if stdout = strings.TrimSpace(redactSensitiveText(stdout)); stdout != "" {
+		parts = append(parts, "stdout: "+singleLine(stdout))
+	}
+	if stderr = strings.TrimSpace(redactSensitiveText(stderr)); stderr != "" {
+		parts = append(parts, "stderr: "+singleLine(stderr))
+	}
+	if err != nil {
+		parts = append(parts, "error: "+singleLine(redactSensitiveText(err.Error())))
+	}
+	if len(parts) == 0 {
+		return "syncoid exited with an unknown error"
+	}
+	return strings.Join(parts, "; ")
+}
+
+func singleLine(value string) string {
+	return strings.Join(strings.Fields(value), " ")
 }
 
 func syncoidTarget(host, dataset string) string {
@@ -176,14 +295,6 @@ func listLookup(lookup func(string) string, key string) []string {
 		}
 	}
 	return out
-}
-
-func clean(stderr string, err error) string {
-	stderr = strings.TrimSpace(stderr)
-	if stderr != "" {
-		return stderr
-	}
-	return err.Error()
 }
 
 func validateNode(expected, actual string) error {
