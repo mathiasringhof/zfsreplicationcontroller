@@ -160,14 +160,48 @@ func TestSenderLogsSuccessfulSyncoidRun(t *testing.T) {
 		"result=success",
 		"exitCode=0",
 		"duration=",
-		"finalSnapshot=tank/src@syncoid_zrc-123_2026-07-06:12:00:00-GUID-123456",
+		"mode=full",
 	} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("logs missing %q:\n%s", want, out)
 		}
 	}
+	if strings.Contains(out, "finalSnapshot=") {
+		t.Fatalf("logs contain misleading finalSnapshot:\n%s", out)
+	}
 	if strings.Contains(out, "--sshkey=/var/run/zfsrep/ssh/id_rsa") {
 		t.Fatalf("logs contain unredacted ssh key path:\n%s", out)
+	}
+}
+
+func TestSenderSuccessSummaryDoesNotReportMisleadingFinalSnapshotForIncremental(t *testing.T) {
+	runner := &fakeRunner{
+		stdout: "INFO: Sending incremental tank/src@syncoid_old_2026 ... syncoid_new_2026 to zfs-recv@10.0.0.42:tank/dst (~ 7 KB):\n",
+	}
+	var logs strings.Builder
+
+	err := runSender(context.Background(), SenderConfig{
+		SrcDataset:       "tank/src",
+		DstHost:          "root@10.0.0.42",
+		DstDataset:       "tank/dst",
+		SSHKeyFile:       "/var/run/zfsrep/ssh/id_rsa",
+		KnownHostsFile:   "/var/run/zfsrep/ssh/known_hosts",
+		SSHPort:          "2222",
+		NoRollback:       true,
+		Compress:         "none",
+		ReceiveUnmounted: true,
+		ReceiveResumable: true,
+	}, runner, &logs)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	out := logs.String()
+	if !strings.Contains(out, "mode=incremental") {
+		t.Fatalf("logs missing incremental mode:\n%s", out)
+	}
+	if strings.Contains(out, "finalSnapshot=") {
+		t.Fatalf("logs contain misleading finalSnapshot:\n%s", out)
 	}
 }
 
@@ -404,6 +438,26 @@ func TestRedactSensitiveTextRedactsSSHKeyForms(t *testing.T) {
 			in:   `before --sshkey=\\"/var/run/zfsrep/ssh/id_rsa\\" after`,
 			want: `before --sshkey=<redacted> after`,
 		},
+		{
+			name: "ssh identity path",
+			in:   `ssh -o StrictHostKeyChecking=yes -i /var/run/zfsrep/ssh/id_rsa zfs-recv@10.42.2.11 zfs receive`,
+			want: `ssh -o StrictHostKeyChecking=yes -i <redacted> zfs-recv@10.42.2.11 zfs receive`,
+		},
+		{
+			name: "standalone identity path",
+			in:   `before -i /var/run/zfsrep/ssh/id_rsa after`,
+			want: `before -i <redacted> after`,
+		},
+		{
+			name: "known private key path",
+			in:   `using /var/run/zfsrep/ssh/id_rsa directly`,
+			want: `using <redacted> directly`,
+		},
+		{
+			name: "syncoid control socket",
+			in:   `-S /tmp/syncoid-zfs-recv1042211-1783418787-10-6113 zfs-recv@10.42.2.11`,
+			want: `-S <redacted> zfs-recv@10.42.2.11`,
+		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			got := RedactSensitiveText(tt.in)
@@ -414,6 +468,40 @@ func TestRedactSensitiveTextRedactsSSHKeyForms(t *testing.T) {
 				t.Fatalf("RedactSensitiveText() leaked ssh key path: %q", got)
 			}
 		})
+	}
+}
+
+func TestSyncoidFailureSummaryKeepsConciseCriticalError(t *testing.T) {
+	stdout := "cannot open 'missingpool/dst': dataset does not exist\n"
+	stderr := "CRITICAL ERROR: zfs send -w tank/src@syncoid_new_2026 | ssh -i /var/run/zfsrep/ssh/id_rsa zfs-recv@10.42.2.11 zfs receive -s -F -u missingpool/dst 2>&1 failed: 256\n"
+
+	summary := syncoidFailureSummary(stdout, stderr, fakeExitError{code: 2, msg: "exit status 2"})
+	if !strings.Contains(summary, "CRITICAL ERROR") {
+		t.Fatalf("summary = %q, want CRITICAL ERROR", summary)
+	}
+	if !strings.Contains(summary, "missingpool/dst") {
+		t.Fatalf("summary = %q, want target dataset", summary)
+	}
+	if strings.Contains(summary, "zfs send") || strings.Contains(summary, "/var/run/zfsrep/ssh/id_rsa") {
+		t.Fatalf("summary contains raw pipeline or private key path: %q", summary)
+	}
+}
+
+func TestSyncoidFailureSummaryExtractsTargetFromCriticalPipeline(t *testing.T) {
+	stderr := "CRITICAL ERROR: zfs send -w tank/src@syncoid_new_2026 | ssh -i /var/run/zfsrep/ssh/id_rsa zfs-recv@10.42.2.11 zfs receive -s -F -u missingpool/dst 2>&1 failed: 256\n"
+
+	summary := syncoidFailureSummary("", stderr, fakeExitError{code: 2, msg: "exit status 2"})
+	if !strings.Contains(summary, "CRITICAL ERROR") {
+		t.Fatalf("summary = %q, want CRITICAL ERROR", summary)
+	}
+	if !strings.Contains(summary, "missingpool/dst") {
+		t.Fatalf("summary = %q, want target dataset", summary)
+	}
+	if strings.Contains(summary, "target=2>&1") {
+		t.Fatalf("summary chose shell redirection as target: %q", summary)
+	}
+	if strings.Contains(summary, "zfs send") || strings.Contains(summary, "/var/run/zfsrep/ssh/id_rsa") {
+		t.Fatalf("summary contains raw pipeline or private key path: %q", summary)
 	}
 }
 

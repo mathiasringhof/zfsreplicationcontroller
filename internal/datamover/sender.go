@@ -91,7 +91,11 @@ func SenderConfigFromLookup(lookup func(string) string) SenderConfig {
 }
 
 func RunSender(ctx context.Context, cfg SenderConfig, r CommandRunner) error {
-	return runSender(ctx, cfg, r, os.Stderr)
+	return RunSenderWithLog(ctx, cfg, r, os.Stderr)
+}
+
+func RunSenderWithLog(ctx context.Context, cfg SenderConfig, r CommandRunner, logw io.Writer) error {
+	return runSender(ctx, cfg, r, logw)
 }
 
 func runSender(ctx context.Context, cfg SenderConfig, r CommandRunner, logw io.Writer) error {
@@ -119,7 +123,7 @@ func runSender(ctx context.Context, cfg SenderConfig, r CommandRunner, logw io.W
 		logSenderLine(logw, "sender completed result=failure exitCode=%d duration=%s error=%q", commandExitCode(err), duration, summary)
 		return fmt.Errorf("syncoid failed: %s", summary)
 	}
-	logSenderLine(logw, "sender completed result=success exitCode=0 duration=%s%s", duration, finalSnapshotLogSuffix(stdout+"\n"+stderr))
+	logSenderLine(logw, "sender completed result=success exitCode=0 duration=%s%s", duration, successSummaryLogSuffix(stdout+"\n"+stderr))
 	return nil
 }
 
@@ -235,7 +239,9 @@ func (s *commandOutputStreamer) Write(p []byte) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
 	}
-	_, _ = s.tail.Write(p)
+	if _, err := s.tail.Write(p); err != nil {
+		return 0, err
+	}
 	remaining := p
 	for len(remaining) > 0 {
 		if i := bytes.IndexAny(remaining, "\r\n"); i >= 0 {
@@ -350,26 +356,75 @@ func redactSensitiveText(value string) string {
 }
 
 func RedactSensitiveText(value string) string {
-	const sshKeyArg = "--sshkey="
-	if !strings.Contains(value, sshKeyArg) {
+	value = redactOptionValue(value, "--sshkey=", "--sshkey=<redacted>")
+	value = redactSeparatedOptionValue(value, "-i", "-i <redacted>")
+	value = redactSeparatedOptionValue(value, "-S", "-S <redacted>")
+	value = strings.ReplaceAll(value, DefaultSSHKeyFile, "<redacted>")
+	return value
+}
+
+func redactOptionValue(value, option, replacement string) string {
+	if !strings.Contains(value, option) {
 		return value
 	}
 	var out strings.Builder
 	out.Grow(len(value))
 	remaining := value
 	for {
-		idx := strings.Index(remaining, sshKeyArg)
+		idx := strings.Index(remaining, option)
 		if idx < 0 {
 			out.WriteString(remaining)
 			return out.String()
 		}
 		out.WriteString(remaining[:idx])
-		out.WriteString("--sshkey=<redacted>")
-		remaining = remaining[sshKeyValueEnd(remaining, idx+len(sshKeyArg)):]
+		out.WriteString(replacement)
+		remaining = remaining[optionValueEnd(remaining, idx+len(option)):]
 	}
 }
 
-func sshKeyValueEnd(value string, start int) int {
+func redactSeparatedOptionValue(value, option, replacement string) string {
+	var out strings.Builder
+	out.Grow(len(value))
+	remaining := value
+	for {
+		idx := separatedOptionIndex(remaining, option)
+		if idx < 0 {
+			out.WriteString(remaining)
+			return out.String()
+		}
+		out.WriteString(remaining[:idx])
+		valueStart := idx + len(option)
+		for valueStart < len(remaining) && isSpace(remaining[valueStart]) {
+			valueStart++
+		}
+		if valueStart >= len(remaining) {
+			out.WriteString(remaining[idx:])
+			return out.String()
+		}
+		out.WriteString(replacement)
+		remaining = remaining[optionValueEnd(remaining, valueStart):]
+	}
+}
+
+func separatedOptionIndex(value, option string) int {
+	for searchStart := 0; searchStart < len(value); {
+		idx := strings.Index(value[searchStart:], option)
+		if idx < 0 {
+			return -1
+		}
+		idx += searchStart
+		beforeOK := idx == 0 || isSpace(value[idx-1])
+		after := idx + len(option)
+		afterOK := after < len(value) && isSpace(value[after])
+		if beforeOK && afterOK {
+			return idx
+		}
+		searchStart = idx + len(option)
+	}
+	return -1
+}
+
+func optionValueEnd(value string, start int) int {
 	if start >= len(value) {
 		return start
 	}
@@ -401,11 +456,15 @@ func quotedValueEnd(value string, start int, quote byte, escaped bool, fallbackS
 
 func unquotedValueEnd(value string, start int) int {
 	for i := start; i < len(value); i++ {
-		if value[i] == ' ' || value[i] == '\t' || value[i] == '\n' || value[i] == '\r' {
+		if isSpace(value[i]) {
 			return i
 		}
 	}
 	return len(value)
+}
+
+func isSpace(ch byte) bool {
+	return ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r'
 }
 
 func escapedQuoteAt(value string, pos int) (byte, int, bool) {
@@ -423,22 +482,50 @@ func isQuote(ch byte) bool {
 	return ch == '"' || ch == '\''
 }
 
-func finalSnapshotLogSuffix(output string) string {
-	if snapshot := lastSnapshotToken(output); snapshot != "" {
-		return " finalSnapshot=" + snapshot
+func successSummaryLogSuffix(output string) string {
+	var parts []string
+	if mode := syncoidTransferMode(output); mode != "" {
+		parts = append(parts, "mode="+mode)
 	}
-	return ""
+	if size := syncoidSizeEstimate(output); size != "" {
+		parts = append(parts, "sizeEstimate="+strings.ReplaceAll(size, " ", ""))
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return " " + strings.Join(parts, " ")
 }
 
-func lastSnapshotToken(output string) string {
-	var last string
-	for _, field := range strings.Fields(output) {
-		field = strings.Trim(field, `"'.,;()[]{}<>`)
-		if _, _, ok := replication.SplitSnapshotTarget(field); ok {
-			last = field
-		}
+func syncoidTransferMode(output string) string {
+	switch {
+	case strings.Contains(output, "Sending oldest full snapshot"):
+		return "full"
+	case strings.Contains(output, "Sending incremental"):
+		return "incremental"
+	default:
+		return ""
 	}
-	return last
+}
+
+func syncoidSizeEstimate(output string) string {
+	searchStart := 0
+	for searchStart < len(output) {
+		idx := strings.Index(output[searchStart:], "(~ ")
+		if idx < 0 {
+			return ""
+		}
+		start := searchStart + idx + len("(~ ")
+		end := strings.IndexByte(output[start:], ')')
+		if end < 0 {
+			return ""
+		}
+		size := strings.TrimSpace(output[start : start+end])
+		if size != "" {
+			return size
+		}
+		searchStart = start + end + 1
+	}
+	return ""
 }
 
 type exitCoder interface {
@@ -458,19 +545,101 @@ func commandExitCode(err error) int {
 
 func syncoidFailureSummary(stdout, stderr string, err error) string {
 	var parts []string
-	if stdout = strings.TrimSpace(redactSensitiveText(stdout)); stdout != "" {
-		parts = append(parts, "stdout: "+singleLine(stdout))
+	if stdout = conciseSyncoidFailure(stdout); stdout != "" {
+		parts = append(parts, "stdout: "+stdout)
 	}
-	if stderr = strings.TrimSpace(redactSensitiveText(stderr)); stderr != "" {
-		parts = append(parts, "stderr: "+singleLine(stderr))
+	if stderr = conciseSyncoidFailure(stderr); stderr != "" {
+		parts = append(parts, "stderr: "+stderr)
 	}
 	if err != nil {
-		parts = append(parts, "error: "+singleLine(redactSensitiveText(err.Error())))
+		parts = append(parts, "error: "+conciseSyncoidFailure(err.Error()))
 	}
 	if len(parts) == 0 {
 		return "syncoid exited with an unknown error"
 	}
 	return strings.Join(parts, "; ")
+}
+
+func conciseSyncoidFailure(value string) string {
+	value = strings.TrimSpace(redactSensitiveText(value))
+	if value == "" {
+		return ""
+	}
+	if line := firstUsefulFailureLine(value); line != "" {
+		return singleLine(truncateSyncoidPipeline(line))
+	}
+	return singleLine(value)
+}
+
+func truncateSyncoidPipeline(value string) string {
+	value = strings.TrimSpace(value)
+	if idx := strings.Index(value, "CRITICAL ERROR:"); idx >= 0 {
+		critical := strings.TrimSpace(value[idx:])
+		if strings.Contains(critical, "zfs send") || strings.Contains(critical, "zfs receive") || strings.Contains(critical, "|") {
+			if target := criticalPipelineReceiveTarget(critical); target != "" {
+				return "CRITICAL ERROR: syncoid command failed target=" + target
+			}
+			return "CRITICAL ERROR: syncoid command failed"
+		}
+		return critical
+	}
+	return value
+}
+
+func criticalPipelineReceiveTarget(value string) string {
+	idx := strings.LastIndex(value, " zfs receive")
+	if idx < 0 {
+		return ""
+	}
+	fields := strings.Fields(value[idx+len(" zfs receive"):])
+	for i := 0; i < len(fields); i++ {
+		field := cleanFailureTargetField(fields[i])
+		if field == "" || isShellRedirection(field) {
+			continue
+		}
+		if field == "failed" || field == "failed:" {
+			return ""
+		}
+		if strings.HasPrefix(field, "-") {
+			if receiveOptionTakesValue(field) {
+				i++
+			}
+			continue
+		}
+		if field != "sh" {
+			return field
+		}
+	}
+	return ""
+}
+
+func cleanFailureTargetField(field string) string {
+	field = strings.Trim(field, `"'.,;()[]{}<>`)
+	if field == "" || strings.HasPrefix(field, "-") {
+		return ""
+	}
+	return field
+}
+
+func receiveOptionTakesValue(field string) bool {
+	return field == "-o" || field == "-x"
+}
+
+func isShellRedirection(field string) bool {
+	return strings.Contains(field, ">&") || strings.HasPrefix(field, ">") || strings.HasPrefix(field, "2>")
+}
+
+func firstUsefulFailureLine(value string) string {
+	lines := strings.Split(value, "\n")
+	for _, needle := range []string{"CRITICAL ERROR:", "cannot open", "cannot receive"} {
+		for _, line := range lines {
+			line = strings.TrimSpace(line)
+			if strings.Contains(line, needle) {
+				return line
+			}
+		}
+	}
+	return ""
 }
 
 func singleLine(value string) string {

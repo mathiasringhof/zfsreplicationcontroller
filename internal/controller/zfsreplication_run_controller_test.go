@@ -17,6 +17,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -194,6 +195,242 @@ func TestRunReconcileLogsReceiverAndSenderLifecycle(t *testing.T) {
 	assertLogEntry(t, logs, "created sender job", receiverFields)
 }
 
+func TestRunReconcileDoesNotRecheckSenderJobImmediatelyAfterCreate(t *testing.T) {
+	run := replicationRun("manual-create-cache")
+	names := objectNamesForRun(run.Name)
+	jobCreated := false
+	hideCreatedJobGets := 1
+	r := newRunReconcilerWithInterceptors(t, interceptor.Funcs{
+		Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+			if obj.GetName() == names.SenderName {
+				jobCreated = true
+			}
+			return c.Create(ctx, obj, opts...)
+		},
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if key.Name == names.SenderName && jobCreated && hideCreatedJobGets > 0 {
+				hideCreatedJobGets--
+				return apierrors.NewNotFound(schema.GroupResource{Group: "batch", Resource: "jobs"}, key.Name)
+			}
+			return c.Get(ctx, key, obj, opts...)
+		},
+	}, run, readyReceiveTask(run, names, "10.0.0.42", testReceiverHostKey))
+	ctx, logs := captureRunLogger()
+
+	result, err := r.Reconcile(ctx, request(run.Name))
+	if err != nil {
+		t.Fatalf("Reconcile() error = %v, want nil after sender job create", err)
+	}
+	if result.RequeueAfter == 0 {
+		t.Fatalf("RequeueAfter = %v, want cache-visible sender job recheck", result.RequeueAfter)
+	}
+	assertLogEntry(t, logs, "replication receiver is ready", map[string]string{
+		"namespace":     run.Namespace,
+		"run":           run.Name,
+		"senderJob":     names.SenderName,
+		"receiveTask":   names.ReceiveTaskName,
+		"receiverPod":   "zfs-receiver-worker-b",
+		"receiverPodIP": "10.0.0.42",
+	})
+	assertLogEntry(t, logs, "created sender job", map[string]string{
+		"namespace":     run.Namespace,
+		"run":           run.Name,
+		"senderJob":     names.SenderName,
+		"receiveTask":   names.ReceiveTaskName,
+		"receiverPod":   "zfs-receiver-worker-b",
+		"receiverPodIP": "10.0.0.42",
+	})
+
+	ctx, logs = captureRunLogger()
+	if _, err := r.Reconcile(ctx, request(run.Name)); err != nil {
+		t.Fatalf("second Reconcile() error = %v", err)
+	}
+	assertNoLogEntry(t, logs, "replication receiver is ready")
+	assertNoLogEntry(t, logs, "created sender job")
+}
+
+func TestRunReconcileTreatsSenderJobCreateAlreadyExistsAsSuccess(t *testing.T) {
+	run := replicationRun("manual-create-exists")
+	names := objectNamesForRun(run.Name)
+	returnAlreadyExists := true
+	r := newRunReconcilerWithInterceptors(t, interceptor.Funcs{
+		Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+			if obj.GetName() == names.SenderName && returnAlreadyExists {
+				returnAlreadyExists = false
+				if err := c.Create(ctx, obj, opts...); err != nil {
+					return err
+				}
+				return apierrors.NewAlreadyExists(schema.GroupResource{Group: "batch", Resource: "jobs"}, obj.GetName())
+			}
+			return c.Create(ctx, obj, opts...)
+		},
+	}, run, readyReceiveTask(run, names, "10.0.0.42", testReceiverHostKey))
+
+	if _, err := r.Reconcile(context.Background(), request(run.Name)); err != nil {
+		t.Fatalf("Reconcile() error = %v, want nil after AlreadyExists sender job create", err)
+	}
+	assertObjectExists(t, r.Client, &batchv1.Job{}, names.SenderName)
+}
+
+func TestRunReconcileTreatsEphemeralCreateAlreadyExistsAsSuccess(t *testing.T) {
+	for _, tt := range []struct {
+		name          string
+		alreadyExists func(client.Object) bool
+		resource      schema.GroupResource
+		assertObject  client.Object
+		assertName    string
+	}{
+		{
+			name: "secret",
+			alreadyExists: func(obj client.Object) bool {
+				_, ok := obj.(*corev1.Secret)
+				return ok
+			},
+			resource:     schema.GroupResource{Resource: "secrets"},
+			assertObject: &corev1.Secret{},
+		},
+		{
+			name: "receive task",
+			alreadyExists: func(obj client.Object) bool {
+				_, ok := obj.(*zfsv1.ZFSReceiveTask)
+				return ok
+			},
+			resource:     schema.GroupResource{Group: zfsv1.Group, Resource: "zfsreceivetasks"},
+			assertObject: &zfsv1.ZFSReceiveTask{},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			run := replicationRun("manual-" + strings.ReplaceAll(tt.name, " ", "-") + "-exists")
+			names := objectNamesForRun(run.Name)
+			if tt.assertName == "" {
+				switch tt.name {
+				case "secret":
+					tt.assertName = names.SecretName
+				case "receive task":
+					tt.assertName = names.ReceiveTaskName
+				}
+			}
+			returnAlreadyExists := true
+			r := newRunReconcilerWithInterceptors(t, interceptor.Funcs{
+				Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+					if returnAlreadyExists && tt.alreadyExists(obj) {
+						returnAlreadyExists = false
+						if err := c.Create(ctx, obj, opts...); err != nil {
+							return err
+						}
+						return apierrors.NewAlreadyExists(tt.resource, obj.GetName())
+					}
+					return c.Create(ctx, obj, opts...)
+				},
+			}, run)
+
+			if _, err := r.Reconcile(context.Background(), request(run.Name)); err != nil {
+				t.Fatalf("Reconcile() error = %v, want nil after AlreadyExists %s create", err, tt.name)
+			}
+			assertObjectExists(t, r.Client, tt.assertObject, tt.assertName)
+		})
+	}
+}
+
+func TestRunReconcileDoesNotReadSecretFromCacheImmediatelyAfterCreate(t *testing.T) {
+	run := replicationRun("manual-secret-cache")
+	names := objectNamesForRun(run.Name)
+	secretCreated := false
+	r := newRunReconcilerWithInterceptors(t, interceptor.Funcs{
+		Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+			if obj.GetName() == names.SecretName {
+				secretCreated = true
+			}
+			return c.Create(ctx, obj, opts...)
+		},
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if key.Name == names.SecretName && secretCreated {
+				return apierrors.NewNotFound(schema.GroupResource{Resource: "secrets"}, key.Name)
+			}
+			return c.Get(ctx, key, obj, opts...)
+		},
+	}, run)
+
+	result, err := r.Reconcile(context.Background(), request(run.Name))
+	if err != nil {
+		t.Fatalf("Reconcile() error = %v, want nil after secret create", err)
+	}
+	if result.RequeueAfter == 0 {
+		t.Fatalf("RequeueAfter = %v, want receiver wait", result.RequeueAfter)
+	}
+	assertObjectExists(t, r.Client, &zfsv1.ZFSReceiveTask{}, names.ReceiveTaskName)
+}
+
+func TestRunReconcileDoesNotReadReceiveTaskFromCacheImmediatelyAfterCreate(t *testing.T) {
+	run := replicationRun("manual-task-cache")
+	names := objectNamesForRun(run.Name)
+	taskCreated := false
+	r := newRunReconcilerWithInterceptors(t, interceptor.Funcs{
+		Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+			if obj.GetName() == names.ReceiveTaskName {
+				taskCreated = true
+			}
+			return c.Create(ctx, obj, opts...)
+		},
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if key.Name == names.ReceiveTaskName && taskCreated {
+				return apierrors.NewNotFound(schema.GroupResource{Group: zfsv1.Group, Resource: "zfsreceivetasks"}, key.Name)
+			}
+			return c.Get(ctx, key, obj, opts...)
+		},
+	}, run, runSSHSecretForTest(run, names))
+
+	result, err := r.Reconcile(context.Background(), request(run.Name))
+	if err != nil {
+		t.Fatalf("Reconcile() error = %v, want nil after receive task create", err)
+	}
+	if result.RequeueAfter == 0 {
+		t.Fatalf("RequeueAfter = %v, want receiver wait", result.RequeueAfter)
+	}
+}
+
+func TestRunReconcileDoesNotLogAcceptedBeforeInitialStatusPersists(t *testing.T) {
+	run := replicationRun("manual-accept-persist")
+	r := newRunReconcilerWithInterceptors(t, interceptor.Funcs{
+		Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+			if _, ok := obj.(*corev1.Secret); ok {
+				return errors.New("temporary secret create failure")
+			}
+			return c.Create(ctx, obj, opts...)
+		},
+	}, run)
+	ctx, logs := captureRunLogger()
+
+	if _, err := r.Reconcile(ctx, request(run.Name)); err == nil || !strings.Contains(err.Error(), "temporary secret create failure") {
+		t.Fatalf("Reconcile() error = %v, want temporary secret create failure", err)
+	}
+	assertNoLogEntry(t, logs, "accepted replication run")
+}
+
+func TestWaitForReplicationReceiverUsesFreshStatusForTransitionLogs(t *testing.T) {
+	run := replicationRun("manual-fresh-wait")
+	names := objectNamesForRun(run.Name)
+	fresh := run.DeepCopy()
+	now := metav1.Now()
+	fresh.Status.StartedAt = &now
+	fresh.Status.Phase = zfsv1.PhaseStartingReceiver
+	fillRunStatusNames(&fresh.Status, names)
+	r := newRunReconciler(t, run)
+	r.APIReader = fake.NewClientBuilder().
+		WithScheme(newTestScheme(t)).
+		WithStatusSubresource(&zfsv1.ZFSReplicationRun{}).
+		WithObjects(fresh).
+		Build()
+	ctx, logs := captureRunLogger()
+
+	if _, err := r.waitForReplicationReceiver(ctx, run, names); err != nil {
+		t.Fatal(err)
+	}
+
+	assertNoLogEntry(t, logs, "waiting for replication receiver")
+	assertNoLogEntry(t, logs, "accepted replication run")
+}
+
 func TestRunReconcileLogsReceiverWait(t *testing.T) {
 	run := replicationRun("manual-wait")
 	names := objectNamesForRun(run.Name)
@@ -233,6 +470,7 @@ func TestRunReconcileLogsReceiverWait(t *testing.T) {
 	if result.RequeueAfter == 0 {
 		t.Fatalf("second RequeueAfter = %v, want receiver wait", result.RequeueAfter)
 	}
+	assertNoLogEntry(t, logs, "accepted replication run")
 	assertNoLogEntry(t, logs, "waiting for replication receiver")
 }
 
@@ -345,6 +583,24 @@ func TestRunReconcileBoundsSenderPodLogLastError(t *testing.T) {
 	}
 	if strings.Contains(got.Status.LastError, "--sshkey=/var/run/zfsrep/ssh/id_rsa") {
 		t.Fatalf("lastError contains unredacted ssh key path: %q", got.Status.LastError)
+	}
+}
+
+func TestFailureMessageFromLogsKeepsConciseCriticalError(t *testing.T) {
+	logs := "syncoid stderr CRITICAL ERROR: zfs send -w tank/src@syncoid_new_2026 | ssh -i /var/run/zfsrep/ssh/id_rsa zfs-recv@10.42.2.11 zfs receive -s -F -u missingpool/dst 2>&1 failed: 256\n"
+
+	got := failureMessageFromLogs(logs)
+	if !strings.Contains(got, "CRITICAL ERROR") {
+		t.Fatalf("failureMessageFromLogs() = %q, want CRITICAL ERROR", got)
+	}
+	if !strings.Contains(got, "missingpool/dst") {
+		t.Fatalf("failureMessageFromLogs() = %q, want target dataset", got)
+	}
+	if strings.Contains(got, "target=2>&1") {
+		t.Fatalf("failureMessageFromLogs() chose shell redirection as target: %q", got)
+	}
+	if strings.Contains(got, "zfs send") || strings.Contains(got, "/var/run/zfsrep/ssh/id_rsa") {
+		t.Fatalf("failureMessageFromLogs() contains raw pipeline or private key path: %q", got)
 	}
 }
 
@@ -712,6 +968,20 @@ func readyReceiveTask(run *zfsv1.ZFSReplicationRun, names runObjects, host, host
 				Name: "zfs-receiver-worker-b",
 				UID:  "pod-uid",
 			},
+		},
+	}
+}
+
+func runSSHSecretForTest(run *zfsv1.ZFSReplicationRun, names runObjects) *corev1.Secret {
+	return &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      names.SecretName,
+			Namespace: run.Namespace,
+			Labels:    cloneLabels(names.Labels),
+		},
+		Data: map[string][]byte{
+			"id_rsa":     []byte("test-private-key"),
+			"id_rsa.pub": []byte("ssh-rsa AAAATEST zfsreplication-controller"),
 		},
 	}
 }

@@ -61,9 +61,6 @@ func (r *ZFSReplicationRunReconciler) Reconcile(ctx context.Context, req ctrl.Re
 	if err := validateRunSpec(run.Spec); err != nil {
 		return ctrl.Result{}, r.failRunValidation(ctx, &run, err.Error())
 	}
-	if run.Status.StartedAt == nil && run.Status.Phase == "" {
-		logger.Info("accepted replication run")
-	}
 	if locked, msg, err := r.destinationLocked(ctx, &run); err != nil || locked {
 		if err != nil {
 			return ctrl.Result{}, err
@@ -71,18 +68,16 @@ func (r *ZFSReplicationRunReconciler) Reconcile(ctx context.Context, req ctrl.Re
 		if run.Status.Phase != zfsv1.PhasePending || run.Status.LastError != msg {
 			logger.WithValues("reason", msg).Info("waiting for replication destination")
 		}
-		return ctrl.Result{RequeueAfter: 5 * time.Second}, r.patchRunStatus(ctx, &run, func(st *zfsv1.ZFSReplicationRunStatus) {
+		initialStatus := r.needsInitialRunStatus(ctx, &run)
+		err := r.patchRunStatus(ctx, &run, func(st *zfsv1.ZFSReplicationRunStatus) {
 			st.Phase = zfsv1.PhasePending
 			st.LastError = msg
 			fillRunStatusNames(st, names)
 		})
-	}
-
-	if err := r.ensureRunSecret(ctx, &run, names); err != nil {
-		return ctrl.Result{}, err
-	}
-	if err := r.ensureRunReceiveTask(ctx, &run, names); err != nil {
-		return ctrl.Result{}, err
+		if err == nil && initialStatus {
+			logger.Info("accepted replication run")
+		}
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, err
 	}
 
 	receiver := runReceiverStatus{
@@ -93,15 +88,39 @@ func (r *ZFSReplicationRunReconciler) Reconcile(ctx context.Context, req ctrl.Re
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	if !senderExists {
-		nextReceiver, result, done, err := r.ensureSenderStarted(ctx, &run, names)
-		if err != nil || done {
+	if senderExists {
+		logger.WithValues("receiverPod", receiver.podName, "receiverPodIP", receiver.podIP).V(1).Info("sender job already present")
+		if result, done, err := r.finishFromSenderJob(ctx, &run, names, receiver); err != nil || done {
 			return result, err
 		}
-		receiver = nextReceiver
-	} else {
-		logger.WithValues("receiverPod", receiver.podName, "receiverPodIP", receiver.podIP).V(1).Info("sender job already present")
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, r.patchRunStatus(ctx, &run, func(st *zfsv1.ZFSReplicationRunStatus) {
+			st.Phase = zfsv1.PhaseRunning
+			st.ReceiverPodName = receiver.podName
+			st.ReceiverPodIP = receiver.podIP
+			fillRunStatusNames(st, names)
+		})
 	}
+
+	publicKey, secretCreated, err := r.ensureRunSecret(ctx, &run, names)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if secretCreated && publicKey == "" {
+		return ctrl.Result{RequeueAfter: time.Second}, nil
+	}
+	receiveTaskCreated, err := r.ensureRunReceiveTask(ctx, &run, names, publicKey)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if receiveTaskCreated {
+		return r.waitForReplicationReceiver(ctx, &run, names)
+	}
+
+	nextReceiver, result, done, err := r.ensureSenderStarted(ctx, &run, names)
+	if err != nil || done {
+		return result, err
+	}
+	receiver = nextReceiver
 
 	if result, done, err := r.finishFromSenderJob(ctx, &run, names, receiver); err != nil || done {
 		return result, err
@@ -131,26 +150,25 @@ func (r *ZFSReplicationRunReconciler) ensureSenderStarted(ctx context.Context, r
 		return runReceiverStatus{}, ctrl.Result{}, true, r.failRunObject(ctx, run, names, msg)
 	}
 	if !ready {
-		logger := log.FromContext(ctx)
-		if run.Status.Phase != zfsv1.PhaseStartingReceiver {
-			logger.Info("waiting for replication receiver")
-		} else {
-			logger.V(1).Info("waiting for replication receiver")
-		}
-		return runReceiverStatus{}, ctrl.Result{RequeueAfter: 5 * time.Second}, true, r.patchRunStatus(ctx, run, func(st *zfsv1.ZFSReplicationRunStatus) {
-			st.Phase = zfsv1.PhaseStartingReceiver
-			fillRunStatusNames(st, names)
-		})
+		result, err := r.waitForReplicationReceiver(ctx, run, names)
+		return runReceiverStatus{}, result, true, err
 	}
 
 	receiver := runReceiverStatus{
 		podName: task.Status.ReceiverPod.Name,
 		podIP:   task.Status.Endpoint.Host,
 	}
-	log.FromContext(ctx).WithValues("receiverPod", receiver.podName, "receiverPodIP", receiver.podIP).Info("replication receiver is ready")
+	receiverLogger := log.FromContext(ctx).WithValues("receiverPod", receiver.podName, "receiverPodIP", receiver.podIP)
+	observedStatus := r.observedRunStatus(ctx, run)
+	if observedStatus.Phase == zfsv1.PhaseReceiverReady || observedStatus.Phase == zfsv1.PhaseRunning {
+		receiverLogger.V(1).Info("replication receiver is ready")
+	} else {
+		receiverLogger.Info("replication receiver is ready")
+	}
 	if err := r.ensureRunKnownHosts(ctx, run, names, task); err != nil {
 		return runReceiverStatus{}, ctrl.Result{}, false, err
 	}
+	initialStatus := r.needsInitialRunStatus(ctx, run)
 	if err := r.patchRunStatus(ctx, run, func(st *zfsv1.ZFSReplicationRunStatus) {
 		st.Phase = zfsv1.PhaseReceiverReady
 		st.ReceiverPodName = receiver.podName
@@ -159,10 +177,19 @@ func (r *ZFSReplicationRunReconciler) ensureSenderStarted(ctx context.Context, r
 	}); err != nil {
 		return runReceiverStatus{}, ctrl.Result{}, false, err
 	}
-	if err := r.ensureRunSenderJob(ctx, run, names, receiver.podIP); err != nil {
+	if initialStatus {
+		log.FromContext(ctx).Info("accepted replication run")
+	}
+	created, recheck, err := r.ensureRunSenderJob(ctx, run, names, receiver.podIP)
+	if err != nil {
 		return runReceiverStatus{}, ctrl.Result{}, false, err
 	}
-	log.FromContext(ctx).WithValues("receiverPod", receiver.podName, "receiverPodIP", receiver.podIP).Info("created sender job")
+	if created {
+		log.FromContext(ctx).WithValues("receiverPod", receiver.podName, "receiverPodIP", receiver.podIP).Info("created sender job")
+	}
+	if recheck {
+		return receiver, ctrl.Result{RequeueAfter: time.Second}, true, nil
+	}
 	return receiver, ctrl.Result{}, false, nil
 }
 
@@ -217,68 +244,106 @@ func (r *ZFSReplicationRunReconciler) image() string {
 	return r.DataMoverImage
 }
 
-func (r *ZFSReplicationRunReconciler) ensureRunSecret(ctx context.Context, run *zfsv1.ZFSReplicationRun, names runObjects) error {
+func (r *ZFSReplicationRunReconciler) waitForReplicationReceiver(ctx context.Context, run *zfsv1.ZFSReplicationRun, names runObjects) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
+	observedStatus := r.observedRunStatus(ctx, run)
+	if observedStatus.Phase != zfsv1.PhaseStartingReceiver {
+		logger.Info("waiting for replication receiver")
+	} else {
+		logger.V(1).Info("waiting for replication receiver")
+	}
+	initialStatus := runStatusNeedsInitialStatus(observedStatus)
+	err := r.patchRunStatus(ctx, run, func(st *zfsv1.ZFSReplicationRunStatus) {
+		st.Phase = zfsv1.PhaseStartingReceiver
+		fillRunStatusNames(st, names)
+	})
+	if err == nil && initialStatus {
+		logger.Info("accepted replication run")
+	}
+	return ctrl.Result{RequeueAfter: 5 * time.Second}, err
+}
+
+func (r *ZFSReplicationRunReconciler) ensureRunSecret(ctx context.Context, run *zfsv1.ZFSReplicationRun, names runObjects) (string, bool, error) {
 	var secret corev1.Secret
 	err := r.Get(ctx, types.NamespacedName{Name: names.SecretName, Namespace: run.Namespace}, &secret)
 	if err == nil {
-		return nil
+		publicKey, err := publicKeyFromSecret(&secret)
+		return publicKey, false, err
 	}
 	if !apierrors.IsNotFound(err) {
-		return err
+		return "", false, err
 	}
 	key, err := generateSSHKeyMaterial()
 	if err != nil {
-		return err
+		return "", false, err
 	}
 	secretObj := runSSHSecret(run, names, key)
 	if err := ctrl.SetControllerReference(run, secretObj, r.Scheme); err != nil {
-		return err
+		return "", false, err
 	}
-	return r.Create(ctx, secretObj)
+	if err := r.Create(ctx, secretObj); err != nil {
+		if apierrors.IsAlreadyExists(err) {
+			return "", true, nil
+		}
+		return "", false, err
+	}
+	return strings.TrimSpace(string(key.PublicKey)), true, nil
 }
 
-func (r *ZFSReplicationRunReconciler) ensureRunReceiveTask(ctx context.Context, run *zfsv1.ZFSReplicationRun, names runObjects) error {
+func publicKeyFromSecret(secret *corev1.Secret) (string, error) {
+	publicKey := strings.TrimSpace(string(secret.Data["id_rsa.pub"]))
+	if publicKey == "" {
+		return "", fmt.Errorf("ssh secret %s/%s is missing id_rsa.pub", secret.Namespace, secret.Name)
+	}
+	return publicKey, nil
+}
+
+func (r *ZFSReplicationRunReconciler) ensureRunReceiveTask(ctx context.Context, run *zfsv1.ZFSReplicationRun, names runObjects, publicKey string) (bool, error) {
 	var existing zfsv1.ZFSReceiveTask
 	err := r.Get(ctx, types.NamespacedName{Name: names.ReceiveTaskName, Namespace: run.Namespace}, &existing)
 	if err == nil {
-		return nil
+		return false, nil
 	}
 	if !apierrors.IsNotFound(err) {
-		return err
-	}
-	var secret corev1.Secret
-	if err := r.Get(ctx, types.NamespacedName{Name: names.SecretName, Namespace: run.Namespace}, &secret); err != nil {
-		return err
-	}
-	publicKey := strings.TrimSpace(string(secret.Data["id_rsa.pub"]))
-	if publicKey == "" {
-		return fmt.Errorf("ssh secret %s/%s is missing id_rsa.pub", secret.Namespace, secret.Name)
+		return false, err
 	}
 	expiresAt := metav1.NewTime(time.Now().Add(30 * time.Minute))
 	task := runReceiveTask(run, names, publicKey, expiresAt)
 	if err := ctrl.SetControllerReference(run, task, r.Scheme); err != nil {
-		return err
+		return false, err
 	}
-	return r.Create(ctx, task)
+	if err := r.Create(ctx, task); err != nil {
+		if apierrors.IsAlreadyExists(err) {
+			return true, nil
+		}
+		return false, err
+	}
+	return true, nil
 }
 
-func (r *ZFSReplicationRunReconciler) ensureRunSenderJob(ctx context.Context, run *zfsv1.ZFSReplicationRun, names runObjects, receiverPodIP string) error {
+func (r *ZFSReplicationRunReconciler) ensureRunSenderJob(ctx context.Context, run *zfsv1.ZFSReplicationRun, names runObjects, receiverPodIP string) (bool, bool, error) {
 	return r.ensureRunJob(ctx, run, runSenderJob(run, names, r.image(), receiverPodIP))
 }
 
-func (r *ZFSReplicationRunReconciler) ensureRunJob(ctx context.Context, run *zfsv1.ZFSReplicationRun, job *batchv1.Job) error {
+func (r *ZFSReplicationRunReconciler) ensureRunJob(ctx context.Context, run *zfsv1.ZFSReplicationRun, job *batchv1.Job) (bool, bool, error) {
 	var existing batchv1.Job
 	err := r.Get(ctx, types.NamespacedName{Name: job.Name, Namespace: job.Namespace}, &existing)
 	if err == nil {
-		return nil
+		return false, false, nil
 	}
 	if !apierrors.IsNotFound(err) {
-		return err
+		return false, false, err
 	}
 	if err := ctrl.SetControllerReference(run, job, r.Scheme); err != nil {
-		return err
+		return false, false, err
 	}
-	return r.Create(ctx, job)
+	if err := r.Create(ctx, job); err != nil {
+		if apierrors.IsAlreadyExists(err) {
+			return false, true, nil
+		}
+		return false, false, err
+	}
+	return true, true, nil
 }
 
 func (r *ZFSReplicationRunReconciler) jobExists(ctx context.Context, ns, name string) (bool, error) {
@@ -485,6 +550,25 @@ func (r *ZFSReplicationRunReconciler) patchRunStatus(ctx context.Context, run *z
 	return r.Status().Patch(ctx, copy, client.MergeFrom(run))
 }
 
+func (r *ZFSReplicationRunReconciler) needsInitialRunStatus(ctx context.Context, run *zfsv1.ZFSReplicationRun) bool {
+	return runStatusNeedsInitialStatus(r.observedRunStatus(ctx, run))
+}
+
+func (r *ZFSReplicationRunReconciler) observedRunStatus(ctx context.Context, run *zfsv1.ZFSReplicationRun) zfsv1.ZFSReplicationRunStatus {
+	if r.APIReader == nil {
+		return run.Status
+	}
+	var fresh zfsv1.ZFSReplicationRun
+	if err := r.APIReader.Get(ctx, types.NamespacedName{Name: run.Name, Namespace: run.Namespace}, &fresh); err != nil {
+		return run.Status
+	}
+	return fresh.Status
+}
+
+func runStatusNeedsInitialStatus(status zfsv1.ZFSReplicationRunStatus) bool {
+	return status.StartedAt == nil && status.Phase == ""
+}
+
 func failureMessageFromLogs(logs string) string {
 	var last string
 	for _, line := range strings.Split(logs, "\n") {
@@ -501,11 +585,93 @@ func boundedRedactedFailureMessage(value string) string {
 	if limit := failedJobLogMessageTailLimit + failedJobLogMessageRedactionLookback; len(value) > limit {
 		value = value[len(value)-limit:]
 	}
-	return boundedFailureMessage(redactFailureMessage(value))
+	value = redactFailureMessage(value)
+	if concise := conciseFailureMessage(value); concise != "" {
+		value = concise
+	}
+	return boundedFailureMessage(value)
 }
 
 func redactFailureMessage(value string) string {
 	return datamover.RedactSensitiveText(value)
+}
+
+func conciseFailureMessage(value string) string {
+	if line := firstUsefulFailureMessageLine(value); line != "" {
+		return strings.Join(strings.Fields(truncateFailurePipeline(line)), " ")
+	}
+	return value
+}
+
+func firstUsefulFailureMessageLine(value string) string {
+	lines := strings.Split(value, "\n")
+	for _, needle := range []string{"CRITICAL ERROR:", "cannot open", "cannot receive"} {
+		for _, line := range lines {
+			line = strings.TrimSpace(line)
+			if strings.Contains(line, needle) {
+				return line
+			}
+		}
+	}
+	return ""
+}
+
+func truncateFailurePipeline(value string) string {
+	value = strings.TrimSpace(value)
+	if idx := strings.Index(value, "CRITICAL ERROR:"); idx >= 0 {
+		critical := strings.TrimSpace(value[idx:])
+		if strings.Contains(critical, "zfs send") || strings.Contains(critical, "zfs receive") || strings.Contains(critical, "|") {
+			if target := criticalFailurePipelineTarget(critical); target != "" {
+				return "CRITICAL ERROR: syncoid command failed target=" + target
+			}
+			return "CRITICAL ERROR: syncoid command failed"
+		}
+		return critical
+	}
+	return value
+}
+
+func criticalFailurePipelineTarget(value string) string {
+	idx := strings.LastIndex(value, " zfs receive")
+	if idx < 0 {
+		return ""
+	}
+	fields := strings.Fields(value[idx+len(" zfs receive"):])
+	for i := 0; i < len(fields); i++ {
+		field := cleanFailureTargetField(fields[i])
+		if field == "" || isShellRedirection(field) {
+			continue
+		}
+		if field == "failed" || field == "failed:" {
+			return ""
+		}
+		if strings.HasPrefix(field, "-") {
+			if receiveOptionTakesValue(field) {
+				i++
+			}
+			continue
+		}
+		if field != "sh" {
+			return field
+		}
+	}
+	return ""
+}
+
+func cleanFailureTargetField(field string) string {
+	field = strings.Trim(field, `"'.,;()[]{}<>`)
+	if field == "" || strings.HasPrefix(field, "-") {
+		return ""
+	}
+	return field
+}
+
+func receiveOptionTakesValue(field string) bool {
+	return field == "-o" || field == "-x"
+}
+
+func isShellRedirection(field string) bool {
+	return strings.Contains(field, ">&") || strings.HasPrefix(field, ">") || strings.HasPrefix(field, "2>")
 }
 
 func boundedFailureMessage(value string) string {
