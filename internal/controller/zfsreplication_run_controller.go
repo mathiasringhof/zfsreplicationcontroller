@@ -40,6 +40,11 @@ type runReceiverStatus struct {
 	podIP   string
 }
 
+const (
+	failedJobLogMessageTailLimit         = 64 * 1024
+	failedJobLogMessageRedactionLookback = 4 * 1024
+)
+
 func (r *ZFSReplicationRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	var run zfsv1.ZFSReplicationRun
 	if err := r.Get(ctx, req.NamespacedName, &run); err != nil {
@@ -48,7 +53,7 @@ func (r *ZFSReplicationRunReconciler) Reconcile(ctx context.Context, req ctrl.Re
 	names := objectNamesForRun(run.Name)
 	logger := log.FromContext(ctx).WithValues(runLogValues(&run, names)...)
 	ctx = log.IntoContext(ctx, logger)
-	logger.Info("reconciling replication run")
+	logger.V(1).Info("reconciling replication run")
 	if run.Status.Phase.Terminal() {
 		logger.WithValues("phase", run.Status.Phase).Info("cleaning up terminal replication run")
 		return ctrl.Result{}, r.reconcileTerminalRun(ctx, &run, names)
@@ -56,13 +61,20 @@ func (r *ZFSReplicationRunReconciler) Reconcile(ctx context.Context, req ctrl.Re
 	if err := validateRunSpec(run.Spec); err != nil {
 		return ctrl.Result{}, r.failRunValidation(ctx, &run, err.Error())
 	}
+	if run.Status.StartedAt == nil && run.Status.Phase == "" {
+		logger.Info("accepted replication run")
+	}
 	if locked, msg, err := r.destinationLocked(ctx, &run); err != nil || locked {
 		if err != nil {
 			return ctrl.Result{}, err
 		}
+		if run.Status.Phase != zfsv1.PhasePending || run.Status.LastError != msg {
+			logger.WithValues("reason", msg).Info("waiting for replication destination")
+		}
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, r.patchRunStatus(ctx, &run, func(st *zfsv1.ZFSReplicationRunStatus) {
 			st.Phase = zfsv1.PhasePending
 			st.LastError = msg
+			fillRunStatusNames(st, names)
 		})
 	}
 
@@ -88,7 +100,7 @@ func (r *ZFSReplicationRunReconciler) Reconcile(ctx context.Context, req ctrl.Re
 		}
 		receiver = nextReceiver
 	} else {
-		logger.WithValues("receiverPod", receiver.podName, "receiverPodIP", receiver.podIP).Info("sender job already present")
+		logger.WithValues("receiverPod", receiver.podName, "receiverPodIP", receiver.podIP).V(1).Info("sender job already present")
 	}
 
 	if result, done, err := r.finishFromSenderJob(ctx, &run, names, receiver); err != nil || done {
@@ -119,7 +131,12 @@ func (r *ZFSReplicationRunReconciler) ensureSenderStarted(ctx context.Context, r
 		return runReceiverStatus{}, ctrl.Result{}, true, r.failRunObject(ctx, run, names, msg)
 	}
 	if !ready {
-		log.FromContext(ctx).Info("waiting for replication receiver")
+		logger := log.FromContext(ctx)
+		if run.Status.Phase != zfsv1.PhaseStartingReceiver {
+			logger.Info("waiting for replication receiver")
+		} else {
+			logger.V(1).Info("waiting for replication receiver")
+		}
 		return runReceiverStatus{}, ctrl.Result{RequeueAfter: 5 * time.Second}, true, r.patchRunStatus(ctx, run, func(st *zfsv1.ZFSReplicationRunStatus) {
 			st.Phase = zfsv1.PhaseStartingReceiver
 			fillRunStatusNames(st, names)
@@ -344,10 +361,10 @@ func (r *ZFSReplicationRunReconciler) jobFailed(ctx context.Context, ns, name, f
 	}
 	for _, cond := range job.Status.Conditions {
 		if cond.Type == batchv1.JobFailed && cond.Status == corev1.ConditionTrue && cond.Message != "" {
-			return true, cond.Message, nil
+			return true, boundedRedactedFailureMessage(cond.Message), nil
 		}
 	}
-	return true, fallback, nil
+	return true, boundedRedactedFailureMessage(fallback), nil
 }
 
 func (r *ZFSReplicationRunReconciler) failedJobLogMessage(ctx context.Context, ns, jobName string) string {
@@ -475,9 +492,27 @@ func failureMessageFromLogs(logs string) string {
 		if line == "" || strings.Contains(line, "zfs-sim-event ") {
 			continue
 		}
-		last = line
+		last = boundedRedactedFailureMessage(line)
 	}
 	return last
+}
+
+func boundedRedactedFailureMessage(value string) string {
+	if limit := failedJobLogMessageTailLimit + failedJobLogMessageRedactionLookback; len(value) > limit {
+		value = value[len(value)-limit:]
+	}
+	return boundedFailureMessage(redactFailureMessage(value))
+}
+
+func redactFailureMessage(value string) string {
+	return datamover.RedactSensitiveText(value)
+}
+
+func boundedFailureMessage(value string) string {
+	if len(value) <= failedJobLogMessageTailLimit {
+		return value
+	}
+	return value[len(value)-failedJobLogMessageTailLimit:]
 }
 
 func validateRunSpec(spec zfsv1.ZFSReplicationRunSpec) error {

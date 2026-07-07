@@ -27,6 +27,97 @@ func (f *fakeRunner) Run(_ context.Context, name string, args ...string) (string
 	return f.stdout, f.stderr, f.err
 }
 
+type streamingFakeRunner struct {
+	calls       []call
+	stream      func(stdout, stderr io.Writer)
+	beforeDone  func()
+	err         error
+	runFallback bool
+}
+
+func (f *streamingFakeRunner) Run(_ context.Context, name string, args ...string) (string, string, error) {
+	f.runFallback = true
+	f.calls = append(f.calls, call{name: name, args: args})
+	return "", "", f.err
+}
+
+func (f *streamingFakeRunner) RunStreaming(_ context.Context, name string, stdout, stderr io.Writer, args ...string) error {
+	f.calls = append(f.calls, call{name: name, args: args})
+	if f.stream != nil {
+		f.stream(stdout, stderr)
+	}
+	if f.beforeDone != nil {
+		f.beforeDone()
+	}
+	return f.err
+}
+
+func TestSenderStreamsSyncoidOutputBeforeCommandReturns(t *testing.T) {
+	var logs strings.Builder
+	runner := &streamingFakeRunner{
+		stream: func(stdout, stderr io.Writer) {
+			if _, err := io.WriteString(stdout, "live stdout --sshkey=/var/run/zfsrep/ssh/id_rsa\n"); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := io.WriteString(stderr, "live stderr --sshkey=/var/run/zfsrep/ssh/id_rsa\n"); err != nil {
+				t.Fatal(err)
+			}
+		},
+		beforeDone: func() {
+			out := logs.String()
+			for _, want := range []string{
+				"syncoid stdout live stdout --sshkey=<redacted>",
+				"syncoid stderr live stderr --sshkey=<redacted>",
+			} {
+				if !strings.Contains(out, want) {
+					t.Fatalf("logs before command returned missing %q:\n%s", want, out)
+				}
+			}
+			if strings.Contains(out, "--sshkey=/var/run/zfsrep/ssh/id_rsa") {
+				t.Fatalf("logs before command returned contain unredacted ssh key path:\n%s", out)
+			}
+		},
+	}
+
+	err := runSender(context.Background(), SenderConfig{
+		SrcDataset:       "tank/src",
+		DstHost:          "root@10.0.0.42",
+		DstDataset:       "tank/dst",
+		SSHKeyFile:       "/var/run/zfsrep/ssh/id_rsa",
+		KnownHostsFile:   "/var/run/zfsrep/ssh/known_hosts",
+		SSHPort:          "2222",
+		NoRollback:       true,
+		Compress:         "none",
+		ReceiveUnmounted: true,
+		ReceiveResumable: true,
+	}, runner, &logs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runner.runFallback {
+		t.Fatal("runSender used non-streaming Run fallback")
+	}
+}
+
+func TestExecRunnerProvidesStreamingCommandExecution(t *testing.T) {
+	streaming, ok := any(ExecRunner{}).(interface {
+		RunStreaming(context.Context, string, io.Writer, io.Writer, ...string) error
+	})
+	if !ok {
+		t.Fatal("ExecRunner does not implement streaming execution")
+	}
+	var stdout, stderr strings.Builder
+	if err := streaming.RunStreaming(context.Background(), "sh", &stdout, &stderr, "-c", "printf stdout; printf stderr >&2"); err != nil {
+		t.Fatal(err)
+	}
+	if stdout.String() != "stdout" {
+		t.Fatalf("stdout = %q", stdout.String())
+	}
+	if stderr.String() != "stderr" {
+		t.Fatalf("stderr = %q", stderr.String())
+	}
+}
+
 func TestSenderLogsSuccessfulSyncoidRun(t *testing.T) {
 	runner := &fakeRunner{
 		stdout: "INFO: Sending oldest full snapshot tank/src@syncoid_zrc-123_2026-07-06:12:00:00-GUID-123456 --sshkey=/var/run/zfsrep/ssh/id_rsa\n",
@@ -142,6 +233,187 @@ func TestSenderLogsFailedSyncoidRunAndReturnsCombinedOutput(t *testing.T) {
 	}
 	if last := failureMessageFromSenderLogs(out); last != "sender completed result=failure exitCode=23 duration=0s error=\"stdout: syncoid stdout detail --sshkey=<redacted>; stderr: syncoid stderr detail --sshkey=<redacted>; error: exit status 23 retry marker --sshkey=<redacted>\"" {
 		t.Fatalf("last failure line = %q", last)
+	}
+}
+
+func TestSenderFailureSummaryKeepsBoundedOutputTail(t *testing.T) {
+	oldStdout := "stdout-old-marker"
+	oldStderr := "stderr-old-marker"
+	stdoutTail := "stdout-tail-marker --sshkey=/var/run/zfsrep/ssh/id_rsa"
+	stderrTail := "stderr-tail-marker --sshkey=/var/run/zfsrep/ssh/id_rsa"
+	runner := &fakeRunner{
+		stdout: oldStdout + "\n" + strings.Repeat("o", 70*1024) + "\n" + stdoutTail + "\n",
+		stderr: oldStderr + "\n" + strings.Repeat("e", 70*1024) + "\n" + stderrTail + "\n",
+		err:    fakeExitError{code: 23, msg: "exit status 23"},
+	}
+	var logs strings.Builder
+
+	err := runSender(context.Background(), SenderConfig{
+		SrcDataset:       "tank/src",
+		DstHost:          "root@10.0.0.42",
+		DstDataset:       "tank/dst",
+		SSHKeyFile:       "/var/run/zfsrep/ssh/id_rsa",
+		KnownHostsFile:   "/var/run/zfsrep/ssh/known_hosts",
+		SSHPort:          "2222",
+		NoRollback:       true,
+		Compress:         "none",
+		ReceiveUnmounted: true,
+		ReceiveResumable: true,
+	}, runner, &logs)
+	if err == nil {
+		t.Fatal("runSender() error = nil, want syncoid failure")
+	}
+	for _, value := range []string{err.Error(), logs.String()} {
+		if strings.Contains(value, oldStdout) || strings.Contains(value, oldStderr) {
+			t.Fatalf("failure summary contains beginning of huge output:\n%s", value)
+		}
+		for _, want := range []string{
+			"stdout-tail-marker --sshkey=<redacted>",
+			"stderr-tail-marker --sshkey=<redacted>",
+		} {
+			if !strings.Contains(value, want) {
+				t.Fatalf("failure summary missing %q:\n%s", want, value)
+			}
+		}
+		if strings.Contains(value, "--sshkey=/var/run/zfsrep/ssh/id_rsa") {
+			t.Fatalf("failure summary contains unredacted ssh key path:\n%s", value)
+		}
+	}
+}
+
+func TestSenderStreamingHugeLineLogsOnlyBoundedTail(t *testing.T) {
+	oldOutput := "stdout-old-marker"
+	tailOutput := `stdout-tail-marker --sshkey="/var/run/zfsrep/ssh/id_rsa"`
+	var logs strings.Builder
+	runner := &streamingFakeRunner{
+		stream: func(stdout, _ io.Writer) {
+			if _, err := io.WriteString(stdout, oldOutput+strings.Repeat("o", 70*1024)+tailOutput); err != nil {
+				t.Fatal(err)
+			}
+		},
+		beforeDone: func() {
+			out := logs.String()
+			if strings.Contains(out, oldOutput) {
+				t.Fatalf("streaming log contains beginning of huge line before command returned:\n%s", out)
+			}
+			if !strings.Contains(out, `stdout-tail-marker --sshkey=<redacted>`) {
+				t.Fatalf("streaming log missing redacted tail marker before command returned:\n%s", out)
+			}
+			if strings.Contains(out, "--sshkey=/var/run/zfsrep/ssh/id_rsa") {
+				t.Fatalf("streaming log contains unredacted ssh key path before command returned:\n%s", out)
+			}
+		},
+	}
+
+	err := runSender(context.Background(), SenderConfig{
+		SrcDataset:       "tank/src",
+		DstHost:          "root@10.0.0.42",
+		DstDataset:       "tank/dst",
+		SSHKeyFile:       "/var/run/zfsrep/ssh/id_rsa",
+		KnownHostsFile:   "/var/run/zfsrep/ssh/known_hosts",
+		SSHPort:          "2222",
+		NoRollback:       true,
+		Compress:         "none",
+		ReceiveUnmounted: true,
+		ReceiveResumable: true,
+	}, runner, &logs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := logs.String()
+	if strings.Contains(out, oldOutput) {
+		t.Fatalf("streaming log contains beginning of huge line:\n%s", out)
+	}
+	if !strings.Contains(out, `stdout-tail-marker --sshkey=<redacted>`) {
+		t.Fatalf("streaming log missing redacted tail marker:\n%s", out)
+	}
+	if strings.Contains(out, "--sshkey=/var/run/zfsrep/ssh/id_rsa") {
+		t.Fatalf("streaming log contains unredacted ssh key path:\n%s", out)
+	}
+}
+
+func TestSenderStreamingBoundedTailRedactsSSHKeyAcrossTrimBoundary(t *testing.T) {
+	secret := "--sshkey=/var/run/zfsrep/ssh/id_rsa"
+	tailMarker := " tail-marker"
+	padding := strings.Repeat("p", commandOutputTailLimit+len("--sshkey=")-len(secret)-len(tailMarker))
+	var logs strings.Builder
+	runner := &streamingFakeRunner{
+		stream: func(stdout, _ io.Writer) {
+			if _, err := io.WriteString(stdout, secret+padding+tailMarker); err != nil {
+				t.Fatal(err)
+			}
+		},
+	}
+
+	err := runSender(context.Background(), SenderConfig{
+		SrcDataset:       "tank/src",
+		DstHost:          "root@10.0.0.42",
+		DstDataset:       "tank/dst",
+		SSHKeyFile:       "/var/run/zfsrep/ssh/id_rsa",
+		KnownHostsFile:   "/var/run/zfsrep/ssh/known_hosts",
+		SSHPort:          "2222",
+		NoRollback:       true,
+		Compress:         "none",
+		ReceiveUnmounted: true,
+		ReceiveResumable: true,
+	}, runner, &logs)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	out := logs.String()
+	if strings.Contains(out, "/var/run/zfsrep/ssh/id_rsa") {
+		t.Fatalf("streaming log contains partially trimmed ssh key path:\n%s", out)
+	}
+	if !strings.Contains(out, "--sshkey=<redacted>") {
+		t.Fatalf("streaming log missing redaction marker:\n%s", out)
+	}
+	if !strings.Contains(out, "tail-marker") {
+		t.Fatalf("streaming log missing tail marker:\n%s", out)
+	}
+}
+
+func TestRedactSensitiveTextRedactsSSHKeyForms(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		in   string
+		want string
+	}{
+		{
+			name: "unquoted",
+			in:   `before --sshkey=/var/run/zfsrep/ssh/id_rsa after`,
+			want: `before --sshkey=<redacted> after`,
+		},
+		{
+			name: "double quoted",
+			in:   `before --sshkey="/var/run/zfsrep/ssh/id_rsa" after`,
+			want: `before --sshkey=<redacted> after`,
+		},
+		{
+			name: "single quoted",
+			in:   `before --sshkey='/var/run/zfsrep/ssh/id_rsa' after`,
+			want: `before --sshkey=<redacted> after`,
+		},
+		{
+			name: "escaped double quoted",
+			in:   `before --sshkey=\"/var/run/zfsrep/ssh/id_rsa\" after`,
+			want: `before --sshkey=<redacted> after`,
+		},
+		{
+			name: "double escaped double quoted",
+			in:   `before --sshkey=\\"/var/run/zfsrep/ssh/id_rsa\\" after`,
+			want: `before --sshkey=<redacted> after`,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			got := RedactSensitiveText(tt.in)
+			if got != tt.want {
+				t.Fatalf("RedactSensitiveText() = %q, want %q", got, tt.want)
+			}
+			if strings.Contains(got, "/var/run/zfsrep/ssh/id_rsa") {
+				t.Fatalf("RedactSensitiveText() leaked ssh key path: %q", got)
+			}
+		})
 	}
 }
 
