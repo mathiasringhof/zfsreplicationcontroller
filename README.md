@@ -227,6 +227,13 @@ The controller also passes a generated Syncoid `--identifier` derived from the
 replication relationship so receiver-side sync snapshot pruning is scoped to
 snapshots owned by that relationship.
 
+Sender Jobs also set a stable pod hostname, `zfsrep-sender`, because upstream
+Syncoid includes the local hostname in sync snapshot names and uses the
+identifier-plus-hostname prefix when pruning obsolete sync snapshots. The
+generated `--identifier` remains the relationship boundary; the stable hostname
+only prevents ephemeral Kubernetes Job pod names from fragmenting Syncoid's own
+pruning scope.
+
 ## Object Lifecycle
 
 Each run gets its own SSH `Secret` and `ZFSReceiveTask`. The sender connects to
@@ -239,10 +246,12 @@ Failed and deletes the SSH Secret. The receiver DaemonSet stops authorizing
 terminal or expired tasks. The sender Job has `ttlSecondsAfterFinished: 86400`
 so Kubernetes can keep it briefly for inspection before TTL cleanup.
 
-Sender Jobs pin pods with `spec.template.spec.nodeName`. At startup, the sender
-compares the downward API node name with the expected source node and exits
-before running ZFS commands on a mismatch. Receiver DaemonSet pods publish their
-own node and pod IP through `ZFSReceiveTask.status`.
+Sender Jobs pin pods with `spec.template.spec.nodeName` and use a stable pod
+hostname so Syncoid-owned sync snapshots keep a stable pruning prefix across
+runs. At startup, the sender compares the downward API node name with the
+expected source node and exits before running ZFS commands on a mismatch.
+Receiver DaemonSet pods publish their own node and pod IP through
+`ZFSReceiveTask.status`.
 
 Sender Jobs use `backoffLimit: 0`, `restartPolicy: Never`, and
 `automountServiceAccountToken: false`.
