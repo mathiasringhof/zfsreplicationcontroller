@@ -676,6 +676,7 @@ func TestRunReconcileLogsDestinationWaitOnlyOnTransition(t *testing.T) {
 	if got.Status.Phase != zfsv1.PhasePending || got.Status.LastError != wantReason {
 		t.Fatalf("status = phase %q lastError %q, want Pending/%q", got.Status.Phase, got.Status.LastError, wantReason)
 	}
+	assertObjectDeleted(t, r.Client, &batchv1.Job{}, names.SenderName)
 
 	ctx, logs = captureRunLogger()
 	result, err = r.Reconcile(ctx, request(run.Name))
