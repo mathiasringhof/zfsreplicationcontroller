@@ -74,6 +74,8 @@ func TestE2EFullAndIncrementalReplication(t *testing.T) {
 	assertSucceededStatus(t, second, secondStatus)
 	k.assertReceiveTaskTerminal(second, secondStatus, e2eReceiveTaskPhaseCompleted)
 	k.assertRealZFSMarker(second.TargetNode, "zfs-dst-p2-"+suffix, pool, second.TargetDataset, "second-"+suffix)
+	k.assertRealZFSSyncoidSnapshots(second.SourceNode, "zfs-src-sync-snaps-"+suffix, pool, second.SourceDataset, 1)
+	k.assertRealZFSSyncoidSnapshots(second.TargetNode, "zfs-dst-sync-snaps-"+suffix, pool, second.TargetDataset, 1)
 	k.assertRunEphemeralCleanup(second.Name)
 }
 
@@ -894,6 +896,31 @@ func (k kubectlRunner) assertRealZFSSnapshotExists(node, jobName, snapshot strin
 	k.runRealZFS(node, jobName, "zfs list -H -t snapshot "+snapshot+" >/dev/null")
 }
 
+func (k kubectlRunner) assertRealZFSSyncoidSnapshots(node, jobName, pool, dataset string, wantCount int) {
+	k.t.Helper()
+	out := k.runRealZFS(node, jobName, realZFSSyncoidSnapshotsScript(pool, dataset))
+	snapshots := nonEmptyOutputLines(out)
+	if len(snapshots) != wantCount {
+		k.t.Fatalf("syncoid snapshots for %s on %s = %v, want %d", dataset, node, snapshots, wantCount)
+	}
+	for _, snapshot := range snapshots {
+		if !strings.Contains(snapshot, "_zfsrep-sender_") {
+			k.t.Fatalf("syncoid snapshot %q does not include stable sender hostname", snapshot)
+		}
+	}
+}
+
+func nonEmptyOutputLines(out string) []string {
+	var lines []string
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			lines = append(lines, line)
+		}
+	}
+	return lines
+}
+
 func (k kubectlRunner) runRealZFS(node, name, script string) string {
 	k.t.Helper()
 	logs, err := k.tryRealZFS(node, name, script)
@@ -1313,6 +1340,12 @@ func realZFSReadMarkerScript(pool, dataset string) string {
 		"zfs clone -o mountpoint=\"$mountpoint\" \"$snapshot\" \"$clone\"",
 		"zfs mount \"$clone\" >/dev/null 2>&1 || true",
 		"cat \"$mountpoint/marker.txt\"",
+	}, "\n")
+}
+
+func realZFSSyncoidSnapshotsScript(pool, dataset string) string {
+	return realZFSPreamble(pool) + "\n" + strings.Join([]string{
+		"zfs list -H -t snapshot -o name -r " + shellQuote(dataset) + ` | awk -F@ '$2 ~ /^syncoid_/ { print $0 }'`,
 	}, "\n")
 }
 
