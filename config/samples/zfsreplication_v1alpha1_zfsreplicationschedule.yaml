@@ -6,6 +6,8 @@ metadata:
 spec:
   schedule: "10 * * * *"
   concurrencyPolicy: Forbid
+  successfulRunsHistoryLimit: 3
+  failedRunsHistoryLimit: 1
   runTemplate:
     source:
       nodeName: worker-a

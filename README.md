@@ -185,6 +185,8 @@ metadata:
 spec:
   schedule: "10 * * * *"
   concurrencyPolicy: Forbid
+  successfulRunsHistoryLimit: 3
+  failedRunsHistoryLimit: 1
   runTemplate:
     source:
       nodeName: worker-a
@@ -206,6 +208,13 @@ durations. Seconds fields are not supported.
 `concurrencyPolicy: Forbid` is the default and skips a tick while a previous
 scheduled run is still active. Set `suspend: true` to stop creating runs without
 deleting the schedule.
+
+Scheduled run history mirrors Kubernetes CronJob history limits. By default the
+controller keeps the last three successful scheduled runs and the last failed
+scheduled run. Set `successfulRunsHistoryLimit` or `failedRunsHistoryLimit` to
+`0` to remove terminal scheduled runs of that phase after reconciliation.
+Manually created `ZFSReplicationRun` objects are not pruned by schedule history
+limits.
 
 ## Syncoid Options
 

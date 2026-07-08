@@ -2,7 +2,9 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"sort"
 	"time"
 
 	zfsv1 "github.com/mathias/zfsreplicationcontroller/api/v1alpha1"
@@ -20,6 +22,11 @@ type ZFSReplicationScheduleReconciler struct {
 	Now    func() time.Time
 }
 
+const (
+	defaultSuccessfulRunsHistoryLimit int32 = 3
+	defaultFailedRunsHistoryLimit     int32 = 1
+)
+
 func (r *ZFSReplicationScheduleReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	var schedule zfsv1.ZFSReplicationSchedule
 	if err := r.Get(ctx, req.NamespacedName, &schedule); err != nil {
@@ -36,8 +43,11 @@ func (r *ZFSReplicationScheduleReconciler) Reconcile(ctx context.Context, req ct
 	if err != nil {
 		return ctrl.Result{}, r.failSchedule(ctx, &schedule, err.Error())
 	}
+	if err := validateScheduleHistoryLimits(&schedule); err != nil {
+		return ctrl.Result{}, r.failSchedule(ctx, &schedule, err.Error())
+	}
 	if boolDefault(schedule.Spec.Suspend, false) {
-		return ctrl.Result{}, r.patchScheduleStatus(ctx, &schedule, func(st *zfsv1.ZFSReplicationScheduleStatus) {
+		return r.patchScheduleStatusAndPruneHistory(ctx, &schedule, ctrl.Result{}, func(st *zfsv1.ZFSReplicationScheduleStatus) {
 			st.LastError = ""
 		})
 	}
@@ -52,7 +62,8 @@ func (r *ZFSReplicationScheduleReconciler) Reconcile(ctx context.Context, req ct
 	}
 	due, next := dueAndNext(parsed, last, now)
 	if due.IsZero() {
-		return requeueAt(now, next), r.patchScheduleStatus(ctx, &schedule, func(st *zfsv1.ZFSReplicationScheduleStatus) {
+		result := requeueAt(now, next)
+		return r.patchScheduleStatusAndPruneHistory(ctx, &schedule, result, func(st *zfsv1.ZFSReplicationScheduleStatus) {
 			st.LastError = ""
 		})
 	}
@@ -63,7 +74,8 @@ func (r *ZFSReplicationScheduleReconciler) Reconcile(ctx context.Context, req ct
 			return ctrl.Result{}, err
 		}
 		if active {
-			return requeueAt(now, next), r.patchScheduleStatus(ctx, &schedule, func(st *zfsv1.ZFSReplicationScheduleStatus) {
+			result := requeueAt(now, next)
+			return r.patchScheduleStatusAndPruneHistory(ctx, &schedule, result, func(st *zfsv1.ZFSReplicationScheduleStatus) {
 				scheduled := metav1.NewTime(due)
 				st.LastScheduleTime = &scheduled
 				st.LastError = "skipped scheduled run because a previous run is still active"
@@ -75,7 +87,8 @@ func (r *ZFSReplicationScheduleReconciler) Reconcile(ctx context.Context, req ct
 	if err := r.ensureScheduledRun(ctx, &schedule, runName, due); err != nil {
 		return ctrl.Result{}, err
 	}
-	return requeueAt(now, next), r.patchScheduleStatus(ctx, &schedule, func(st *zfsv1.ZFSReplicationScheduleStatus) {
+	result := requeueAt(now, next)
+	return r.patchScheduleStatusAndPruneHistory(ctx, &schedule, result, func(st *zfsv1.ZFSReplicationScheduleStatus) {
 		scheduled := metav1.NewTime(due)
 		st.LastScheduleTime = &scheduled
 		st.LastRunName = runName
@@ -139,6 +152,71 @@ func (r *ZFSReplicationScheduleReconciler) hasActiveRun(ctx context.Context, sch
 	return false, nil
 }
 
+func (r *ZFSReplicationScheduleReconciler) pruneScheduleRunHistory(ctx context.Context, schedule *zfsv1.ZFSReplicationSchedule) error {
+	var runs zfsv1.ZFSReplicationRunList
+	if err := r.List(ctx, &runs, client.InNamespace(schedule.Namespace), client.MatchingLabels{labelPrefix + "/schedule": schedule.Name}); err != nil {
+		return err
+	}
+
+	var successful []zfsv1.ZFSReplicationRun
+	var failed []zfsv1.ZFSReplicationRun
+	for _, run := range runs.Items {
+		switch run.Status.Phase {
+		case zfsv1.PhaseSucceeded:
+			successful = append(successful, run)
+		case zfsv1.PhaseFailed:
+			failed = append(failed, run)
+		}
+	}
+
+	return errors.Join(
+		r.pruneTerminalRuns(ctx, successful, scheduleHistoryLimit(schedule.Spec.SuccessfulRunsHistoryLimit, defaultSuccessfulRunsHistoryLimit)),
+		r.pruneTerminalRuns(ctx, failed, scheduleHistoryLimit(schedule.Spec.FailedRunsHistoryLimit, defaultFailedRunsHistoryLimit)),
+	)
+}
+
+func (r *ZFSReplicationScheduleReconciler) pruneTerminalRuns(ctx context.Context, runs []zfsv1.ZFSReplicationRun, limit int) error {
+	if len(runs) <= limit {
+		return nil
+	}
+	sort.Slice(runs, func(i, j int) bool {
+		return terminalRunOlder(runs[i], runs[j])
+	})
+
+	for i := 0; i < len(runs)-limit; i++ {
+		run := runs[i].DeepCopy()
+		if err := r.Delete(ctx, run); client.IgnoreNotFound(err) != nil {
+			return fmt.Errorf("delete old scheduled run %s/%s: %w", run.Namespace, run.Name, err)
+		}
+	}
+	return nil
+}
+
+func terminalRunOlder(a, b zfsv1.ZFSReplicationRun) bool {
+	aTime := terminalRunHistoryTime(a)
+	bTime := terminalRunHistoryTime(b)
+	if !aTime.Equal(bTime) {
+		if aTime.IsZero() {
+			return true
+		}
+		if bTime.IsZero() {
+			return false
+		}
+		return aTime.Before(bTime)
+	}
+	if !a.CreationTimestamp.Time.Equal(b.CreationTimestamp.Time) {
+		return a.CreationTimestamp.Time.Before(b.CreationTimestamp.Time)
+	}
+	return a.Name < b.Name
+}
+
+func terminalRunHistoryTime(run zfsv1.ZFSReplicationRun) time.Time {
+	if run.Status.CompletedAt != nil {
+		return run.Status.CompletedAt.Time
+	}
+	return run.CreationTimestamp.Time
+}
+
 func (r *ZFSReplicationScheduleReconciler) failSchedule(ctx context.Context, schedule *zfsv1.ZFSReplicationSchedule, msg string) error {
 	return r.patchScheduleStatus(ctx, schedule, func(st *zfsv1.ZFSReplicationScheduleStatus) {
 		st.LastError = msg
@@ -149,6 +227,18 @@ func (r *ZFSReplicationScheduleReconciler) patchScheduleStatus(ctx context.Conte
 	copy := schedule.DeepCopy()
 	mutate(&copy.Status)
 	return r.Status().Patch(ctx, copy, client.MergeFrom(schedule))
+}
+
+func (r *ZFSReplicationScheduleReconciler) patchScheduleStatusAndPruneHistory(
+	ctx context.Context,
+	schedule *zfsv1.ZFSReplicationSchedule,
+	result ctrl.Result,
+	mutate func(*zfsv1.ZFSReplicationScheduleStatus),
+) (ctrl.Result, error) {
+	if err := r.patchScheduleStatus(ctx, schedule, mutate); err != nil {
+		return result, err
+	}
+	return result, r.pruneScheduleRunHistory(ctx, schedule)
 }
 
 func scheduledRunName(scheduleName string, due time.Time) string {
@@ -163,6 +253,27 @@ func validateConcurrencyPolicy(policy zfsv1.ConcurrencyPolicy) (zfsv1.Concurrenc
 		return policy, nil
 	}
 	return "", fmt.Errorf("concurrencyPolicy must be Allow or Forbid")
+}
+
+func validateScheduleHistoryLimits(schedule *zfsv1.ZFSReplicationSchedule) error {
+	if err := validateHistoryLimit("successfulRunsHistoryLimit", schedule.Spec.SuccessfulRunsHistoryLimit); err != nil {
+		return err
+	}
+	return validateHistoryLimit("failedRunsHistoryLimit", schedule.Spec.FailedRunsHistoryLimit)
+}
+
+func validateHistoryLimit(field string, value *int32) error {
+	if value != nil && *value < 0 {
+		return fmt.Errorf("%s must be greater than or equal to 0", field)
+	}
+	return nil
+}
+
+func scheduleHistoryLimit(value *int32, defaultValue int32) int {
+	if value == nil {
+		return int(defaultValue)
+	}
+	return int(*value)
 }
 
 func requeueAt(now, next time.Time) ctrl.Result {

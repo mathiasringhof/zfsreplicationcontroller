@@ -110,6 +110,14 @@ func (in *ZFSReplicationSchedule) DeepCopy() *ZFSReplicationSchedule {
 		out.Spec.Suspend = new(bool)
 		*out.Spec.Suspend = *in.Spec.Suspend
 	}
+	if in.Spec.SuccessfulRunsHistoryLimit != nil {
+		out.Spec.SuccessfulRunsHistoryLimit = new(int32)
+		*out.Spec.SuccessfulRunsHistoryLimit = *in.Spec.SuccessfulRunsHistoryLimit
+	}
+	if in.Spec.FailedRunsHistoryLimit != nil {
+		out.Spec.FailedRunsHistoryLimit = new(int32)
+		*out.Spec.FailedRunsHistoryLimit = *in.Spec.FailedRunsHistoryLimit
+	}
 	out.Spec.RunTemplate = *in.Spec.RunTemplate.DeepCopy()
 	if in.Status.LastScheduleTime != nil {
 		out.Status.LastScheduleTime = in.Status.LastScheduleTime.DeepCopy()

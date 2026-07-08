@@ -175,10 +175,12 @@ const (
 )
 
 type ZFSReplicationScheduleSpec struct {
-	Schedule          string                `json:"schedule"`
-	Suspend           *bool                 `json:"suspend,omitempty"`
-	ConcurrencyPolicy ConcurrencyPolicy     `json:"concurrencyPolicy,omitempty"`
-	RunTemplate       ZFSReplicationRunSpec `json:"runTemplate"`
+	Schedule                   string                `json:"schedule"`
+	Suspend                    *bool                 `json:"suspend,omitempty"`
+	ConcurrencyPolicy          ConcurrencyPolicy     `json:"concurrencyPolicy,omitempty"`
+	SuccessfulRunsHistoryLimit *int32                `json:"successfulRunsHistoryLimit,omitempty"`
+	FailedRunsHistoryLimit     *int32                `json:"failedRunsHistoryLimit,omitempty"`
+	RunTemplate                ZFSReplicationRunSpec `json:"runTemplate"`
 }
 
 type ZFSReplicationScheduleStatus struct {

@@ -48,6 +48,16 @@ spec:
                   enum:
                     - Allow
                     - Forbid
+                successfulRunsHistoryLimit:
+                  type: integer
+                  format: int32
+                  minimum: 0
+                  default: 3
+                failedRunsHistoryLimit:
+                  type: integer
+                  format: int32
+                  minimum: 0
+                  default: 1
                 runTemplate:
                   type: object
                   required:

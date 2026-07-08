@@ -18,6 +18,14 @@ type validationRule struct {
 	Message string `yaml:"message"`
 }
 
+type crdSchemaProperty struct {
+	Type       string                       `yaml:"type"`
+	Format     string                       `yaml:"format"`
+	Default    any                          `yaml:"default"`
+	Minimum    *int64                       `yaml:"minimum"`
+	Properties map[string]crdSchemaProperty `yaml:"properties"`
+}
+
 type manifestObject struct {
 	Kind     string `yaml:"kind"`
 	Metadata struct {
@@ -79,7 +87,7 @@ func TestControllerClusterRoleHasRequiredPermissions(t *testing.T) {
 	}
 
 	verbs := verbsForResource(role.Rules, "zfsreplication.ringhof.io", "zfsreplicationruns")
-	for _, verb := range []string{"create", "get", "list", "watch"} {
+	for _, verb := range []string{"create", "get", "list", "watch", "delete"} {
 		if !contains(verbs, verb) {
 			t.Fatalf("zfsreplicationruns RBAC verbs = %v, missing %q", verbs, verb)
 		}
@@ -129,6 +137,59 @@ func TestControllerClusterRoleHasRequiredPermissions(t *testing.T) {
 	for _, verb := range []string{"create", "get", "list", "watch", "update", "patch", "delete"} {
 		if !contains(verbs, verb) {
 			t.Fatalf("secrets RBAC verbs = %v, missing %q", verbs, verb)
+		}
+	}
+}
+
+func TestScheduleCRDHistoryLimitsHaveCronJobDefaults(t *testing.T) {
+	t.Helper()
+
+	crdPath := filepath.Join("..", "..", "config", "crd", "zfsreplication.ringhof.io_zfsreplicationschedules.yaml")
+	data, err := os.ReadFile(crdPath)
+	if err != nil {
+		t.Fatalf("read %s: %v", crdPath, err)
+	}
+
+	var crd struct {
+		Spec struct {
+			Versions []struct {
+				Schema struct {
+					OpenAPIV3Schema crdSchemaProperty `yaml:"openAPIV3Schema"`
+				} `yaml:"schema"`
+			} `yaml:"versions"`
+		} `yaml:"spec"`
+	}
+	if err := yaml.Unmarshal(data, &crd); err != nil {
+		t.Fatalf("parse %s: %v", crdPath, err)
+	}
+	if len(crd.Spec.Versions) != 1 {
+		t.Fatalf("CRD versions = %d, want 1", len(crd.Spec.Versions))
+	}
+
+	specProps := crd.Spec.Versions[0].Schema.OpenAPIV3Schema.Properties["spec"].Properties
+	for _, tt := range []struct {
+		name        string
+		wantDefault int64
+	}{
+		{name: "successfulRunsHistoryLimit", wantDefault: 3},
+		{name: "failedRunsHistoryLimit", wantDefault: 1},
+	} {
+		prop, ok := specProps[tt.name]
+		if !ok {
+			t.Fatalf("schedule CRD spec properties missing %s", tt.name)
+		}
+		if prop.Type != "integer" {
+			t.Fatalf("%s type = %q, want integer", tt.name, prop.Type)
+		}
+		if prop.Format != "int32" {
+			t.Fatalf("%s format = %q, want int32", tt.name, prop.Format)
+		}
+		defaultValue, ok := prop.Default.(int)
+		if !ok || int64(defaultValue) != tt.wantDefault {
+			t.Fatalf("%s default = %#v, want %d", tt.name, prop.Default, tt.wantDefault)
+		}
+		if prop.Minimum == nil || *prop.Minimum != 0 {
+			t.Fatalf("%s minimum = %v, want 0", tt.name, prop.Minimum)
 		}
 	}
 }
@@ -207,7 +268,7 @@ func TestNamespacedRBACRestrictsWorkloadPermissionsToWatchedNamespace(t *testing
 		verbs    []string
 	}{
 		{apiGroup: "zfsreplication.ringhof.io", resource: "zfsreplicationschedules", verbs: []string{"get", "list", "watch"}},
-		{apiGroup: "zfsreplication.ringhof.io", resource: "zfsreplicationruns", verbs: []string{"create", "get", "list", "watch"}},
+		{apiGroup: "zfsreplication.ringhof.io", resource: "zfsreplicationruns", verbs: []string{"create", "get", "list", "watch", "delete"}},
 		{apiGroup: "zfsreplication.ringhof.io", resource: "zfsreceivetasks", verbs: []string{"create", "get", "list", "watch"}},
 		{apiGroup: "zfsreplication.ringhof.io", resource: "zfsreplicationruns/status", verbs: []string{"get", "update", "patch"}},
 		{apiGroup: "zfsreplication.ringhof.io", resource: "zfsreceivetasks/status", verbs: []string{"get", "update", "patch"}},
