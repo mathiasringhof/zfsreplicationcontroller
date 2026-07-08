@@ -43,6 +43,7 @@ type runReceiverStatus struct {
 const (
 	failedJobLogMessageTailLimit         = 64 * 1024
 	failedJobLogMessageRedactionLookback = 4 * 1024
+	senderPodHostname                    = "zfsrep-sender"
 )
 
 func (r *ZFSReplicationRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -847,7 +848,9 @@ func runSenderJob(run *zfsv1.ZFSReplicationRun, names runObjects, image, receive
 		{Name: datamover.EnvSyncoidIdentifier, Value: syncSnapshotIdentifierForRun(run)},
 	}
 	env = append(env, syncoidEnv(run.Spec.Syncoid)...)
-	return dataMoverJobForRun(run, names.SenderName, image, labels, run.Spec.Source.NodeName, "/usr/local/bin/zfsrep-sender", env, names.SecretName, false)
+	job := dataMoverJobForRun(run, names.SenderName, image, labels, run.Spec.Source.NodeName, "/usr/local/bin/zfsrep-sender", env, names.SecretName, false)
+	job.Spec.Template.Spec.Hostname = senderPodHostname
+	return job
 }
 
 func syncSnapshotIdentifierForRun(run *zfsv1.ZFSReplicationRun) string {

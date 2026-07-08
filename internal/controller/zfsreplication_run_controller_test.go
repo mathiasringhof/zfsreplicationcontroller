@@ -37,6 +37,9 @@ func TestRunReconcileSenderJobUsesSyncoidOptions(t *testing.T) {
 		t.Fatal(err)
 	}
 	sender := getJob(t, r.Client, "zfsrep-manual-1-sender")
+	if got := sender.Spec.Template.Spec.Hostname; got != "zfsrep-sender" {
+		t.Fatalf("sender pod hostname = %q, want zfsrep-sender", got)
+	}
 	if got := envValue(sender, "SRC_DATASET"); got != "tank/src" {
 		t.Fatalf("SRC_DATASET = %q", got)
 	}
