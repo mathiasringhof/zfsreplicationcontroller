@@ -94,18 +94,13 @@ func TestContainerWorkflowGatesTagReleasePublication(t *testing.T) {
 	artifactRequireNotContains(t, ".github/workflows/container.yaml", workflow, "zfsreplication-e2e")
 }
 
-func TestE2EWorkflowRunsSeparatelyFromReleasePublication(t *testing.T) {
+func TestGitHubActionsDoesNotPublishE2EWorkflow(t *testing.T) {
 	t.Parallel()
 
-	workflow := artifactReadFile(t, "../../.github/workflows/e2e.yaml")
-	for _, want := range []string{
-		"workflow_dispatch:",
-		"- \"v*\"",
-		"zfsreplication-e2e",
-		"./test/e2e/doctor.sh",
-		"./test/e2e/run.sh",
-	} {
-		artifactRequireContains(t, ".github/workflows/e2e.yaml", workflow, want)
+	if _, err := os.Stat("../../.github/workflows/e2e.yaml"); err == nil {
+		t.Fatal("GitHub Actions E2E workflow exists; E2E must only run manually outside GitHub Actions")
+	} else if !os.IsNotExist(err) {
+		t.Fatalf("stat GitHub Actions E2E workflow: %v", err)
 	}
 }
 

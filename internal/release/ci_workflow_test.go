@@ -25,16 +25,12 @@ func TestFastCIWorkflowHasReleaseGates(t *testing.T) {
 	}
 }
 
-func TestE2EWorkflowRunsFullHarnessForReleaseTags(t *testing.T) {
-	workflow := ciWorkflowFile(t, "../../.github/workflows/e2e.yaml")
-
-	ciRequireWorkflowEvent(t, workflow, "workflow_dispatch")
-	ciRequireWorkflowEventValue(t, workflow, "push", "tags", "v*")
-	ciRequireLine(t, workflow, "vm-e2e:")
-	ciRequireLine(t, workflow, "- self-hosted")
-	ciRequireLine(t, workflow, "- zfsreplication-e2e")
-	ciRequireRunCommand(t, workflow, "./test/e2e/doctor.sh")
-	ciRequireRunCommand(t, workflow, "./test/e2e/run.sh")
+func TestGitHubActionsDoesNotDefineE2EWorkflow(t *testing.T) {
+	if _, err := os.Stat("../../.github/workflows/e2e.yaml"); err == nil {
+		t.Fatal("GitHub Actions E2E workflow exists; E2E must only run manually outside GitHub Actions")
+	} else if !os.IsNotExist(err) {
+		t.Fatalf("stat GitHub Actions E2E workflow: %v", err)
+	}
 }
 
 func ciWorkflowFile(t *testing.T, path string) string {
@@ -65,12 +61,6 @@ func ciRequireRunCommand(t *testing.T, contents, want string) {
 		}
 	}
 	t.Fatalf("workflow missing run command %q", want)
-}
-
-func ciRequireWorkflowEvent(t *testing.T, contents, event string) {
-	t.Helper()
-	onBlock := ciRequireYAMLBlock(t, ciYAMLLines(contents), "on:")
-	ciRequireYAMLBlock(t, onBlock, event+":")
 }
 
 func ciRequireWorkflowEventValue(t *testing.T, contents, event, key, value string) {

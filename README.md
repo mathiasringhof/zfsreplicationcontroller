@@ -293,11 +293,17 @@ go test ./...
 golangci-lint run
 ```
 
-Release tags require both CI workflows:
+Release tags require the hosted CI and release workflows:
 
 - `Test`: format, lint, unit/integration tests, and race tests.
-- `E2E`: full Lima/k3s real-ZFS E2E on a self-hosted runner labelled
-  `zfsreplication-e2e`.
+- `Container`: release image build and release manifest publication.
+
+GitHub Actions does not run the VM e2e harness. Run the full Lima/k3s real-ZFS
+E2E locally before cutting a release:
+
+```sh
+./test/e2e/run.sh
+```
 
 For an alpha `0.4.x` release, the Kubernetes API remains
 `zfsreplication.ringhof.io/v1alpha1`; compatibility-breaking API changes may
