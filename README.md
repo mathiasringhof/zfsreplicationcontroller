@@ -90,11 +90,11 @@ For an alpha release, prefer the rendered release manifest attached to the
 GitHub release instead of the mutable `main` manifests in the repository:
 
 ```sh
-curl -LO https://github.com/mathiasringhof/zfsreplicationcontroller/releases/download/v0.2.0/zfsreplicationcontroller-v0.2.0.yaml
-kubectl apply -f zfsreplicationcontroller-v0.2.0.yaml
+curl -LO https://github.com/mathiasringhof/zfsreplicationcontroller/releases/download/v0.3.0/zfsreplicationcontroller-v0.3.0.yaml
+kubectl apply -f zfsreplicationcontroller-v0.3.0.yaml
 ```
 
-The `0.2.x` releases are alpha releases. The Kubernetes API remains
+The `0.3.x` releases are alpha releases. The Kubernetes API remains
 `zfsreplication.ringhof.io/v1alpha1`, and incompatible API changes may happen
 before a stable `1.0.0`.
 
@@ -290,7 +290,7 @@ Release tags require both CI workflows:
 - `E2E`: full Lima/k3s real-ZFS E2E on a self-hosted runner labelled
   `zfsreplication-e2e`.
 
-For an alpha `0.2.x` release, the Kubernetes API remains
+For an alpha `0.3.x` release, the Kubernetes API remains
 `zfsreplication.ringhof.io/v1alpha1`; compatibility-breaking API changes may
 still happen before a stable `1.0.0`.
 
