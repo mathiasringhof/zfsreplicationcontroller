@@ -86,6 +86,9 @@ If you use a different registry or a pinned image, set it in both places in
 
 Install the CRDs, RBAC, namespace, and controller Deployment.
 
+For a release promotion checklist, especially for GitOps repositories that
+vendor these manifests, see [`docs/deployment.md`](docs/deployment.md).
+
 For an alpha release, prefer the rendered release manifest attached to the
 GitHub release instead of the mutable `main` manifests in the repository:
 
