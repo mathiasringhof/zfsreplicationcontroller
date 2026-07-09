@@ -93,6 +93,9 @@ spec:
                     allowSyncSnapshotDestroy:
                       type: boolean
                       default: false
+                    allowTargetSnapshotDestroy:
+                      type: boolean
+                      default: false
                     syncSnapshotIdentifier:
                       type: string
                     compression:

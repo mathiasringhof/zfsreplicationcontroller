@@ -31,6 +31,7 @@ const testReceiverHostKey = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOOBMEh4NBNCYAr
 
 func TestRunReconcileSenderJobUsesSyncoidOptions(t *testing.T) {
 	run := replicationRun("manual-1")
+	run.Spec.Syncoid.DeleteTargetSnapshots = ptr(true)
 	names := objectNamesForRun(run.Name)
 	r := newRunReconciler(t, run, readyReceiveTask(run, names, "10.0.0.42", testReceiverHostKey))
 	if _, err := r.Reconcile(context.Background(), request("manual-1")); err != nil {
@@ -51,6 +52,9 @@ func TestRunReconcileSenderJobUsesSyncoidOptions(t *testing.T) {
 	}
 	if got := envValue(sender, "SYNCOID_NO_SYNC_SNAP"); got != "true" {
 		t.Fatalf("SYNCOID_NO_SYNC_SNAP = %q", got)
+	}
+	if got := envValue(sender, "SYNCOID_DELETE_TARGET_SNAPSHOTS"); got != "true" {
+		t.Fatalf("SYNCOID_DELETE_TARGET_SNAPSHOTS = %q", got)
 	}
 	if got := envValue(sender, "SYNCOID_COMPRESS"); got != "zstd" {
 		t.Fatalf("SYNCOID_COMPRESS = %q", got)
@@ -76,7 +80,7 @@ func TestRunReconcileSenderJobUsesSyncoidOptions(t *testing.T) {
 	if cfg.DstHost != "zfs-recv@10.0.0.42" {
 		t.Fatalf("round-tripped DstHost = %q", cfg.DstHost)
 	}
-	if !cfg.NoSyncSnap || !cfg.NoRollback || cfg.ForceDelete || cfg.Compress != "zstd" {
+	if !cfg.NoSyncSnap || !cfg.NoRollback || cfg.ForceDelete || !cfg.DeleteTargetSnapshots || cfg.Compress != "zstd" {
 		t.Fatalf("round-tripped Syncoid config = %#v", cfg)
 	}
 	if cfg.ReceiveUnmounted || cfg.ReceiveResumable {
@@ -122,6 +126,7 @@ func TestKnownHostsLineRejectsInvalidHostKey(t *testing.T) {
 
 func TestRunReconcileCreatesReceiveTaskBeforeSenderJob(t *testing.T) {
 	run := replicationRun("manual-1")
+	run.Spec.Syncoid.DeleteTargetSnapshots = ptr(true)
 	names := objectNamesForRun(run.Name)
 	r := newRunReconciler(t, run)
 
@@ -160,6 +165,9 @@ func TestRunReconcileCreatesReceiveTaskBeforeSenderJob(t *testing.T) {
 	}
 	if task.Spec.Policy.AllowSyncSnapshotDestroy {
 		t.Fatal("task allows Syncoid snapshot pruning when noSyncSnap is true")
+	}
+	if !task.Spec.Policy.AllowTargetSnapshotDestroy {
+		t.Fatal("task does not allow target snapshot destroy when deleteTargetSnapshots is true")
 	}
 	if task.Spec.Policy.Compression != "zstd" {
 		t.Fatalf("task compression = %q, want zstd", task.Spec.Policy.Compression)

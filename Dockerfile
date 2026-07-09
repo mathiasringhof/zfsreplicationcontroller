@@ -28,6 +28,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 	&& syncoid --version | grep -F "${SANOID_VERSION}" \
 	&& syncoid --help 2>&1 | grep -F -- "--include-snaps" \
 	&& syncoid --help 2>&1 | grep -F -- "--identifier" \
+	&& syncoid --help 2>&1 | grep -F -- "--delete-target-snapshots" \
 	&& rm -rf /tmp/sanoid.tar.gz "/tmp/sanoid-${SANOID_VERSION}" /var/lib/apt/lists/*
 RUN useradd -o -u 0 -g 0 -M -d /run/zfs-receiver -s /bin/sh zfs-recv \
 	&& usermod -p '*' zfs-recv

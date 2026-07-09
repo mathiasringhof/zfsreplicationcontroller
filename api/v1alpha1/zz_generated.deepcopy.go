@@ -163,6 +163,10 @@ func (in *SyncoidSpec) DeepCopy() *SyncoidSpec {
 		out.ForceDelete = new(bool)
 		*out.ForceDelete = *in.ForceDelete
 	}
+	if in.DeleteTargetSnapshots != nil {
+		out.DeleteTargetSnapshots = new(bool)
+		*out.DeleteTargetSnapshots = *in.DeleteTargetSnapshots
+	}
 	if in.ReceiveUnmounted != nil {
 		out.ReceiveUnmounted = new(bool)
 		*out.ReceiveUnmounted = *in.ReceiveUnmounted

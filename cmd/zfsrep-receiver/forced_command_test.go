@@ -66,6 +66,7 @@ func TestAuthorizeReceiverCommandRejectsCommandsOutsidePolicy(t *testing.T) {
 		"zfs receive -u -s tank/other 2>&1",
 		"zfs receive -u -s tank/dst; id",
 		"zfs receive -u -s tank/dst $(id)",
+		"zfs destroy tank/dst@manual-rescue",
 		"zfs destroy tank/dst@syncoid_2026-07-04",
 		"zfs destroy tank/dst@syncoid_rel123_worker_old",
 		"zfs destroy tank/dst@syncoid_old; id",
@@ -162,6 +163,45 @@ func TestAuthorizeReceiverCommandEnforcesDatasetAndSnapshotBoundaries(t *testing
 		t.Run(cmd, func(t *testing.T) {
 			if _, err := authorizeReceiverCommand(cmd, policy); err != nil {
 				t.Fatalf("authorizeReceiverCommand() error = %v, want nil", err)
+			}
+		})
+	}
+}
+
+func TestAuthorizeReceiverCommandAllowsTargetSnapshotDestroyPolicy(t *testing.T) {
+	policy := testReceiverPolicy("tank/dst", zfsv1.ReceiveTaskPolicy{
+		ReceiveUnmounted:           true,
+		ReceiveResumable:           true,
+		AllowSyncSnapshotDestroy:   false,
+		AllowTargetSnapshotDestroy: true,
+		SyncSnapshotIdentifier:     "rel123",
+		Compression:                "none",
+	})
+
+	for _, cmd := range []string{
+		"zfs destroy tank/dst@manual-rescue",
+		"zfs destroy tank/dst@snap-2026-07-09",
+		"zfs destroy tank/dst@syncoid_other_worker_2026-07-09",
+		"zfs destroy tank/dst@manual-a; zfs destroy tank/dst@manual-b",
+	} {
+		t.Run(cmd, func(t *testing.T) {
+			if _, err := authorizeReceiverCommand(cmd, policy); err != nil {
+				t.Fatalf("authorizeReceiverCommand() error = %v, want nil", err)
+			}
+		})
+	}
+
+	for _, cmd := range []string{
+		"zfs destroy tank/dst/child@manual-rescue",
+		"zfs destroy tank/other@manual-rescue",
+		"zfs destroy tank/dst@manual-rescue,hold",
+		"zfs destroy -r tank/dst@manual-rescue",
+		"zfs destroy tank/dst@manual-rescue 2>&1",
+		"zfs destroy tank/dst",
+	} {
+		t.Run(cmd, func(t *testing.T) {
+			if _, err := authorizeReceiverCommand(cmd, policy); err == nil {
+				t.Fatal("authorizeReceiverCommand() error = nil, want rejection")
 			}
 		})
 	}

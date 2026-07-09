@@ -15,24 +15,25 @@ import (
 )
 
 const (
-	EnvRole              = "ZFSREP_ROLE"
-	EnvSrcDataset        = "SRC_DATASET"
-	EnvDstHost           = "DST_HOST"
-	EnvDstDataset        = "DST_DATASET"
-	EnvSSHKeyFile        = "SSH_KEY_FILE"
-	EnvKnownHostsFile    = "KNOWN_HOSTS_FILE"
-	EnvSSHPort           = "SSH_PORT"
-	EnvNoSyncSnap        = "SYNCOID_NO_SYNC_SNAP"
-	EnvNoRollback        = "SYNCOID_NO_ROLLBACK"
-	EnvForceDelete       = "SYNCOID_FORCE_DELETE"
-	EnvCompress          = "SYNCOID_COMPRESS"
-	EnvSyncoidIdentifier = "SYNCOID_IDENTIFIER"
-	EnvReceiveUnmounted  = "RECEIVE_UNMOUNTED"
-	EnvReceiveResumable  = "RECEIVE_RESUMABLE"
-	EnvIncludeSnaps      = "SYNCOID_INCLUDE_SNAPS"
-	EnvExcludeSnaps      = "SYNCOID_EXCLUDE_SNAPS"
-	EnvExpectedNodeName  = "EXPECTED_NODE_NAME"
-	EnvActualNodeName    = "ACTUAL_NODE_NAME"
+	EnvRole                  = "ZFSREP_ROLE"
+	EnvSrcDataset            = "SRC_DATASET"
+	EnvDstHost               = "DST_HOST"
+	EnvDstDataset            = "DST_DATASET"
+	EnvSSHKeyFile            = "SSH_KEY_FILE"
+	EnvKnownHostsFile        = "KNOWN_HOSTS_FILE"
+	EnvSSHPort               = "SSH_PORT"
+	EnvNoSyncSnap            = "SYNCOID_NO_SYNC_SNAP"
+	EnvNoRollback            = "SYNCOID_NO_ROLLBACK"
+	EnvForceDelete           = "SYNCOID_FORCE_DELETE"
+	EnvDeleteTargetSnapshots = "SYNCOID_DELETE_TARGET_SNAPSHOTS"
+	EnvCompress              = "SYNCOID_COMPRESS"
+	EnvSyncoidIdentifier     = "SYNCOID_IDENTIFIER"
+	EnvReceiveUnmounted      = "RECEIVE_UNMOUNTED"
+	EnvReceiveResumable      = "RECEIVE_RESUMABLE"
+	EnvIncludeSnaps          = "SYNCOID_INCLUDE_SNAPS"
+	EnvExcludeSnaps          = "SYNCOID_EXCLUDE_SNAPS"
+	EnvExpectedNodeName      = "EXPECTED_NODE_NAME"
+	EnvActualNodeName        = "ACTUAL_NODE_NAME"
 
 	RoleSender            = "sender"
 	DefaultSSHKeyFile     = "/var/run/zfsrep/ssh/id_rsa"
@@ -44,23 +45,24 @@ const (
 )
 
 type SenderConfig struct {
-	SrcDataset        string
-	DstHost           string
-	DstDataset        string
-	SSHKeyFile        string
-	KnownHostsFile    string
-	SSHPort           string
-	NoSyncSnap        bool
-	NoRollback        bool
-	ForceDelete       bool
-	Compress          string
-	SyncoidIdentifier string
-	ReceiveUnmounted  bool
-	ReceiveResumable  bool
-	IncludeSnaps      []string
-	ExcludeSnaps      []string
-	ExpectedNode      string
-	ActualNode        string
+	SrcDataset            string
+	DstHost               string
+	DstDataset            string
+	SSHKeyFile            string
+	KnownHostsFile        string
+	SSHPort               string
+	NoSyncSnap            bool
+	NoRollback            bool
+	ForceDelete           bool
+	DeleteTargetSnapshots bool
+	Compress              string
+	SyncoidIdentifier     string
+	ReceiveUnmounted      bool
+	ReceiveResumable      bool
+	IncludeSnaps          []string
+	ExcludeSnaps          []string
+	ExpectedNode          string
+	ActualNode            string
 }
 
 func SenderConfigFromEnv() SenderConfig {
@@ -70,23 +72,24 @@ func SenderConfigFromEnv() SenderConfig {
 func SenderConfigFromLookup(lookup func(string) string) SenderConfig {
 	defaults := replication.DefaultSyncoidOptions()
 	return SenderConfig{
-		SrcDataset:        lookup(EnvSrcDataset),
-		DstHost:           lookup(EnvDstHost),
-		DstDataset:        lookup(EnvDstDataset),
-		SSHKeyFile:        lookup(EnvSSHKeyFile),
-		KnownHostsFile:    lookup(EnvKnownHostsFile),
-		SSHPort:           lookup(EnvSSHPort),
-		NoSyncSnap:        boolLookupDefault(lookup, EnvNoSyncSnap, defaults.NoSyncSnap),
-		NoRollback:        boolLookupDefault(lookup, EnvNoRollback, defaults.NoRollback),
-		ForceDelete:       boolLookupDefault(lookup, EnvForceDelete, defaults.ForceDelete),
-		Compress:          lookupDefault(lookup, EnvCompress, defaults.Compress),
-		SyncoidIdentifier: lookup(EnvSyncoidIdentifier),
-		ReceiveUnmounted:  boolLookupDefault(lookup, EnvReceiveUnmounted, defaults.ReceiveUnmounted),
-		ReceiveResumable:  boolLookupDefault(lookup, EnvReceiveResumable, defaults.ReceiveResumable),
-		IncludeSnaps:      listLookup(lookup, EnvIncludeSnaps),
-		ExcludeSnaps:      listLookup(lookup, EnvExcludeSnaps),
-		ExpectedNode:      lookup(EnvExpectedNodeName),
-		ActualNode:        lookup(EnvActualNodeName),
+		SrcDataset:            lookup(EnvSrcDataset),
+		DstHost:               lookup(EnvDstHost),
+		DstDataset:            lookup(EnvDstDataset),
+		SSHKeyFile:            lookup(EnvSSHKeyFile),
+		KnownHostsFile:        lookup(EnvKnownHostsFile),
+		SSHPort:               lookup(EnvSSHPort),
+		NoSyncSnap:            boolLookupDefault(lookup, EnvNoSyncSnap, defaults.NoSyncSnap),
+		NoRollback:            boolLookupDefault(lookup, EnvNoRollback, defaults.NoRollback),
+		ForceDelete:           boolLookupDefault(lookup, EnvForceDelete, defaults.ForceDelete),
+		DeleteTargetSnapshots: boolLookupDefault(lookup, EnvDeleteTargetSnapshots, defaults.DeleteTargetSnapshots),
+		Compress:              lookupDefault(lookup, EnvCompress, defaults.Compress),
+		SyncoidIdentifier:     lookup(EnvSyncoidIdentifier),
+		ReceiveUnmounted:      boolLookupDefault(lookup, EnvReceiveUnmounted, defaults.ReceiveUnmounted),
+		ReceiveResumable:      boolLookupDefault(lookup, EnvReceiveResumable, defaults.ReceiveResumable),
+		IncludeSnaps:          listLookup(lookup, EnvIncludeSnaps),
+		ExcludeSnaps:          listLookup(lookup, EnvExcludeSnaps),
+		ExpectedNode:          lookup(EnvExpectedNodeName),
+		ActualNode:            lookup(EnvActualNodeName),
 	}
 }
 
@@ -160,6 +163,9 @@ func syncoidArgs(cfg SenderConfig, compress string) []string {
 	if cfg.SyncoidIdentifier != "" {
 		args = append(args, "--identifier="+cfg.SyncoidIdentifier)
 	}
+	if cfg.DeleteTargetSnapshots {
+		args = append(args, "--delete-target-snapshots")
+	}
 	if cfg.KnownHostsFile != "" {
 		args = append(args,
 			"--sshoption=UserKnownHostsFile="+cfg.KnownHostsFile,
@@ -192,8 +198,8 @@ func syncoidArgs(cfg SenderConfig, compress string) []string {
 }
 
 func logSenderStart(w io.Writer, cfg SenderConfig) {
-	logSenderLine(w, "sender starting srcDataset=%s dstDataset=%s dstHost=%s sshPort=%s syncoidIdentifier=%s noSyncSnap=%t noRollback=%t forceDelete=%t compress=%s receiveUnmounted=%t receiveResumable=%t includeSnaps=%q excludeSnaps=%q",
-		cfg.SrcDataset, cfg.DstDataset, cfg.DstHost, cfg.SSHPort, cfg.SyncoidIdentifier, cfg.NoSyncSnap, cfg.NoRollback, cfg.ForceDelete, cfg.Compress, cfg.ReceiveUnmounted, cfg.ReceiveResumable, strings.Join(cfg.IncludeSnaps, ","), strings.Join(cfg.ExcludeSnaps, ","))
+	logSenderLine(w, "sender starting srcDataset=%s dstDataset=%s dstHost=%s sshPort=%s syncoidIdentifier=%s noSyncSnap=%t noRollback=%t forceDelete=%t deleteTargetSnapshots=%t compress=%s receiveUnmounted=%t receiveResumable=%t includeSnaps=%q excludeSnaps=%q",
+		cfg.SrcDataset, cfg.DstDataset, cfg.DstHost, cfg.SSHPort, cfg.SyncoidIdentifier, cfg.NoSyncSnap, cfg.NoRollback, cfg.ForceDelete, cfg.DeleteTargetSnapshots, cfg.Compress, cfg.ReceiveUnmounted, cfg.ReceiveResumable, strings.Join(cfg.IncludeSnaps, ","), strings.Join(cfg.ExcludeSnaps, ","))
 }
 
 func logSenderLine(w io.Writer, format string, args ...any) {

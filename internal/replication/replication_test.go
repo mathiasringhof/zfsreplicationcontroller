@@ -125,17 +125,18 @@ func TestNormalizeSyncoidOptions(t *testing.T) {
 	exclude := []string{".*-tmp$"}
 
 	opts := NormalizeSyncoidOptions(SyncoidOptionInput{
-		NoSyncSnap:       ptr(true),
-		NoRollback:       ptr(false),
-		ForceDelete:      ptr(true),
-		Compress:         "zstd",
-		ReceiveUnmounted: ptr(false),
-		ReceiveResumable: ptr(false),
-		IncludeSnaps:     include,
-		ExcludeSnaps:     exclude,
+		NoSyncSnap:            ptr(true),
+		NoRollback:            ptr(false),
+		ForceDelete:           ptr(true),
+		DeleteTargetSnapshots: ptr(true),
+		Compress:              "zstd",
+		ReceiveUnmounted:      ptr(false),
+		ReceiveResumable:      ptr(false),
+		IncludeSnaps:          include,
+		ExcludeSnaps:          exclude,
 	})
 
-	if !opts.NoSyncSnap || opts.NoRollback || !opts.ForceDelete || opts.Compress != "zstd" {
+	if !opts.NoSyncSnap || opts.NoRollback || !opts.ForceDelete || !opts.DeleteTargetSnapshots || opts.Compress != "zstd" {
 		t.Fatalf("normalized syncoid behavior = %#v", opts)
 	}
 	if opts.ReceiveUnmounted || opts.ReceiveResumable {
@@ -150,7 +151,7 @@ func TestNormalizeSyncoidOptions(t *testing.T) {
 
 func TestDefaultSyncoidOptions(t *testing.T) {
 	opts := NormalizeSyncoidOptions(SyncoidOptionInput{})
-	if opts.NoSyncSnap || !opts.NoRollback || opts.ForceDelete {
+	if opts.NoSyncSnap || !opts.NoRollback || opts.ForceDelete || opts.DeleteTargetSnapshots {
 		t.Fatalf("default syncoid behavior = %#v", opts)
 	}
 	if opts.Compress != CompressionNone {

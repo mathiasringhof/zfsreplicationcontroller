@@ -55,14 +55,15 @@ type LocalObjectReference struct {
 }
 
 type SyncoidSpec struct {
-	NoSyncSnap       *bool    `json:"noSyncSnap,omitempty"`
-	NoRollback       *bool    `json:"noRollback,omitempty"`
-	ForceDelete      *bool    `json:"forceDelete,omitempty"`
-	Compress         string   `json:"compress,omitempty"`
-	ReceiveUnmounted *bool    `json:"receiveUnmounted,omitempty"`
-	ReceiveResumable *bool    `json:"receiveResumable,omitempty"`
-	IncludeSnaps     []string `json:"includeSnaps,omitempty"`
-	ExcludeSnaps     []string `json:"excludeSnaps,omitempty"`
+	NoSyncSnap            *bool    `json:"noSyncSnap,omitempty"`
+	NoRollback            *bool    `json:"noRollback,omitempty"`
+	ForceDelete           *bool    `json:"forceDelete,omitempty"`
+	DeleteTargetSnapshots *bool    `json:"deleteTargetSnapshots,omitempty"`
+	Compress              string   `json:"compress,omitempty"`
+	ReceiveUnmounted      *bool    `json:"receiveUnmounted,omitempty"`
+	ReceiveResumable      *bool    `json:"receiveResumable,omitempty"`
+	IncludeSnaps          []string `json:"includeSnaps,omitempty"`
+	ExcludeSnaps          []string `json:"excludeSnaps,omitempty"`
 }
 
 type ZFSReplicationRunSpec struct {
@@ -110,14 +111,15 @@ type ReceiveTaskSSHSpec struct {
 }
 
 type ReceiveTaskPolicy struct {
-	ReceiveUnmounted         bool   `json:"receiveUnmounted"`
-	ReceiveResumable         bool   `json:"receiveResumable,omitempty"`
-	AllowRollback            bool   `json:"allowRollback,omitempty"`
-	AllowDestroy             bool   `json:"allowDestroy,omitempty"`
-	AllowMount               bool   `json:"allowMount,omitempty"`
-	AllowSyncSnapshotDestroy bool   `json:"allowSyncSnapshotDestroy,omitempty"`
-	SyncSnapshotIdentifier   string `json:"syncSnapshotIdentifier,omitempty"`
-	Compression              string `json:"compression,omitempty"`
+	ReceiveUnmounted           bool   `json:"receiveUnmounted"`
+	ReceiveResumable           bool   `json:"receiveResumable,omitempty"`
+	AllowRollback              bool   `json:"allowRollback,omitempty"`
+	AllowDestroy               bool   `json:"allowDestroy,omitempty"`
+	AllowMount                 bool   `json:"allowMount,omitempty"`
+	AllowSyncSnapshotDestroy   bool   `json:"allowSyncSnapshotDestroy,omitempty"`
+	AllowTargetSnapshotDestroy bool   `json:"allowTargetSnapshotDestroy,omitempty"`
+	SyncSnapshotIdentifier     string `json:"syncSnapshotIdentifier,omitempty"`
+	Compression                string `json:"compression,omitempty"`
 }
 
 type ZFSReceiveTaskSpec struct {

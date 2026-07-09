@@ -90,11 +90,11 @@ For an alpha release, prefer the rendered release manifest attached to the
 GitHub release instead of the mutable `main` manifests in the repository:
 
 ```sh
-curl -LO https://github.com/mathiasringhof/zfsreplicationcontroller/releases/download/v0.3.0/zfsreplicationcontroller-v0.3.0.yaml
-kubectl apply -f zfsreplicationcontroller-v0.3.0.yaml
+curl -LO https://github.com/mathiasringhof/zfsreplicationcontroller/releases/download/v0.4.0/zfsreplicationcontroller-v0.4.0.yaml
+kubectl apply -f zfsreplicationcontroller-v0.4.0.yaml
 ```
 
-The `0.3.x` releases are alpha releases. The Kubernetes API remains
+The `0.4.x` releases are alpha releases. The Kubernetes API remains
 `zfsreplication.ringhof.io/v1alpha1`, and incompatible API changes may happen
 before a stable `1.0.0`.
 
@@ -225,6 +225,10 @@ the replication behavior:
 - `noSyncSnap`: pass `--no-sync-snap`. Defaults to false.
 - `noRollback`: pass `--no-rollback` when true. Defaults to true.
 - `forceDelete`: pass `--force-delete`. Defaults to false.
+- `deleteTargetSnapshots`: pass `--delete-target-snapshots`. Defaults to
+  false. When true, Syncoid may destroy snapshots that exist only on the target
+  after a successful sync. Use it only for strict mirror targets whose snapshot
+  lifecycle is owned by the source.
 - `compress`: pass `--compress=<value>`. Defaults to `none` in the sender.
 - `receiveUnmounted`: pass `--recvoptions=u` when true. Defaults to true.
   Mounted receives are only authorized when this is false.
@@ -270,7 +274,12 @@ Sender Jobs use `backoffLimit: 0`, `restartPolicy: Never`, and
 The target dataset must be passive and suitable for `syncoid` to receive into.
 
 `forceDelete` is destructive. When enabled, the sender passes `--force-delete`
-to Syncoid.
+to Syncoid so it may destroy conflicting target datasets.
+
+`deleteTargetSnapshots` is also destructive. When enabled, the sender passes
+`--delete-target-snapshots` to Syncoid so it may destroy snapshots that exist
+only on the target. Do not enable it when target-local rollback, rescue, or
+inspection snapshots must be preserved.
 
 When external snapshot tooling owns snapshots and retention, make sure retention
 does not prune the common source/target base before a scheduled replication run
@@ -290,7 +299,7 @@ Release tags require both CI workflows:
 - `E2E`: full Lima/k3s real-ZFS E2E on a self-hosted runner labelled
   `zfsreplication-e2e`.
 
-For an alpha `0.3.x` release, the Kubernetes API remains
+For an alpha `0.4.x` release, the Kubernetes API remains
 `zfsreplication.ringhof.io/v1alpha1`; compatibility-breaking API changes may
 still happen before a stable `1.0.0`.
 

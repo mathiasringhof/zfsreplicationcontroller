@@ -340,9 +340,12 @@ func validateZFSReceiveStep(step receiverCommandStep, policy receiverCommandPoli
 func zfsDestroyAllowed(args []string, policy receiverCommandPolicy) bool {
 	if len(args) == 2 && args[0] == "destroy" {
 		if dataset, snapshot, ok := replication.SplitSnapshotTarget(args[1]); ok {
-			return policy.AllowSyncSnapshotDestroy &&
-				dataset == policy.TargetDataset &&
-				replication.SyncoidSnapshotTarget(snapshot, policy.SyncSnapshotIdentifier)
+			if dataset != policy.TargetDataset {
+				return false
+			}
+			return policy.AllowTargetSnapshotDestroy ||
+				policy.AllowSyncSnapshotDestroy &&
+					replication.SyncoidSnapshotTarget(snapshot, policy.SyncSnapshotIdentifier)
 		}
 		return policy.AllowDestroy && replication.DatasetOrChild(args[1], policy.TargetDataset) && !strings.Contains(args[1], "@")
 	}

@@ -52,9 +52,9 @@ func TestREADMEDocumentsReleaseInstallArtifact(t *testing.T) {
 
 	readme := artifactReadFile(t, "../../README.md")
 	for _, want := range []string{
-		"https://github.com/mathiasringhof/zfsreplicationcontroller/releases/download/v0.3.0/zfsreplicationcontroller-v0.3.0.yaml",
-		"kubectl apply -f zfsreplicationcontroller-v0.3.0.yaml",
-		"The `0.3.x` releases are alpha releases",
+		"https://github.com/mathiasringhof/zfsreplicationcontroller/releases/download/v0.4.0/zfsreplicationcontroller-v0.4.0.yaml",
+		"kubectl apply -f zfsreplicationcontroller-v0.4.0.yaml",
+		"The `0.4.x` releases are alpha releases",
 	} {
 		artifactRequireContains(t, "README.md", readme, want)
 	}

@@ -544,6 +544,9 @@ func TestCRDSchemaExposesSyncoidOptions(t *testing.T) {
 	if syncoidProps["noSyncSnap"].Type != "boolean" {
 		t.Fatalf("noSyncSnap schema = %#v", syncoidProps["noSyncSnap"])
 	}
+	if syncoidProps["deleteTargetSnapshots"].Type != "boolean" || syncoidProps["deleteTargetSnapshots"].Default != false {
+		t.Fatalf("deleteTargetSnapshots schema = %#v", syncoidProps["deleteTargetSnapshots"])
+	}
 	if syncoidProps["includeSnaps"].Type != "array" || syncoidProps["includeSnaps"].Items == nil || syncoidProps["includeSnaps"].Items.Type != "string" {
 		t.Fatalf("includeSnaps schema = %#v", syncoidProps["includeSnaps"])
 	}
@@ -572,6 +575,7 @@ func TestReceiveTaskCRDSchemaExposesMVP1Fields(t *testing.T) {
 
 	type schemaNode struct {
 		Properties             map[string]schemaNode `yaml:"properties"`
+		Default                any                   `yaml:"default"`
 		Required               []string              `yaml:"required"`
 		Type                   string                `yaml:"type"`
 		XKubernetesValidations []validationRule      `yaml:"x-kubernetes-validations"`
@@ -612,6 +616,12 @@ func TestReceiveTaskCRDSchemaExposesMVP1Fields(t *testing.T) {
 	if spec.Properties["policy"].Properties["allowSyncSnapshotDestroy"].Type != "boolean" {
 		t.Fatalf("allowSyncSnapshotDestroy schema = %#v", spec.Properties["policy"].Properties["allowSyncSnapshotDestroy"])
 	}
+	if spec.Properties["policy"].Properties["allowTargetSnapshotDestroy"].Type != "boolean" {
+		t.Fatalf("allowTargetSnapshotDestroy schema = %#v", spec.Properties["policy"].Properties["allowTargetSnapshotDestroy"])
+	}
+	if spec.Properties["policy"].Properties["allowTargetSnapshotDestroy"].Default != false {
+		t.Fatalf("allowTargetSnapshotDestroy default = %#v, want false", spec.Properties["policy"].Properties["allowTargetSnapshotDestroy"].Default)
+	}
 	if spec.Properties["policy"].Properties["syncSnapshotIdentifier"].Type != "string" {
 		t.Fatalf("syncSnapshotIdentifier schema = %#v", spec.Properties["policy"].Properties["syncSnapshotIdentifier"])
 	}
@@ -627,6 +637,42 @@ func TestReceiveTaskCRDSchemaExposesMVP1Fields(t *testing.T) {
 	}
 	if !hasValidationRule(spec.XKubernetesValidations, "self == oldSelf", "spec is immutable") {
 		t.Fatalf("receive task spec validations = %#v, want immutable spec rule", spec.XKubernetesValidations)
+	}
+}
+
+func TestScheduleCRDSchemaExposesSyncoidDeleteTargetSnapshots(t *testing.T) {
+	t.Helper()
+
+	crdPath := filepath.Join("..", "..", "config", "crd", "zfsreplication.ringhof.io_zfsreplicationschedules.yaml")
+	data, err := os.ReadFile(crdPath)
+	if err != nil {
+		t.Fatalf("read %s: %v", crdPath, err)
+	}
+
+	type schemaNode struct {
+		Default    any                   `yaml:"default"`
+		Properties map[string]schemaNode `yaml:"properties"`
+		Type       string                `yaml:"type"`
+	}
+	var crd struct {
+		Spec struct {
+			Versions []struct {
+				Schema struct {
+					OpenAPIV3Schema schemaNode `yaml:"openAPIV3Schema"`
+				} `yaml:"schema"`
+			} `yaml:"versions"`
+		} `yaml:"spec"`
+	}
+	if err := yaml.Unmarshal(data, &crd); err != nil {
+		t.Fatalf("parse %s: %v", crdPath, err)
+	}
+	if len(crd.Spec.Versions) == 0 {
+		t.Fatalf("%s has no versions", crdPath)
+	}
+	runTemplate := crd.Spec.Versions[0].Schema.OpenAPIV3Schema.Properties["spec"].Properties["runTemplate"]
+	syncoidProps := runTemplate.Properties["syncoid"].Properties
+	if syncoidProps["deleteTargetSnapshots"].Type != "boolean" || syncoidProps["deleteTargetSnapshots"].Default != false {
+		t.Fatalf("schedule deleteTargetSnapshots schema = %#v", syncoidProps["deleteTargetSnapshots"])
 	}
 }
 

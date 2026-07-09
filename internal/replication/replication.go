@@ -10,25 +10,27 @@ import (
 const CompressionNone = "none"
 
 type SyncoidOptions struct {
-	NoSyncSnap       bool
-	NoRollback       bool
-	ForceDelete      bool
-	Compress         string
-	ReceiveUnmounted bool
-	ReceiveResumable bool
-	IncludeSnaps     []string
-	ExcludeSnaps     []string
+	NoSyncSnap            bool
+	NoRollback            bool
+	ForceDelete           bool
+	DeleteTargetSnapshots bool
+	Compress              string
+	ReceiveUnmounted      bool
+	ReceiveResumable      bool
+	IncludeSnaps          []string
+	ExcludeSnaps          []string
 }
 
 type SyncoidOptionInput struct {
-	NoSyncSnap       *bool
-	NoRollback       *bool
-	ForceDelete      *bool
-	Compress         string
-	ReceiveUnmounted *bool
-	ReceiveResumable *bool
-	IncludeSnaps     []string
-	ExcludeSnaps     []string
+	NoSyncSnap            *bool
+	NoRollback            *bool
+	ForceDelete           *bool
+	DeleteTargetSnapshots *bool
+	Compress              string
+	ReceiveUnmounted      *bool
+	ReceiveResumable      *bool
+	IncludeSnaps          []string
+	ExcludeSnaps          []string
 }
 
 func DefaultSyncoidOptions() SyncoidOptions {
@@ -45,6 +47,7 @@ func NormalizeSyncoidOptions(in SyncoidOptionInput) SyncoidOptions {
 	out.NoSyncSnap = boolDefault(in.NoSyncSnap, out.NoSyncSnap)
 	out.NoRollback = boolDefault(in.NoRollback, out.NoRollback)
 	out.ForceDelete = boolDefault(in.ForceDelete, out.ForceDelete)
+	out.DeleteTargetSnapshots = boolDefault(in.DeleteTargetSnapshots, out.DeleteTargetSnapshots)
 	out.Compress = CompressionDefault(in.Compress)
 	out.ReceiveUnmounted = boolDefault(in.ReceiveUnmounted, out.ReceiveUnmounted)
 	out.ReceiveResumable = boolDefault(in.ReceiveResumable, out.ReceiveResumable)

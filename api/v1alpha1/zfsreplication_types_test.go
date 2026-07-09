@@ -30,3 +30,21 @@ func TestScheduleDeepCopyCopiesHistoryLimitPointers(t *testing.T) {
 		t.Fatalf("copied failed limit = %d, want 1", got)
 	}
 }
+
+func TestSyncoidSpecDeepCopyCopiesDeleteTargetSnapshotsPointer(t *testing.T) {
+	deleteTargetSnapshots := true
+	spec := &SyncoidSpec{
+		DeleteTargetSnapshots: &deleteTargetSnapshots,
+	}
+
+	copy := spec.DeepCopy()
+	if copy.DeleteTargetSnapshots == spec.DeleteTargetSnapshots {
+		t.Fatalf("DeleteTargetSnapshots pointer was aliased")
+	}
+
+	*spec.DeleteTargetSnapshots = false
+
+	if got := *copy.DeleteTargetSnapshots; !got {
+		t.Fatalf("copied DeleteTargetSnapshots = %t, want true", got)
+	}
+}

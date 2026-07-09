@@ -19,6 +19,7 @@ func TestRuntimeImagePinsSyncoid230(t *testing.T) {
 		"syncoid --version | grep -F \"${SANOID_VERSION}\"",
 		"syncoid --help 2>&1 | grep -F -- \"--include-snaps\"",
 		"syncoid --help 2>&1 | grep -F -- \"--identifier\"",
+		"syncoid --help 2>&1 | grep -F -- \"--delete-target-snapshots\"",
 		"openssh-server",
 		"go build -o /out/zfsrep-receiver ./cmd/zfsrep-receiver",
 		"COPY --from=build /out/zfsrep-receiver /usr/local/bin/zfsrep-receiver",

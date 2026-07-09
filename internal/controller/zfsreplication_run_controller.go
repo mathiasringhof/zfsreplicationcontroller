@@ -821,14 +821,15 @@ func runReceiveTask(run *zfsv1.ZFSReplicationRun, names runObjects, publicKey st
 				ExpiresAt:           expiresAt,
 			},
 			Policy: zfsv1.ReceiveTaskPolicy{
-				ReceiveUnmounted:         options.ReceiveUnmounted,
-				ReceiveResumable:         options.ReceiveResumable,
-				AllowRollback:            !options.NoRollback,
-				AllowDestroy:             options.ForceDelete,
-				AllowMount:               !options.ReceiveUnmounted,
-				AllowSyncSnapshotDestroy: !options.NoSyncSnap,
-				SyncSnapshotIdentifier:   syncSnapshotIdentifier,
-				Compression:              options.Compress,
+				ReceiveUnmounted:           options.ReceiveUnmounted,
+				ReceiveResumable:           options.ReceiveResumable,
+				AllowRollback:              !options.NoRollback,
+				AllowDestroy:               options.ForceDelete,
+				AllowMount:                 !options.ReceiveUnmounted,
+				AllowSyncSnapshotDestroy:   !options.NoSyncSnap,
+				AllowTargetSnapshotDestroy: options.DeleteTargetSnapshots,
+				SyncSnapshotIdentifier:     syncSnapshotIdentifier,
+				Compression:                options.Compress,
 			},
 		},
 	}
@@ -870,6 +871,7 @@ func syncoidEnv(spec zfsv1.SyncoidSpec) []corev1.EnvVar {
 		{Name: datamover.EnvNoSyncSnap, Value: strconv.FormatBool(options.NoSyncSnap)},
 		{Name: datamover.EnvNoRollback, Value: strconv.FormatBool(options.NoRollback)},
 		{Name: datamover.EnvForceDelete, Value: strconv.FormatBool(options.ForceDelete)},
+		{Name: datamover.EnvDeleteTargetSnapshots, Value: strconv.FormatBool(options.DeleteTargetSnapshots)},
 		{Name: datamover.EnvCompress, Value: options.Compress},
 		{Name: datamover.EnvReceiveUnmounted, Value: strconv.FormatBool(options.ReceiveUnmounted)},
 		{Name: datamover.EnvReceiveResumable, Value: strconv.FormatBool(options.ReceiveResumable)},
@@ -880,14 +882,15 @@ func syncoidEnv(spec zfsv1.SyncoidSpec) []corev1.EnvVar {
 
 func normalizedSyncoidOptions(spec zfsv1.SyncoidSpec) replication.SyncoidOptions {
 	return replication.NormalizeSyncoidOptions(replication.SyncoidOptionInput{
-		NoSyncSnap:       spec.NoSyncSnap,
-		NoRollback:       spec.NoRollback,
-		ForceDelete:      spec.ForceDelete,
-		Compress:         spec.Compress,
-		ReceiveUnmounted: spec.ReceiveUnmounted,
-		ReceiveResumable: spec.ReceiveResumable,
-		IncludeSnaps:     spec.IncludeSnaps,
-		ExcludeSnaps:     spec.ExcludeSnaps,
+		NoSyncSnap:            spec.NoSyncSnap,
+		NoRollback:            spec.NoRollback,
+		ForceDelete:           spec.ForceDelete,
+		DeleteTargetSnapshots: spec.DeleteTargetSnapshots,
+		Compress:              spec.Compress,
+		ReceiveUnmounted:      spec.ReceiveUnmounted,
+		ReceiveResumable:      spec.ReceiveResumable,
+		IncludeSnaps:          spec.IncludeSnaps,
+		ExcludeSnaps:          spec.ExcludeSnaps,
 	})
 }
 

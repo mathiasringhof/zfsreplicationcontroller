@@ -149,6 +149,7 @@ func TestSenderLogsSuccessfulSyncoidRun(t *testing.T) {
 		"dstDataset=tank/dst",
 		"dstHost=root@10.0.0.42",
 		"syncoidIdentifier=zrc-123",
+		"deleteTargetSnapshots=false",
 		"syncoid command",
 		"--sshkey=<redacted>",
 		"syncoid stdout",
@@ -520,25 +521,26 @@ func failureMessageFromSenderLogs(logs string) string {
 func TestSenderRunsSyncoidWithConfiguredSnapshotOptions(t *testing.T) {
 	runner := &fakeRunner{}
 	err := RunSender(context.Background(), SenderConfig{
-		SrcDataset:        "tank/src",
-		DstHost:           "root@10.0.0.42",
-		DstDataset:        "tank/dst",
-		SSHKeyFile:        "/var/run/zfsrep/ssh/id_rsa",
-		KnownHostsFile:    "/var/run/zfsrep/ssh/known_hosts",
-		SSHPort:           "2222",
-		NoSyncSnap:        true,
-		NoRollback:        true,
-		Compress:          "zstd",
-		SyncoidIdentifier: "zrc-123",
-		ReceiveUnmounted:  false,
-		ReceiveResumable:  false,
-		IncludeSnaps:      []string{"^snap-.*", "^manual$"},
-		ExcludeSnaps:      []string{".*-tmp$"},
+		SrcDataset:            "tank/src",
+		DstHost:               "root@10.0.0.42",
+		DstDataset:            "tank/dst",
+		SSHKeyFile:            "/var/run/zfsrep/ssh/id_rsa",
+		KnownHostsFile:        "/var/run/zfsrep/ssh/known_hosts",
+		SSHPort:               "2222",
+		NoSyncSnap:            true,
+		NoRollback:            true,
+		Compress:              "zstd",
+		SyncoidIdentifier:     "zrc-123",
+		DeleteTargetSnapshots: true,
+		ReceiveUnmounted:      false,
+		ReceiveResumable:      false,
+		IncludeSnaps:          []string{"^snap-.*", "^manual$"},
+		ExcludeSnaps:          []string{".*-tmp$"},
 	}, runner)
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := "--no-sync-snap --no-rollback --no-privilege-elevation --compress=zstd-fast --identifier=zrc-123 --sshoption=UserKnownHostsFile=/var/run/zfsrep/ssh/known_hosts --sshoption=StrictHostKeyChecking=yes --sshoption=IdentitiesOnly=yes --sshkey=/var/run/zfsrep/ssh/id_rsa --sshport=2222 --no-resume --include-snaps=^snap-.* --include-snaps=^manual$ --exclude-snaps=.*-tmp$ tank/src root@10.0.0.42:tank/dst"
+	want := "--no-sync-snap --no-rollback --no-privilege-elevation --compress=zstd-fast --identifier=zrc-123 --delete-target-snapshots --sshoption=UserKnownHostsFile=/var/run/zfsrep/ssh/known_hosts --sshoption=StrictHostKeyChecking=yes --sshoption=IdentitiesOnly=yes --sshkey=/var/run/zfsrep/ssh/id_rsa --sshport=2222 --no-resume --include-snaps=^snap-.* --include-snaps=^manual$ --exclude-snaps=.*-tmp$ tank/src root@10.0.0.42:tank/dst"
 	if !hasNamedCall(runner.calls, "syncoid", want) {
 		t.Fatalf("syncoid was not called with %q: %#v", want, runner.calls)
 	}
@@ -551,6 +553,7 @@ func TestSenderConfigFromEnvDefaults(t *testing.T) {
 	t.Setenv("SYNCOID_NO_SYNC_SNAP", "")
 	t.Setenv("SYNCOID_NO_ROLLBACK", "")
 	t.Setenv("SYNCOID_FORCE_DELETE", "")
+	t.Setenv("SYNCOID_DELETE_TARGET_SNAPSHOTS", "")
 	t.Setenv("SYNCOID_COMPRESS", "")
 	t.Setenv("SYNCOID_IDENTIFIER", "")
 	t.Setenv("RECEIVE_UNMOUNTED", "")
@@ -564,6 +567,9 @@ func TestSenderConfigFromEnvDefaults(t *testing.T) {
 	}
 	if cfg.ForceDelete {
 		t.Fatalf("ForceDelete = true, want false")
+	}
+	if cfg.DeleteTargetSnapshots {
+		t.Fatalf("DeleteTargetSnapshots = true, want false")
 	}
 	if cfg.Compress != "none" {
 		t.Fatalf("Compress = %q, want none", cfg.Compress)
@@ -621,6 +627,7 @@ func TestSenderConfigFromEnvExplicitValuesOverrideDefaults(t *testing.T) {
 	t.Setenv("SYNCOID_NO_SYNC_SNAP", "true")
 	t.Setenv("SYNCOID_NO_ROLLBACK", "false")
 	t.Setenv("SYNCOID_FORCE_DELETE", "true")
+	t.Setenv("SYNCOID_DELETE_TARGET_SNAPSHOTS", "true")
 	t.Setenv("SYNCOID_COMPRESS", "zstd")
 	t.Setenv("SYNCOID_IDENTIFIER", "zrc-123")
 	t.Setenv("RECEIVE_UNMOUNTED", "false")
@@ -637,6 +644,9 @@ func TestSenderConfigFromEnvExplicitValuesOverrideDefaults(t *testing.T) {
 	}
 	if !sender.ForceDelete {
 		t.Fatalf("sender ForceDelete = false, want true")
+	}
+	if !sender.DeleteTargetSnapshots {
+		t.Fatalf("sender DeleteTargetSnapshots = false, want true")
 	}
 	if sender.Compress != "zstd" {
 		t.Fatalf("sender Compress = %q, want zstd", sender.Compress)
@@ -660,23 +670,24 @@ func TestSenderConfigFromEnvExplicitValuesOverrideDefaults(t *testing.T) {
 
 func TestSenderConfigFromLookupParsesControllerEnvContract(t *testing.T) {
 	values := map[string]string{
-		EnvSrcDataset:        "tank/src",
-		EnvDstHost:           "zfs-recv@10.0.0.42",
-		EnvDstDataset:        "tank/dst",
-		EnvSSHKeyFile:        DefaultSSHKeyFile,
-		EnvKnownHostsFile:    DefaultKnownHostsFile,
-		EnvSSHPort:           DefaultSSHPort,
-		EnvNoSyncSnap:        "true",
-		EnvNoRollback:        "false",
-		EnvForceDelete:       "true",
-		EnvCompress:          "zstd",
-		EnvSyncoidIdentifier: "zrc-123",
-		EnvReceiveUnmounted:  "false",
-		EnvReceiveResumable:  "false",
-		EnvIncludeSnaps:      "^snap-.*\n^manual$",
-		EnvExcludeSnaps:      ".*-tmp$",
-		EnvExpectedNodeName:  "worker-a",
-		EnvActualNodeName:    "worker-a",
+		EnvSrcDataset:            "tank/src",
+		EnvDstHost:               "zfs-recv@10.0.0.42",
+		EnvDstDataset:            "tank/dst",
+		EnvSSHKeyFile:            DefaultSSHKeyFile,
+		EnvKnownHostsFile:        DefaultKnownHostsFile,
+		EnvSSHPort:               DefaultSSHPort,
+		EnvNoSyncSnap:            "true",
+		EnvNoRollback:            "false",
+		EnvForceDelete:           "true",
+		EnvDeleteTargetSnapshots: "true",
+		EnvCompress:              "zstd",
+		EnvSyncoidIdentifier:     "zrc-123",
+		EnvReceiveUnmounted:      "false",
+		EnvReceiveResumable:      "false",
+		EnvIncludeSnaps:          "^snap-.*\n^manual$",
+		EnvExcludeSnaps:          ".*-tmp$",
+		EnvExpectedNodeName:      "worker-a",
+		EnvActualNodeName:        "worker-a",
 	}
 
 	cfg := SenderConfigFromLookup(func(key string) string {
@@ -689,7 +700,7 @@ func TestSenderConfigFromLookupParsesControllerEnvContract(t *testing.T) {
 	if cfg.SSHKeyFile != DefaultSSHKeyFile || cfg.KnownHostsFile != DefaultKnownHostsFile || cfg.SSHPort != DefaultSSHPort {
 		t.Fatalf("ssh config = %#v", cfg)
 	}
-	if !cfg.NoSyncSnap || cfg.NoRollback || !cfg.ForceDelete || cfg.Compress != "zstd" || cfg.SyncoidIdentifier != "zrc-123" {
+	if !cfg.NoSyncSnap || cfg.NoRollback || !cfg.ForceDelete || !cfg.DeleteTargetSnapshots || cfg.Compress != "zstd" || cfg.SyncoidIdentifier != "zrc-123" {
 		t.Fatalf("syncoid config = %#v", cfg)
 	}
 	if cfg.ReceiveUnmounted || cfg.ReceiveResumable {
