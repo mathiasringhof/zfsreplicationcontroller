@@ -339,13 +339,8 @@ func validateZFSReceiveStep(step receiverCommandStep, policy receiverCommandPoli
 
 func zfsDestroyAllowed(args []string, policy receiverCommandPolicy) bool {
 	if len(args) == 2 && args[0] == "destroy" {
-		if dataset, snapshot, ok := replication.SplitSnapshotTarget(args[1]); ok {
-			if dataset != policy.TargetDataset {
-				return false
-			}
-			return policy.AllowTargetSnapshotDestroy ||
-				policy.AllowSyncSnapshotDestroy &&
-					replication.SyncoidSnapshotTarget(snapshot, policy.SyncSnapshotIdentifier)
+		if snapshotDestroyAllowed(args[1], policy) {
+			return true
 		}
 		return policy.AllowDestroy && replication.DatasetOrChild(args[1], policy.TargetDataset) && !strings.Contains(args[1], "@")
 	}
@@ -353,6 +348,24 @@ func zfsDestroyAllowed(args []string, policy receiverCommandPolicy) bool {
 		return policy.AllowDestroy && replication.DatasetOrChild(args[2], policy.TargetDataset) && !strings.Contains(args[2], "@")
 	}
 	return false
+}
+
+func snapshotDestroyAllowed(target string, policy receiverCommandPolicy) bool {
+	dataset, snapshots, ok := strings.Cut(target, "@")
+	if !ok || strings.Contains(snapshots, "@") || dataset != policy.TargetDataset {
+		return false
+	}
+	for _, snapshot := range strings.Split(snapshots, ",") {
+		if !replication.ValidSnapshotName(snapshot) {
+			return false
+		}
+		if !policy.AllowTargetSnapshotDestroy &&
+			(!policy.AllowSyncSnapshotDestroy ||
+				!replication.SyncoidSnapshotTarget(snapshot, policy.SyncSnapshotIdentifier)) {
+			return false
+		}
+	}
+	return true
 }
 
 func receiverStepHasNoRedirects(step receiverCommandStep) bool {

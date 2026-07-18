@@ -182,6 +182,7 @@ func TestAuthorizeReceiverCommandAllowsTargetSnapshotDestroyPolicy(t *testing.T)
 		"zfs destroy tank/dst@manual-rescue",
 		"zfs destroy tank/dst@snap-2026-07-09",
 		"zfs destroy tank/dst@syncoid_other_worker_2026-07-09",
+		"zfs destroy 'tank/dst@csi-snapshot-a,csi-snapshot-b,csi-snapshot-c'",
 		"zfs destroy tank/dst@manual-a; zfs destroy tank/dst@manual-b",
 	} {
 		t.Run(cmd, func(t *testing.T) {
@@ -193,11 +194,42 @@ func TestAuthorizeReceiverCommandAllowsTargetSnapshotDestroyPolicy(t *testing.T)
 
 	for _, cmd := range []string{
 		"zfs destroy tank/dst/child@manual-rescue",
+		"zfs destroy 'tank/dst/child@manual-rescue,hold'",
 		"zfs destroy tank/other@manual-rescue",
-		"zfs destroy tank/dst@manual-rescue,hold",
+		"zfs destroy tank/dst@manual-rescue,",
+		"zfs destroy tank/dst@manual-rescue,../hold",
+		"zfs destroy tank/dst@manual-rescue,tank/other@hold",
 		"zfs destroy -r tank/dst@manual-rescue",
+		"zfs destroy -r 'tank/dst@manual-rescue,hold'",
 		"zfs destroy tank/dst@manual-rescue 2>&1",
+		"zfs destroy 'tank/dst@manual-rescue,hold' 2>&1",
 		"zfs destroy tank/dst",
+	} {
+		t.Run(cmd, func(t *testing.T) {
+			if _, err := authorizeReceiverCommand(cmd, policy); err == nil {
+				t.Fatal("authorizeReceiverCommand() error = nil, want rejection")
+			}
+		})
+	}
+}
+
+func TestAuthorizeReceiverCommandAllowsBatchedSnapshotSyntaxForSyncPolicy(t *testing.T) {
+	policy := testReceiverPolicy("tank/dst", zfsv1.ReceiveTaskPolicy{
+		ReceiveUnmounted:         true,
+		ReceiveResumable:         true,
+		AllowSyncSnapshotDestroy: true,
+		SyncSnapshotIdentifier:   "rel123",
+		Compression:              "none",
+	})
+
+	allowed := "zfs destroy 'tank/dst@syncoid_rel123_worker_old,syncoid_rel123_worker_older'"
+	if _, err := authorizeReceiverCommand(allowed, policy); err != nil {
+		t.Fatalf("authorizeReceiverCommand() error = %v, want nil", err)
+	}
+
+	for _, cmd := range []string{
+		"zfs destroy 'tank/dst@syncoid_rel123_worker_old,manual-rescue'",
+		"zfs destroy 'tank/dst@syncoid_rel123_worker_old,syncoid_other_worker_old'",
 	} {
 		t.Run(cmd, func(t *testing.T) {
 			if _, err := authorizeReceiverCommand(cmd, policy); err == nil {
