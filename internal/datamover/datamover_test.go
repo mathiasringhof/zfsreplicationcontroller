@@ -8,6 +8,8 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+
+	"github.com/mathias/zfsreplicationcontroller/internal/replication/diagnosis"
 )
 
 type call struct {
@@ -219,7 +221,7 @@ func (e fakeExitError) ExitCode() int {
 	return e.code
 }
 
-func TestSenderLogsFailedSyncoidRunAndReturnsCombinedOutput(t *testing.T) {
+func TestSenderLogsFailedSyncoidRunAndReturnsFailureDiagnosis(t *testing.T) {
 	runner := &fakeRunner{
 		stdout: "syncoid stdout detail --sshkey=/var/run/zfsrep/ssh/id_rsa\n",
 		stderr: "syncoid stderr detail --sshkey=/var/run/zfsrep/ssh/id_rsa\n",
@@ -242,13 +244,20 @@ func TestSenderLogsFailedSyncoidRunAndReturnsCombinedOutput(t *testing.T) {
 	if err == nil {
 		t.Fatal("runSender() error = nil, want syncoid failure")
 	}
-	for _, want := range []string{"syncoid stdout detail", "syncoid stderr detail", "exit status 23 retry marker", "--sshkey=<redacted>"} {
-		if !strings.Contains(err.Error(), want) {
-			t.Fatalf("error missing %q: %v", want, err)
-		}
+	var failure diagnosis.Failure
+	if !errors.As(err, &failure) {
+		t.Fatalf("error type = %T, want diagnosis.Failure", err)
 	}
-	if strings.Contains(err.Error(), "--sshkey=/var/run/zfsrep/ssh/id_rsa") {
-		t.Fatalf("error contains unredacted ssh key path: %v", err)
+	if got, want := failure.Diagnosis().String(), "exit status 23 retry marker --sshkey=<redacted>"; got != want {
+		t.Fatalf("diagnosis = %q, want %q", got, want)
+	}
+	if failure.ExitCode() != 23 {
+		t.Fatalf("exit code = %d, want 23", failure.ExitCode())
+	}
+	for _, forbidden := range []string{"syncoid stdout detail", "syncoid stderr detail", "/var/run/zfsrep/ssh/id_rsa"} {
+		if strings.Contains(err.Error(), forbidden) {
+			t.Fatalf("error contains unsafe captured evidence %q: %v", forbidden, err)
+		}
 	}
 	out := logs.String()
 	for _, want := range []string{
@@ -257,7 +266,7 @@ func TestSenderLogsFailedSyncoidRunAndReturnsCombinedOutput(t *testing.T) {
 		"exitCode=23",
 		"syncoid stdout syncoid stdout detail --sshkey=<redacted>",
 		"syncoid stderr syncoid stderr detail --sshkey=<redacted>",
-		`error="stdout: syncoid stdout detail --sshkey=<redacted>; stderr: syncoid stderr detail --sshkey=<redacted>; error: exit status 23 retry marker --sshkey=<redacted>"`,
+		`error="exit status 23 retry marker --sshkey=<redacted>"`,
 	} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("logs missing %q:\n%s", want, out)
@@ -266,12 +275,12 @@ func TestSenderLogsFailedSyncoidRunAndReturnsCombinedOutput(t *testing.T) {
 	if strings.Contains(out, "--sshkey=/var/run/zfsrep/ssh/id_rsa") {
 		t.Fatalf("logs contain unredacted ssh key path:\n%s", out)
 	}
-	if last := failureMessageFromSenderLogs(out); last != "sender completed result=failure exitCode=23 duration=0s error=\"stdout: syncoid stdout detail --sshkey=<redacted>; stderr: syncoid stderr detail --sshkey=<redacted>; error: exit status 23 retry marker --sshkey=<redacted>\"" {
+	if last := failureMessageFromSenderLogs(out); last != "sender completed result=failure exitCode=23 duration=0s error=\"exit status 23 retry marker --sshkey=<redacted>\"" {
 		t.Fatalf("last failure line = %q", last)
 	}
 }
 
-func TestSenderFailureSummaryKeepsBoundedOutputTail(t *testing.T) {
+func TestSenderKeepsDetailedSanitizedLogsSeparateFromFailureDiagnosis(t *testing.T) {
 	oldStdout := "stdout-old-marker"
 	oldStderr := "stderr-old-marker"
 	stdoutTail := "stdout-tail-marker --sshkey=/var/run/zfsrep/ssh/id_rsa"
@@ -298,25 +307,29 @@ func TestSenderFailureSummaryKeepsBoundedOutputTail(t *testing.T) {
 	if err == nil {
 		t.Fatal("runSender() error = nil, want syncoid failure")
 	}
-	for _, value := range []string{err.Error(), logs.String()} {
-		if strings.Contains(value, oldStdout) || strings.Contains(value, oldStderr) {
-			t.Fatalf("failure summary contains beginning of huge output:\n%s", value)
+	if err.Error() != "exit status 23" {
+		t.Fatalf("failure diagnosis = %q, want safe process error", err)
+	}
+	value := logs.String()
+	for _, want := range []string{oldStdout, oldStderr} {
+		if !strings.Contains(value, want) {
+			t.Fatalf("detailed logs missing %q:\n%s", want, value)
 		}
-		for _, want := range []string{
-			"stdout-tail-marker --sshkey=<redacted>",
-			"stderr-tail-marker --sshkey=<redacted>",
-		} {
-			if !strings.Contains(value, want) {
-				t.Fatalf("failure summary missing %q:\n%s", want, value)
-			}
+	}
+	for _, want := range []string{
+		"stdout-tail-marker --sshkey=<redacted>",
+		"stderr-tail-marker --sshkey=<redacted>",
+	} {
+		if !strings.Contains(value, want) {
+			t.Fatalf("logs missing %q:\n%s", want, value)
 		}
-		if strings.Contains(value, "--sshkey=/var/run/zfsrep/ssh/id_rsa") {
-			t.Fatalf("failure summary contains unredacted ssh key path:\n%s", value)
-		}
+	}
+	if strings.Contains(value, "--sshkey=/var/run/zfsrep/ssh/id_rsa") {
+		t.Fatalf("logs contain unredacted ssh key path:\n%s", value)
 	}
 }
 
-func TestSenderStreamingHugeLineLogsOnlyBoundedTail(t *testing.T) {
+func TestSenderStreamingHugeLineLogsBoundedOmission(t *testing.T) {
 	oldOutput := "stdout-old-marker"
 	tailOutput := `stdout-tail-marker --sshkey="/var/run/zfsrep/ssh/id_rsa"`
 	var logs strings.Builder
@@ -331,8 +344,8 @@ func TestSenderStreamingHugeLineLogsOnlyBoundedTail(t *testing.T) {
 			if strings.Contains(out, oldOutput) {
 				t.Fatalf("streaming log contains beginning of huge line before command returned:\n%s", out)
 			}
-			if !strings.Contains(out, `stdout-tail-marker --sshkey=<redacted>`) {
-				t.Fatalf("streaming log missing redacted tail marker before command returned:\n%s", out)
+			if !strings.Contains(out, "syncoid stdout <output line omitted: exceeded 65536 bytes>") {
+				t.Fatalf("streaming log missing bounded omission before command returned:\n%s", out)
 			}
 			if strings.Contains(out, "--sshkey=/var/run/zfsrep/ssh/id_rsa") {
 				t.Fatalf("streaming log contains unredacted ssh key path before command returned:\n%s", out)
@@ -359,150 +372,11 @@ func TestSenderStreamingHugeLineLogsOnlyBoundedTail(t *testing.T) {
 	if strings.Contains(out, oldOutput) {
 		t.Fatalf("streaming log contains beginning of huge line:\n%s", out)
 	}
-	if !strings.Contains(out, `stdout-tail-marker --sshkey=<redacted>`) {
-		t.Fatalf("streaming log missing redacted tail marker:\n%s", out)
+	if !strings.Contains(out, "syncoid stdout <output line omitted: exceeded 65536 bytes>") {
+		t.Fatalf("streaming log missing bounded omission:\n%s", out)
 	}
 	if strings.Contains(out, "--sshkey=/var/run/zfsrep/ssh/id_rsa") {
 		t.Fatalf("streaming log contains unredacted ssh key path:\n%s", out)
-	}
-}
-
-func TestSenderStreamingBoundedTailRedactsSSHKeyAcrossTrimBoundary(t *testing.T) {
-	secret := "--sshkey=/var/run/zfsrep/ssh/id_rsa"
-	tailMarker := " tail-marker"
-	padding := strings.Repeat("p", commandOutputTailLimit+len("--sshkey=")-len(secret)-len(tailMarker))
-	var logs strings.Builder
-	runner := &streamingFakeRunner{
-		stream: func(stdout, _ io.Writer) {
-			if _, err := io.WriteString(stdout, secret+padding+tailMarker); err != nil {
-				t.Fatal(err)
-			}
-		},
-	}
-
-	err := runSender(context.Background(), SenderConfig{
-		SrcDataset:       "tank/src",
-		DstHost:          "root@10.0.0.42",
-		DstDataset:       "tank/dst",
-		SSHKeyFile:       "/var/run/zfsrep/ssh/id_rsa",
-		KnownHostsFile:   "/var/run/zfsrep/ssh/known_hosts",
-		SSHPort:          "2222",
-		NoRollback:       true,
-		Compress:         "none",
-		ReceiveUnmounted: true,
-		ReceiveResumable: true,
-	}, runner, &logs)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	out := logs.String()
-	if strings.Contains(out, "/var/run/zfsrep/ssh/id_rsa") {
-		t.Fatalf("streaming log contains partially trimmed ssh key path:\n%s", out)
-	}
-	if !strings.Contains(out, "--sshkey=<redacted>") {
-		t.Fatalf("streaming log missing redaction marker:\n%s", out)
-	}
-	if !strings.Contains(out, "tail-marker") {
-		t.Fatalf("streaming log missing tail marker:\n%s", out)
-	}
-}
-
-func TestRedactSensitiveTextRedactsSSHKeyForms(t *testing.T) {
-	for _, tt := range []struct {
-		name string
-		in   string
-		want string
-	}{
-		{
-			name: "unquoted",
-			in:   `before --sshkey=/var/run/zfsrep/ssh/id_rsa after`,
-			want: `before --sshkey=<redacted> after`,
-		},
-		{
-			name: "double quoted",
-			in:   `before --sshkey="/var/run/zfsrep/ssh/id_rsa" after`,
-			want: `before --sshkey=<redacted> after`,
-		},
-		{
-			name: "single quoted",
-			in:   `before --sshkey='/var/run/zfsrep/ssh/id_rsa' after`,
-			want: `before --sshkey=<redacted> after`,
-		},
-		{
-			name: "escaped double quoted",
-			in:   `before --sshkey=\"/var/run/zfsrep/ssh/id_rsa\" after`,
-			want: `before --sshkey=<redacted> after`,
-		},
-		{
-			name: "double escaped double quoted",
-			in:   `before --sshkey=\\"/var/run/zfsrep/ssh/id_rsa\\" after`,
-			want: `before --sshkey=<redacted> after`,
-		},
-		{
-			name: "ssh identity path",
-			in:   `ssh -o StrictHostKeyChecking=yes -i /var/run/zfsrep/ssh/id_rsa zfs-recv@10.42.2.11 zfs receive`,
-			want: `ssh -o StrictHostKeyChecking=yes -i <redacted> zfs-recv@10.42.2.11 zfs receive`,
-		},
-		{
-			name: "standalone identity path",
-			in:   `before -i /var/run/zfsrep/ssh/id_rsa after`,
-			want: `before -i <redacted> after`,
-		},
-		{
-			name: "known private key path",
-			in:   `using /var/run/zfsrep/ssh/id_rsa directly`,
-			want: `using <redacted> directly`,
-		},
-		{
-			name: "syncoid control socket",
-			in:   `-S /tmp/syncoid-zfs-recv1042211-1783418787-10-6113 zfs-recv@10.42.2.11`,
-			want: `-S <redacted> zfs-recv@10.42.2.11`,
-		},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			got := RedactSensitiveText(tt.in)
-			if got != tt.want {
-				t.Fatalf("RedactSensitiveText() = %q, want %q", got, tt.want)
-			}
-			if strings.Contains(got, "/var/run/zfsrep/ssh/id_rsa") {
-				t.Fatalf("RedactSensitiveText() leaked ssh key path: %q", got)
-			}
-		})
-	}
-}
-
-func TestSyncoidFailureSummaryKeepsConciseCriticalError(t *testing.T) {
-	stdout := "cannot open 'missingpool/dst': dataset does not exist\n"
-	stderr := "CRITICAL ERROR: zfs send -w tank/src@syncoid_new_2026 | ssh -i /var/run/zfsrep/ssh/id_rsa zfs-recv@10.42.2.11 zfs receive -s -F -u missingpool/dst 2>&1 failed: 256\n"
-
-	summary := syncoidFailureSummary(stdout, stderr, fakeExitError{code: 2, msg: "exit status 2"})
-	if !strings.Contains(summary, "CRITICAL ERROR") {
-		t.Fatalf("summary = %q, want CRITICAL ERROR", summary)
-	}
-	if !strings.Contains(summary, "missingpool/dst") {
-		t.Fatalf("summary = %q, want target dataset", summary)
-	}
-	if strings.Contains(summary, "zfs send") || strings.Contains(summary, "/var/run/zfsrep/ssh/id_rsa") {
-		t.Fatalf("summary contains raw pipeline or private key path: %q", summary)
-	}
-}
-
-func TestSyncoidFailureSummaryExtractsTargetFromCriticalPipeline(t *testing.T) {
-	stderr := "CRITICAL ERROR: zfs send -w tank/src@syncoid_new_2026 | ssh -i /var/run/zfsrep/ssh/id_rsa zfs-recv@10.42.2.11 zfs receive -s -F -u missingpool/dst 2>&1 failed: 256\n"
-
-	summary := syncoidFailureSummary("", stderr, fakeExitError{code: 2, msg: "exit status 2"})
-	if !strings.Contains(summary, "CRITICAL ERROR") {
-		t.Fatalf("summary = %q, want CRITICAL ERROR", summary)
-	}
-	if !strings.Contains(summary, "missingpool/dst") {
-		t.Fatalf("summary = %q, want target dataset", summary)
-	}
-	if strings.Contains(summary, "target=2>&1") {
-		t.Fatalf("summary chose shell redirection as target: %q", summary)
-	}
-	if strings.Contains(summary, "zfs send") || strings.Contains(summary, "/var/run/zfsrep/ssh/id_rsa") {
-		t.Fatalf("summary contains raw pipeline or private key path: %q", summary)
 	}
 }
 

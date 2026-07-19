@@ -1,7 +1,6 @@
 package datamover
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -12,6 +11,7 @@ import (
 	"time"
 
 	"github.com/mathias/zfsreplicationcontroller/internal/replication"
+	"github.com/mathias/zfsreplicationcontroller/internal/replication/diagnosis"
 )
 
 const (
@@ -39,9 +39,6 @@ const (
 	DefaultSSHKeyFile     = "/var/run/zfsrep/ssh/id_rsa"
 	DefaultKnownHostsFile = "/var/run/zfsrep/ssh/known_hosts"
 	DefaultSSHPort        = "2222"
-
-	commandOutputTailLimit         = 64 * 1024
-	commandOutputRedactionLookback = 4 * 1024
 )
 
 type SenderConfig struct {
@@ -119,33 +116,43 @@ func runSender(ctx context.Context, cfg SenderConfig, r CommandRunner, logw io.W
 	args := syncoidArgs(cfg, compress)
 	logSenderStart(logw, cfg)
 	logSenderLine(logw, "syncoid command command=%s", strings.Join(sanitizeSyncoidArgs(args), " "))
-	stdout, stderr, err := runSyncoidCommand(ctx, r, logw, args...)
+	summarySuffix, err := runSyncoidCommand(ctx, r, logw, args...)
 	duration := time.Since(started).Round(time.Millisecond)
 	if err != nil {
-		summary := syncoidFailureSummary(stdout, stderr, err)
-		logSenderLine(logw, "sender completed result=failure exitCode=%d duration=%s error=%q", commandExitCode(err), duration, summary)
-		return fmt.Errorf("syncoid failed: %s", summary)
+		logSenderLine(logw, "sender completed result=failure exitCode=%d duration=%s error=%q", commandExitCode(err), duration, err.Error())
+		return err
 	}
-	logSenderLine(logw, "sender completed result=success exitCode=0 duration=%s%s", duration, successSummaryLogSuffix(stdout+"\n"+stderr))
+	logSenderLine(logw, "sender completed result=success exitCode=0 duration=%s%s", duration, summarySuffix)
 	return nil
 }
 
-func runSyncoidCommand(ctx context.Context, r CommandRunner, logw io.Writer, args ...string) (string, string, error) {
+func runSyncoidCommand(ctx context.Context, r CommandRunner, logw io.Writer, args ...string) (string, error) {
+	var logMu sync.Mutex
+	var summary syncoidSuccessSummary
+	capture := diagnosis.NewCapture(func(stream diagnosis.Stream, line string) {
+		logMu.Lock()
+		defer logMu.Unlock()
+		logSenderLine(logw, "syncoid %s %s", stream, line)
+		summary.observe(line)
+	})
+	var err error
 	if streaming, ok := r.(StreamingCommandRunner); ok {
-		var logMu sync.Mutex
-		stdout := newCommandOutputStreamer(logw, "stdout", &logMu)
-		stderr := newCommandOutputStreamer(logw, "stderr", &logMu)
-		err := streaming.RunStreaming(ctx, "syncoid", stdout, stderr, args...)
-		stdout.Flush()
-		stderr.Flush()
-		return stdout.Tail(), stderr.Tail(), err
+		err = streaming.RunStreaming(ctx, "syncoid", capture.Stdout(), capture.Stderr(), args...)
+	} else {
+		stdout, stderr, runErr := r.Run(ctx, "syncoid", args...)
+		if _, writeErr := io.WriteString(capture.Stdout(), stdout); writeErr != nil {
+			return "", capture.Failure(fmt.Errorf("capture syncoid stdout: %w", writeErr))
+		}
+		if _, writeErr := io.WriteString(capture.Stderr(), stderr); writeErr != nil {
+			return "", capture.Failure(fmt.Errorf("capture syncoid stderr: %w", writeErr))
+		}
+		err = runErr
 	}
-	stdout, stderr, err := r.Run(ctx, "syncoid", args...)
-	stdout = boundedRedactedOutputTail(stdout)
-	stderr = boundedRedactedOutputTail(stderr)
-	logCommandOutput(logw, "stdout", stdout)
-	logCommandOutput(logw, "stderr", stderr)
-	return stdout, stderr, err
+	if err != nil {
+		return "", capture.Failure(err)
+	}
+	capture.Flush()
+	return summary.suffix(), nil
 }
 
 func syncoidArgs(cfg SenderConfig, compress string) []string {
@@ -211,142 +218,6 @@ func logSenderLine(w io.Writer, format string, args ...any) {
 	}
 }
 
-func logCommandOutput(w io.Writer, stream, value string) {
-	value = strings.TrimSpace(redactSensitiveText(value))
-	if value == "" {
-		return
-	}
-	for _, line := range strings.Split(value, "\n") {
-		line = strings.TrimSpace(line)
-		if line != "" {
-			logSenderLine(w, "syncoid %s %s", stream, line)
-		}
-	}
-}
-
-type commandOutputStreamer struct {
-	logw    io.Writer
-	stream  string
-	logMu   *sync.Mutex
-	tail    outputTail
-	pending []byte
-}
-
-func newCommandOutputStreamer(logw io.Writer, stream string, logMu *sync.Mutex) *commandOutputStreamer {
-	return &commandOutputStreamer{
-		logw:   logw,
-		stream: stream,
-		logMu:  logMu,
-		tail:   outputTail{limit: commandOutputTailLimit + commandOutputRedactionLookback},
-	}
-}
-
-func (s *commandOutputStreamer) Write(p []byte) (int, error) {
-	if len(p) == 0 {
-		return 0, nil
-	}
-	if _, err := s.tail.Write(p); err != nil {
-		return 0, err
-	}
-	remaining := p
-	for len(remaining) > 0 {
-		if i := bytes.IndexAny(remaining, "\r\n"); i >= 0 {
-			s.appendPending(remaining[:i])
-			s.flushLine()
-			remaining = remaining[i+1:]
-			continue
-		}
-		s.appendPending(remaining)
-		s.flushPartial()
-		break
-	}
-	return len(p), nil
-}
-
-func (s *commandOutputStreamer) Flush() {
-	s.flushLine()
-}
-
-func (s *commandOutputStreamer) Tail() string {
-	return boundedRedactedOutputTail(s.tail.String())
-}
-
-func (s *commandOutputStreamer) appendPending(p []byte) {
-	s.pending = append(s.pending, p...)
-}
-
-func (s *commandOutputStreamer) flushLine() {
-	if len(s.pending) == 0 {
-		return
-	}
-	s.logPending(boundedRedactedOutputTail(string(s.pending)))
-	s.pending = s.pending[:0]
-}
-
-func (s *commandOutputStreamer) flushPartial() {
-	if len(s.pending) <= commandOutputTailLimit+commandOutputRedactionLookback {
-		return
-	}
-	s.logPending(boundedRedactedOutputTail(string(s.pending)))
-	keep := commandOutputRedactionLookback
-	if keep > len(s.pending) {
-		keep = len(s.pending)
-	}
-	s.pending = append(s.pending[:0], s.pending[len(s.pending)-keep:]...)
-}
-
-func (s *commandOutputStreamer) logPending(line string) {
-	line = strings.TrimSpace(line)
-	if line == "" {
-		return
-	}
-	if s.logMu != nil {
-		s.logMu.Lock()
-		defer s.logMu.Unlock()
-	}
-	logSenderLine(s.logw, "syncoid %s %s", s.stream, line)
-}
-
-type outputTail struct {
-	limit int
-	data  []byte
-}
-
-func (t *outputTail) Write(p []byte) (int, error) {
-	if t.limit <= 0 {
-		return len(p), nil
-	}
-	if len(p) >= t.limit {
-		t.data = append(t.data[:0], p[len(p)-t.limit:]...)
-		return len(p), nil
-	}
-	overflow := len(t.data) + len(p) - t.limit
-	if overflow > 0 {
-		copy(t.data, t.data[overflow:])
-		t.data = t.data[:len(t.data)-overflow]
-	}
-	t.data = append(t.data, p...)
-	return len(p), nil
-}
-
-func (t *outputTail) String() string {
-	return string(t.data)
-}
-
-func boundedOutputTail(value string) string {
-	if len(value) <= commandOutputTailLimit {
-		return value
-	}
-	return value[len(value)-commandOutputTailLimit:]
-}
-
-func boundedRedactedOutputTail(value string) string {
-	if limit := commandOutputTailLimit + commandOutputRedactionLookback; len(value) > limit {
-		value = value[len(value)-limit:]
-	}
-	return boundedOutputTail(redactSensitiveText(value))
-}
-
 func sanitizeSyncoidArgs(args []string) []string {
 	out := append([]string(nil), args...)
 	for i, arg := range out {
@@ -357,144 +228,27 @@ func sanitizeSyncoidArgs(args []string) []string {
 	return out
 }
 
-func redactSensitiveText(value string) string {
-	return RedactSensitiveText(value)
+type syncoidSuccessSummary struct {
+	mode string
+	size string
 }
 
-func RedactSensitiveText(value string) string {
-	value = redactOptionValue(value, "--sshkey=", "--sshkey=<redacted>")
-	value = redactSeparatedOptionValue(value, "-i", "-i <redacted>")
-	value = redactSeparatedOptionValue(value, "-S", "-S <redacted>")
-	value = strings.ReplaceAll(value, DefaultSSHKeyFile, "<redacted>")
-	return value
-}
-
-func redactOptionValue(value, option, replacement string) string {
-	if !strings.Contains(value, option) {
-		return value
-	}
-	var out strings.Builder
-	out.Grow(len(value))
-	remaining := value
-	for {
-		idx := strings.Index(remaining, option)
-		if idx < 0 {
-			out.WriteString(remaining)
-			return out.String()
-		}
-		out.WriteString(remaining[:idx])
-		out.WriteString(replacement)
-		remaining = remaining[optionValueEnd(remaining, idx+len(option)):]
-	}
-}
-
-func redactSeparatedOptionValue(value, option, replacement string) string {
-	var out strings.Builder
-	out.Grow(len(value))
-	remaining := value
-	for {
-		idx := separatedOptionIndex(remaining, option)
-		if idx < 0 {
-			out.WriteString(remaining)
-			return out.String()
-		}
-		out.WriteString(remaining[:idx])
-		valueStart := idx + len(option)
-		for valueStart < len(remaining) && isSpace(remaining[valueStart]) {
-			valueStart++
-		}
-		if valueStart >= len(remaining) {
-			out.WriteString(remaining[idx:])
-			return out.String()
-		}
-		out.WriteString(replacement)
-		remaining = remaining[optionValueEnd(remaining, valueStart):]
-	}
-}
-
-func separatedOptionIndex(value, option string) int {
-	for searchStart := 0; searchStart < len(value); {
-		idx := strings.Index(value[searchStart:], option)
-		if idx < 0 {
-			return -1
-		}
-		idx += searchStart
-		beforeOK := idx == 0 || isSpace(value[idx-1])
-		after := idx + len(option)
-		afterOK := after < len(value) && isSpace(value[after])
-		if beforeOK && afterOK {
-			return idx
-		}
-		searchStart = idx + len(option)
-	}
-	return -1
-}
-
-func optionValueEnd(value string, start int) int {
-	if start >= len(value) {
-		return start
-	}
-	if quote, consumed, ok := escapedQuoteAt(value, start); ok {
-		return quotedValueEnd(value, start+consumed, quote, true, start)
-	}
-	if isQuote(value[start]) {
-		return quotedValueEnd(value, start+1, value[start], false, start)
-	}
-	return unquotedValueEnd(value, start)
-}
-
-func quotedValueEnd(value string, start int, quote byte, escaped bool, fallbackStart int) int {
-	for i := start; i < len(value); i++ {
-		if escaped {
-			if foundQuote, consumed, ok := escapedQuoteAt(value, i); ok && foundQuote == quote {
-				return i + consumed
-			}
-		} else if value[i] == '\\' && i+1 < len(value) {
-			i++
-			continue
-		}
-		if value[i] == quote {
-			return i + 1
-		}
-	}
-	return unquotedValueEnd(value, fallbackStart)
-}
-
-func unquotedValueEnd(value string, start int) int {
-	for i := start; i < len(value); i++ {
-		if isSpace(value[i]) {
-			return i
-		}
-	}
-	return len(value)
-}
-
-func isSpace(ch byte) bool {
-	return ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r'
-}
-
-func escapedQuoteAt(value string, pos int) (byte, int, bool) {
-	backslashes := 0
-	for pos+backslashes < len(value) && value[pos+backslashes] == '\\' {
-		backslashes++
-	}
-	if backslashes == 0 || pos+backslashes >= len(value) || !isQuote(value[pos+backslashes]) {
-		return 0, 0, false
-	}
-	return value[pos+backslashes], backslashes + 1, true
-}
-
-func isQuote(ch byte) bool {
-	return ch == '"' || ch == '\''
-}
-
-func successSummaryLogSuffix(output string) string {
-	var parts []string
+func (s *syncoidSuccessSummary) observe(output string) {
 	if mode := syncoidTransferMode(output); mode != "" {
-		parts = append(parts, "mode="+mode)
+		s.mode = mode
 	}
 	if size := syncoidSizeEstimate(output); size != "" {
-		parts = append(parts, "sizeEstimate="+strings.ReplaceAll(size, " ", ""))
+		s.size = size
+	}
+}
+
+func (s syncoidSuccessSummary) suffix() string {
+	var parts []string
+	if s.mode != "" {
+		parts = append(parts, "mode="+s.mode)
+	}
+	if s.size != "" {
+		parts = append(parts, "sizeEstimate="+strings.ReplaceAll(s.size, " ", ""))
 	}
 	if len(parts) == 0 {
 		return ""
@@ -547,109 +301,6 @@ func commandExitCode(err error) int {
 		return exitErr.ExitCode()
 	}
 	return -1
-}
-
-func syncoidFailureSummary(stdout, stderr string, err error) string {
-	var parts []string
-	if stdout = conciseSyncoidFailure(stdout); stdout != "" {
-		parts = append(parts, "stdout: "+stdout)
-	}
-	if stderr = conciseSyncoidFailure(stderr); stderr != "" {
-		parts = append(parts, "stderr: "+stderr)
-	}
-	if err != nil {
-		parts = append(parts, "error: "+conciseSyncoidFailure(err.Error()))
-	}
-	if len(parts) == 0 {
-		return "syncoid exited with an unknown error"
-	}
-	return strings.Join(parts, "; ")
-}
-
-func conciseSyncoidFailure(value string) string {
-	value = strings.TrimSpace(redactSensitiveText(value))
-	if value == "" {
-		return ""
-	}
-	if line := firstUsefulFailureLine(value); line != "" {
-		return singleLine(truncateSyncoidPipeline(line))
-	}
-	return singleLine(value)
-}
-
-func truncateSyncoidPipeline(value string) string {
-	value = strings.TrimSpace(value)
-	if idx := strings.Index(value, "CRITICAL ERROR:"); idx >= 0 {
-		critical := strings.TrimSpace(value[idx:])
-		if strings.Contains(critical, "zfs send") || strings.Contains(critical, "zfs receive") || strings.Contains(critical, "|") {
-			if target := criticalPipelineReceiveTarget(critical); target != "" {
-				return "CRITICAL ERROR: syncoid command failed target=" + target
-			}
-			return "CRITICAL ERROR: syncoid command failed"
-		}
-		return critical
-	}
-	return value
-}
-
-func criticalPipelineReceiveTarget(value string) string {
-	idx := strings.LastIndex(value, " zfs receive")
-	if idx < 0 {
-		return ""
-	}
-	fields := strings.Fields(value[idx+len(" zfs receive"):])
-	for i := 0; i < len(fields); i++ {
-		field := cleanFailureTargetField(fields[i])
-		if field == "" || isShellRedirection(field) {
-			continue
-		}
-		if field == "failed" || field == "failed:" {
-			return ""
-		}
-		if strings.HasPrefix(field, "-") {
-			if receiveOptionTakesValue(field) {
-				i++
-			}
-			continue
-		}
-		if field != "sh" {
-			return field
-		}
-	}
-	return ""
-}
-
-func cleanFailureTargetField(field string) string {
-	field = strings.Trim(field, `"'.,;()[]{}<>`)
-	if field == "" || strings.HasPrefix(field, "-") {
-		return ""
-	}
-	return field
-}
-
-func receiveOptionTakesValue(field string) bool {
-	return field == "-o" || field == "-x"
-}
-
-func isShellRedirection(field string) bool {
-	return strings.Contains(field, ">&") || strings.HasPrefix(field, ">") || strings.HasPrefix(field, "2>")
-}
-
-func firstUsefulFailureLine(value string) string {
-	lines := strings.Split(value, "\n")
-	for _, needle := range []string{"CRITICAL ERROR:", "cannot open", "cannot receive"} {
-		for _, line := range lines {
-			line = strings.TrimSpace(line)
-			if strings.Contains(line, needle) {
-				return line
-			}
-		}
-	}
-	return ""
-}
-
-func singleLine(value string) string {
-	return strings.Join(strings.Fields(value), " ")
 }
 
 func syncoidTarget(host, dataset string) string {

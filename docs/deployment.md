@@ -39,11 +39,15 @@ of a release; CRDs and RBAC are part of the runtime contract too.
 When the deployment is managed by another repository, sync all relevant release
 artifacts, not just the container image.
 
-1. Update every runtime image reference to the same immutable image:
+1. Set the manager Deployment image to the immutable release image and preserve
+   the manifest's image propagation:
 
    - controller Deployment container image
-   - controller `DATA_MOVER_IMAGE`
+   - controller `RELEASE_IMAGE`
    - receiver DaemonSet container image
+
+   The rendered values must be byte-for-byte identical. Manager, sender, and
+   receiver are one release unit; mixed versions are unsupported.
 
 2. Sync CRDs from `config/crd/`.
 
@@ -84,6 +88,18 @@ artifacts, not just the container image.
    kubectl -n zfsreplication get jobs,pods
    kubectl -n zfsreplication-system logs deploy/zfsreplication-controller --since=30m
    ```
+
+## Drain-First Upgrades
+
+Before changing the release image, set `spec.suspend: true` on every
+`ZFSReplicationSchedule` and wait for all active `ZFSReplicationRun` objects to
+reach `Succeeded` or `Failed`. Then roll out the manager Deployment and receiver
+DaemonSet together and verify both use the same image reference. Resume schedules
+only after both rollouts are available.
+
+Do not upgrade while a sender Job is active. Existing Jobs and Pods are not
+replaced atomically with the manager and receiver, and cross-version operation is
+not supported.
 
 ## v0.4.0 Notes
 

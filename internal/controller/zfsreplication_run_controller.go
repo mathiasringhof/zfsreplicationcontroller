@@ -14,6 +14,7 @@ import (
 	zfsv1 "github.com/mathias/zfsreplicationcontroller/api/v1alpha1"
 	"github.com/mathias/zfsreplicationcontroller/internal/datamover"
 	"github.com/mathias/zfsreplicationcontroller/internal/replication"
+	"github.com/mathias/zfsreplicationcontroller/internal/replication/diagnosis"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/knownhosts"
 	batchv1 "k8s.io/api/batch/v1"
@@ -29,10 +30,9 @@ import (
 
 type ZFSReplicationRunReconciler struct {
 	client.Client
-	APIReader      client.Reader
-	Scheme         *runtime.Scheme
-	DataMoverImage string
-	PodLogs        PodLogReader
+	APIReader    client.Reader
+	Scheme       *runtime.Scheme
+	ReleaseImage string
 }
 
 type runReceiverStatus struct {
@@ -40,11 +40,7 @@ type runReceiverStatus struct {
 	podIP   string
 }
 
-const (
-	failedJobLogMessageTailLimit         = 64 * 1024
-	failedJobLogMessageRedactionLookback = 4 * 1024
-	senderPodHostname                    = "zfsrep-sender"
-)
+const senderPodHostname = "zfsrep-sender"
 
 func (r *ZFSReplicationRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	var run zfsv1.ZFSReplicationRun
@@ -238,13 +234,6 @@ func (r *ZFSReplicationRunReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Complete(r)
 }
 
-func (r *ZFSReplicationRunReconciler) image() string {
-	if r.DataMoverImage == "" {
-		return "zfsreplicationcontroller:latest"
-	}
-	return r.DataMoverImage
-}
-
 func (r *ZFSReplicationRunReconciler) waitForReplicationReceiver(ctx context.Context, run *zfsv1.ZFSReplicationRun, names runObjects) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 	observedStatus := r.observedRunStatus(ctx, run)
@@ -323,7 +312,7 @@ func (r *ZFSReplicationRunReconciler) ensureRunReceiveTask(ctx context.Context, 
 }
 
 func (r *ZFSReplicationRunReconciler) ensureRunSenderJob(ctx context.Context, run *zfsv1.ZFSReplicationRun, names runObjects, receiverPodIP string) (bool, bool, error) {
-	return r.ensureRunJob(ctx, run, runSenderJob(run, names, r.image(), receiverPodIP))
+	return r.ensureRunJob(ctx, run, runSenderJob(run, names, r.ReleaseImage, receiverPodIP))
 }
 
 func (r *ZFSReplicationRunReconciler) ensureRunJob(ctx context.Context, run *zfsv1.ZFSReplicationRun, job *batchv1.Job) (bool, bool, error) {
@@ -422,43 +411,83 @@ func (r *ZFSReplicationRunReconciler) jobFailed(ctx context.Context, ns, name, f
 	if job.Status.Failed == 0 {
 		return false, "", nil
 	}
-	if msg := r.failedJobLogMessage(ctx, ns, name); msg != "" {
+	if msg, err := r.senderTerminationDiagnosis(ctx, &job); err != nil {
+		return false, "", err
+	} else if msg != "" {
 		return true, msg, nil
 	}
 	for _, cond := range job.Status.Conditions {
 		if cond.Type == batchv1.JobFailed && cond.Status == corev1.ConditionTrue && cond.Message != "" {
-			return true, boundedRedactedFailureMessage(cond.Message), nil
+			return true, diagnosis.Sanitize(cond.Message).String(), nil
 		}
 	}
-	return true, boundedRedactedFailureMessage(fallback), nil
+	return true, diagnosis.Sanitize(fallback).String(), nil
 }
 
-func (r *ZFSReplicationRunReconciler) failedJobLogMessage(ctx context.Context, ns, jobName string) string {
-	if r.PodLogs == nil {
-		return ""
+type terminatedSender struct {
+	state     corev1.ContainerStateTerminated
+	createdAt metav1.Time
+	podName   string
+}
+
+func (r *ZFSReplicationRunReconciler) senderTerminationDiagnosis(ctx context.Context, job *batchv1.Job) (string, error) {
+	var pods corev1.PodList
+	if err := r.podReader().List(ctx, &pods, client.InNamespace(job.Namespace)); err != nil {
+		return "", err
 	}
-	var last string
-	seen := map[string]bool{}
-	for _, label := range []string{"job-name", "batch.kubernetes.io/job-name"} {
-		var pods corev1.PodList
-		if err := r.podReader().List(ctx, &pods, client.InNamespace(ns), client.MatchingLabels{label: jobName}); err != nil {
+	var newest *terminatedSender
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		if !podControlledByJobUID(pod, job.UID) {
 			continue
 		}
-		for _, pod := range pods.Items {
-			if seen[pod.Name] {
+		for _, status := range pod.Status.ContainerStatuses {
+			if status.Name != "datamover" || status.State.Terminated == nil {
 				continue
 			}
-			seen[pod.Name] = true
-			logs, err := r.PodLogs.Logs(ctx, ns, pod.Name)
-			if err != nil {
-				continue
+			candidate := terminatedSender{
+				state:     *status.State.Terminated,
+				createdAt: pod.CreationTimestamp,
+				podName:   pod.Name,
 			}
-			if msg := failureMessageFromLogs(logs); msg != "" {
-				last = msg
+			if newest == nil || newerTerminatedSender(candidate, *newest) {
+				newest = &candidate
 			}
 		}
 	}
-	return last
+	if newest == nil {
+		return "", nil
+	}
+	if newest.state.Message != "" {
+		return diagnosis.Sanitize(newest.state.Message).String(), nil
+	}
+	return diagnosis.Sanitize(fmt.Sprintf(
+		"sender terminated: reason %s, exit code %d",
+		newest.state.Reason,
+		newest.state.ExitCode,
+	)).String(), nil
+}
+
+func podControlledByJobUID(pod *corev1.Pod, uid types.UID) bool {
+	if uid == "" {
+		return false
+	}
+	for _, owner := range pod.OwnerReferences {
+		if owner.Controller != nil && *owner.Controller && owner.Kind == "Job" && owner.UID == uid {
+			return true
+		}
+	}
+	return false
+}
+
+func newerTerminatedSender(left, right terminatedSender) bool {
+	if !left.state.FinishedAt.Equal(&right.state.FinishedAt) {
+		return left.state.FinishedAt.After(right.state.FinishedAt.Time)
+	}
+	if !left.createdAt.Equal(&right.createdAt) {
+		return left.createdAt.After(right.createdAt.Time)
+	}
+	return left.podName > right.podName
 }
 
 func (r *ZFSReplicationRunReconciler) cleanupRunEphemeralObjects(ctx context.Context, run *zfsv1.ZFSReplicationRun, names runObjects) error {
@@ -568,118 +597,6 @@ func (r *ZFSReplicationRunReconciler) observedRunStatus(ctx context.Context, run
 
 func runStatusNeedsInitialStatus(status zfsv1.ZFSReplicationRunStatus) bool {
 	return status.StartedAt == nil && status.Phase == ""
-}
-
-func failureMessageFromLogs(logs string) string {
-	var last string
-	for _, line := range strings.Split(logs, "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.Contains(line, "zfs-sim-event ") {
-			continue
-		}
-		last = boundedRedactedFailureMessage(line)
-	}
-	return last
-}
-
-func boundedRedactedFailureMessage(value string) string {
-	if limit := failedJobLogMessageTailLimit + failedJobLogMessageRedactionLookback; len(value) > limit {
-		value = value[len(value)-limit:]
-	}
-	value = redactFailureMessage(value)
-	if concise := conciseFailureMessage(value); concise != "" {
-		value = concise
-	}
-	return boundedFailureMessage(value)
-}
-
-func redactFailureMessage(value string) string {
-	return datamover.RedactSensitiveText(value)
-}
-
-func conciseFailureMessage(value string) string {
-	if line := firstUsefulFailureMessageLine(value); line != "" {
-		return strings.Join(strings.Fields(truncateFailurePipeline(line)), " ")
-	}
-	return value
-}
-
-func firstUsefulFailureMessageLine(value string) string {
-	lines := strings.Split(value, "\n")
-	for _, needle := range []string{"CRITICAL ERROR:", "cannot open", "cannot receive"} {
-		for _, line := range lines {
-			line = strings.TrimSpace(line)
-			if strings.Contains(line, needle) {
-				return line
-			}
-		}
-	}
-	return ""
-}
-
-func truncateFailurePipeline(value string) string {
-	value = strings.TrimSpace(value)
-	if idx := strings.Index(value, "CRITICAL ERROR:"); idx >= 0 {
-		critical := strings.TrimSpace(value[idx:])
-		if strings.Contains(critical, "zfs send") || strings.Contains(critical, "zfs receive") || strings.Contains(critical, "|") {
-			if target := criticalFailurePipelineTarget(critical); target != "" {
-				return "CRITICAL ERROR: syncoid command failed target=" + target
-			}
-			return "CRITICAL ERROR: syncoid command failed"
-		}
-		return critical
-	}
-	return value
-}
-
-func criticalFailurePipelineTarget(value string) string {
-	idx := strings.LastIndex(value, " zfs receive")
-	if idx < 0 {
-		return ""
-	}
-	fields := strings.Fields(value[idx+len(" zfs receive"):])
-	for i := 0; i < len(fields); i++ {
-		field := cleanFailureTargetField(fields[i])
-		if field == "" || isShellRedirection(field) {
-			continue
-		}
-		if field == "failed" || field == "failed:" {
-			return ""
-		}
-		if strings.HasPrefix(field, "-") {
-			if receiveOptionTakesValue(field) {
-				i++
-			}
-			continue
-		}
-		if field != "sh" {
-			return field
-		}
-	}
-	return ""
-}
-
-func cleanFailureTargetField(field string) string {
-	field = strings.Trim(field, `"'.,;()[]{}<>`)
-	if field == "" || strings.HasPrefix(field, "-") {
-		return ""
-	}
-	return field
-}
-
-func receiveOptionTakesValue(field string) bool {
-	return field == "-o" || field == "-x"
-}
-
-func isShellRedirection(field string) bool {
-	return strings.Contains(field, ">&") || strings.HasPrefix(field, ">") || strings.HasPrefix(field, "2>")
-}
-
-func boundedFailureMessage(value string) string {
-	if len(value) <= failedJobLogMessageTailLimit {
-		return value
-	}
-	return value[len(value)-failedJobLogMessageTailLimit:]
 }
 
 func validateRunSpec(spec zfsv1.ZFSReplicationRunSpec) error {
@@ -851,6 +768,8 @@ func runSenderJob(run *zfsv1.ZFSReplicationRun, names runObjects, image, receive
 	env = append(env, syncoidEnv(run.Spec.Syncoid)...)
 	job := dataMoverJobForRun(run, names.SenderName, image, labels, run.Spec.Source.NodeName, "/usr/local/bin/zfsrep-sender", env, names.SecretName, false)
 	job.Spec.Template.Spec.Hostname = senderPodHostname
+	job.Spec.Template.Spec.Containers[0].TerminationMessagePath = "/dev/termination-log"
+	job.Spec.Template.Spec.Containers[0].TerminationMessagePolicy = corev1.TerminationMessageReadFile
 	return job
 }
 

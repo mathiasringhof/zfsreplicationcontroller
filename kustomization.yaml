@@ -19,3 +19,19 @@ resources:
 patches:
   - path: config/namespaced/manager_watch_namespace_patch.yaml
   - path: config/namespaced/receiver_watch_namespace_patch.yaml
+replacements:
+  - source:
+      kind: Deployment
+      name: zfsreplication-controller
+      fieldPath: spec.template.spec.containers.[name=manager].image
+    targets:
+      - select:
+          kind: Deployment
+          name: zfsreplication-controller
+        fieldPaths:
+          - spec.template.spec.containers.[name=manager].env.[name=RELEASE_IMAGE].value
+      - select:
+          kind: DaemonSet
+          name: zfs-receiver
+        fieldPaths:
+          - spec.template.spec.containers.[name=receiver].image

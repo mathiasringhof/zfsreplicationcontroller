@@ -42,10 +42,45 @@ type manifestObject struct {
 }
 
 type manifestContainer struct {
+	Image          string           `yaml:"image"`
 	Name           string           `yaml:"name"`
 	Args           []string         `yaml:"args"`
 	Env            []manifestEnvVar `yaml:"env"`
 	ReadinessProbe manifestProbe    `yaml:"readinessProbe"`
+}
+
+func TestRenderedRuntimeUsesOneReleaseImage(t *testing.T) {
+	objects := renderKustomize(t, filepath.Join("..", "..", "config"))
+	var manager, receiver *manifestContainer
+	for _, obj := range objects {
+		switch obj.Kind {
+		case "Deployment":
+			if obj.Metadata.Name == "zfsreplication-controller" {
+				manager = findContainer(obj.Spec.Template.Spec.Containers, "manager")
+			}
+		case "DaemonSet":
+			if obj.Metadata.Name == "zfs-receiver" {
+				receiver = findContainer(obj.Spec.Template.Spec.Containers, "receiver")
+			}
+		}
+	}
+	if manager == nil || receiver == nil {
+		t.Fatalf("rendered manager = %v, receiver = %v", manager != nil, receiver != nil)
+	}
+	if manager.Image == "" || receiver.Image != manager.Image {
+		t.Fatalf("manager image = %q, receiver image = %q", manager.Image, receiver.Image)
+	}
+	if got := manifestEnvValue(manager.Env, "RELEASE_IMAGE"); got != manager.Image {
+		t.Fatalf("RELEASE_IMAGE = %q, want manager image %q", got, manager.Image)
+	}
+	if got := manifestEnvValue(manager.Env, "DATA_MOVER_IMAGE"); got != "" {
+		t.Fatalf("DATA_MOVER_IMAGE = %q, want removed", got)
+	}
+	for _, arg := range manager.Args {
+		if strings.Contains(arg, "datamover-image") {
+			t.Fatalf("manager args contain independent image override: %v", manager.Args)
+		}
+	}
 }
 
 type manifestProbe struct {
@@ -122,8 +157,8 @@ func TestControllerClusterRoleHasRequiredPermissions(t *testing.T) {
 	}
 
 	verbs = verbsForResource(role.Rules, "", "pods/log")
-	if !contains(verbs, "get") {
-		t.Fatalf("pods/log RBAC verbs = %v, missing get", verbs)
+	if len(verbs) != 0 {
+		t.Fatalf("pods/log RBAC verbs = %v, want no Pod log access", verbs)
 	}
 
 	verbs = verbsForResource(role.Rules, "", "pods")
@@ -276,7 +311,6 @@ func TestNamespacedRBACRestrictsWorkloadPermissionsToWatchedNamespace(t *testing
 		{apiGroup: "batch", resource: "jobs", verbs: []string{"create", "get", "list", "watch", "update", "patch", "delete"}},
 		{apiGroup: "", resource: "secrets", verbs: []string{"create", "get", "list", "watch", "update", "patch", "delete"}},
 		{apiGroup: "", resource: "pods", verbs: []string{"get", "list", "watch", "delete"}},
-		{apiGroup: "", resource: "pods/log", verbs: []string{"get"}},
 		{apiGroup: "", resource: "events", verbs: []string{"create", "patch"}},
 	} {
 		verbs := verbsForResource(role.Rules, tt.apiGroup, tt.resource)

@@ -11,3 +11,19 @@ resources:
   - rbac/receiver_role_binding.yaml
   - manager/deployment.yaml
   - receiver/daemonset.yaml
+replacements:
+  - source:
+      kind: Deployment
+      name: zfsreplication-controller
+      fieldPath: spec.template.spec.containers.[name=manager].image
+    targets:
+      - select:
+          kind: Deployment
+          name: zfsreplication-controller
+        fieldPaths:
+          - spec.template.spec.containers.[name=manager].env.[name=RELEASE_IMAGE].value
+      - select:
+          kind: DaemonSet
+          name: zfs-receiver
+        fieldPaths:
+          - spec.template.spec.containers.[name=receiver].image

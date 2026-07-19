@@ -20,10 +20,8 @@ spec:
           imagePullPolicy: Always
           command:
             - /usr/local/bin/manager
-          args:
-            - --datamover-image=$(DATA_MOVER_IMAGE)
           env:
-            - name: DATA_MOVER_IMAGE
+            - name: RELEASE_IMAGE
               value: ghcr.io/mathiasringhof/zfsreplicationcontroller:main
           ports:
             - name: health

@@ -2,6 +2,7 @@ package main
 
 import (
 	"flag"
+	"fmt"
 	"os"
 	"strings"
 
@@ -12,7 +13,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
-	"k8s.io/client-go/kubernetes"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
@@ -21,13 +21,24 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 )
 
+func requiredReleaseImage(lookup func(string) string) (string, error) {
+	image := lookup("RELEASE_IMAGE")
+	if strings.TrimSpace(image) == "" {
+		return "", fmt.Errorf("release image environment variable RELEASE_IMAGE must not be empty")
+	}
+	return image, nil
+}
+
 func main() {
-	var metricsAddr, probeAddr, image, watchNamespace string
+	var metricsAddr, probeAddr, watchNamespace string
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "metrics bind address")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "probe bind address")
-	flag.StringVar(&image, "datamover-image", os.Getenv("DATA_MOVER_IMAGE"), "datamover image")
 	flag.StringVar(&watchNamespace, "watch-namespace", os.Getenv("WATCH_NAMESPACE"), "namespace to watch; empty watches all namespaces")
 	flag.Parse()
+	releaseImage, err := requiredReleaseImage(os.Getenv)
+	if err != nil {
+		panic(err)
+	}
 
 	ctrl.SetLogger(logzap.New())
 
@@ -43,16 +54,11 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	clientset, err := kubernetes.NewForConfig(config)
-	if err != nil {
-		panic(err)
-	}
 	runReconciler := &controller.ZFSReplicationRunReconciler{
-		Client:         mgr.GetClient(),
-		APIReader:      mgr.GetAPIReader(),
-		Scheme:         scheme,
-		DataMoverImage: image,
-		PodLogs:        controller.KubernetesPodLogReader{Client: clientset},
+		Client:       mgr.GetClient(),
+		APIReader:    mgr.GetAPIReader(),
+		Scheme:       scheme,
+		ReleaseImage: releaseImage,
 	}
 	if err := runReconciler.SetupWithManager(mgr); err != nil {
 		panic(err)

@@ -80,7 +80,7 @@ spec:
           image: ${release_image}
           imagePullPolicy: IfNotPresent
           env:
-            - name: DATA_MOVER_IMAGE
+            - name: RELEASE_IMAGE
               value: ${release_image}
 YAML
 

@@ -41,6 +41,16 @@ func TestRunReconcileSenderJobUsesSyncoidOptions(t *testing.T) {
 	if got := sender.Spec.Template.Spec.Hostname; got != "zfsrep-sender" {
 		t.Fatalf("sender pod hostname = %q, want zfsrep-sender", got)
 	}
+	container := sender.Spec.Template.Spec.Containers[0]
+	if container.Image != r.ReleaseImage {
+		t.Fatalf("sender image = %q, want release image %q", container.Image, r.ReleaseImage)
+	}
+	if container.TerminationMessagePath != "/dev/termination-log" {
+		t.Fatalf("termination message path = %q", container.TerminationMessagePath)
+	}
+	if container.TerminationMessagePolicy != corev1.TerminationMessageReadFile {
+		t.Fatalf("termination message policy = %q, want File", container.TerminationMessagePolicy)
+	}
 	if got := envValue(sender, "SRC_DATASET"); got != "tank/src" {
 		t.Fatalf("SRC_DATASET = %q", got)
 	}
@@ -552,28 +562,22 @@ func TestRunReconcileLogsSenderFailure(t *testing.T) {
 	})
 }
 
-func TestRunReconcileBoundsSenderPodLogLastError(t *testing.T) {
-	run := replicationRun("manual-log-tail")
+func TestRunReconcileUsesSanitizedTerminationMessageFromExactSenderJob(t *testing.T) {
+	run := replicationRun("manual-termination-message")
 	names := objectNamesForRun(run.Name)
 	run.Status.ReceiverPodName = "zfs-receiver-worker-b"
 	run.Status.ReceiverPodIP = "10.0.0.42"
 	sender := runSenderJob(run, names, "datamover:test", "10.0.0.42")
+	sender.UID = "sender-job-uid"
 	sender.Status.Failed = 1
-	pod := &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "sender-pod",
-			Namespace: run.Namespace,
-			Labels: map[string]string{
-				"job-name": names.SenderName,
-			},
-		},
-	}
-	oldOutput := `old-output-marker --sshkey="/var/run/zfsrep/ssh/id_rsa"`
-	tailOutput := `tail-output-marker --sshkey="/var/run/zfsrep/ssh/id_rsa"`
-	r := newRunReconciler(t, run, sender, pod)
-	r.PodLogs = fakePodLogs{
-		"sender-pod": "sender completed result=failure error=\"" + oldOutput + strings.Repeat("x", 70*1024) + tailOutput + "\"\n",
-	}
+	finished := metav1.NewTime(time.Date(2026, 7, 19, 10, 0, 0, 0, time.UTC))
+	pod := terminatedSenderPod(run.Namespace, "sender-pod", sender, finished,
+		`cannot receive tank/archive --sshkey=/var/run/zfsrep/ssh/id_rsa`)
+	staleJob := sender.DeepCopy()
+	staleJob.UID = "stale-job-uid"
+	stale := terminatedSenderPod(run.Namespace, "stale-sender-pod", staleJob, metav1.NewTime(finished.Add(time.Minute)),
+		"stale job evidence must not win")
+	r := newRunReconciler(t, run, sender, pod, stale)
 
 	if _, err := r.Reconcile(context.Background(), request(run.Name)); err != nil {
 		t.Fatal(err)
@@ -586,32 +590,97 @@ func TestRunReconcileBoundsSenderPodLogLastError(t *testing.T) {
 	if got.Status.Phase != zfsv1.PhaseFailed {
 		t.Fatalf("phase = %q, want Failed", got.Status.Phase)
 	}
-	if strings.Contains(got.Status.LastError, "old-output-marker") {
-		t.Fatalf("lastError contains beginning of huge log line: %q", got.Status.LastError)
-	}
-	if !strings.Contains(got.Status.LastError, `tail-output-marker --sshkey=<redacted>`) {
-		t.Fatalf("lastError missing redacted tail marker: %q", got.Status.LastError)
-	}
-	if strings.Contains(got.Status.LastError, "--sshkey=/var/run/zfsrep/ssh/id_rsa") {
-		t.Fatalf("lastError contains unredacted ssh key path: %q", got.Status.LastError)
+	if got.Status.LastError != `cannot receive tank/archive --sshkey=<redacted>` {
+		t.Fatalf("lastError = %q", got.Status.LastError)
 	}
 }
 
-func TestFailureMessageFromLogsKeepsConciseCriticalError(t *testing.T) {
-	logs := "syncoid stderr CRITICAL ERROR: zfs send -w tank/src@syncoid_new_2026 | ssh -i /var/run/zfsrep/ssh/id_rsa zfs-recv@10.42.2.11 zfs receive -s -F -u missingpool/dst 2>&1 failed: 256\n"
+func TestRunReconcileSelectsNewestTerminatedSenderDeterministically(t *testing.T) {
+	base := time.Date(2026, 7, 19, 10, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name      string
+		configure func(older, newer *corev1.Pod)
+	}{
+		{
+			name: "finish time",
+			configure: func(older, newer *corev1.Pod) {
+				older.Status.ContainerStatuses[0].State.Terminated.FinishedAt = metav1.NewTime(base)
+				newer.Status.ContainerStatuses[0].State.Terminated.FinishedAt = metav1.NewTime(base.Add(time.Minute))
+			},
+		},
+		{
+			name: "pod creation time",
+			configure: func(older, newer *corev1.Pod) {
+				finished := metav1.NewTime(base)
+				older.Status.ContainerStatuses[0].State.Terminated.FinishedAt = finished
+				newer.Status.ContainerStatuses[0].State.Terminated.FinishedAt = finished
+				older.CreationTimestamp = metav1.NewTime(base.Add(-2 * time.Minute))
+				newer.CreationTimestamp = metav1.NewTime(base.Add(-time.Minute))
+			},
+		},
+		{
+			name: "pod name",
+			configure: func(older, newer *corev1.Pod) {
+				finished := metav1.NewTime(base)
+				created := metav1.NewTime(base.Add(-time.Minute))
+				older.Status.ContainerStatuses[0].State.Terminated.FinishedAt = finished
+				newer.Status.ContainerStatuses[0].State.Terminated.FinishedAt = finished
+				older.CreationTimestamp = created
+				newer.CreationTimestamp = created
+				older.Name = "sender-a"
+				newer.Name = "sender-b"
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			run := replicationRun("manual-newest-" + strings.ReplaceAll(tt.name, " ", "-"))
+			names := objectNamesForRun(run.Name)
+			sender := runSenderJob(run, names, "release:test", "10.0.0.42")
+			sender.UID = types.UID("sender-job-uid-" + tt.name)
+			sender.Status.Failed = 1
+			finished := metav1.NewTime(base)
+			older := terminatedSenderPod(run.Namespace, "sender-old", sender, finished, "older diagnosis")
+			newer := terminatedSenderPod(run.Namespace, "sender-new", sender, finished, "newest diagnosis")
+			tt.configure(older, newer)
+			r := newRunReconciler(t, run, sender, older, newer)
 
-	got := failureMessageFromLogs(logs)
-	if !strings.Contains(got, "CRITICAL ERROR") {
-		t.Fatalf("failureMessageFromLogs() = %q, want CRITICAL ERROR", got)
+			if _, err := r.Reconcile(context.Background(), request(run.Name)); err != nil {
+				t.Fatal(err)
+			}
+
+			var got zfsv1.ZFSReplicationRun
+			if err := r.Get(context.Background(), request(run.Name).NamespacedName, &got); err != nil {
+				t.Fatal(err)
+			}
+			if got.Status.LastError != "newest diagnosis" {
+				t.Fatalf("lastError = %q", got.Status.LastError)
+			}
+		})
 	}
-	if !strings.Contains(got, "missingpool/dst") {
-		t.Fatalf("failureMessageFromLogs() = %q, want target dataset", got)
+}
+
+func TestRunReconcileFallsBackToTerminationReasonAndExitCode(t *testing.T) {
+	run := replicationRun("manual-termination-reason")
+	names := objectNamesForRun(run.Name)
+	sender := runSenderJob(run, names, "release:test", "10.0.0.42")
+	sender.UID = "sender-job-uid"
+	sender.Status.Failed = 1
+	pod := terminatedSenderPod(run.Namespace, "sender-pod", sender, metav1.Now(), "")
+	pod.Status.ContainerStatuses[0].State.Terminated.Reason = "OOMKilled"
+	pod.Status.ContainerStatuses[0].State.Terminated.ExitCode = 137
+	r := newRunReconciler(t, run, sender, pod)
+
+	if _, err := r.Reconcile(context.Background(), request(run.Name)); err != nil {
+		t.Fatal(err)
 	}
-	if strings.Contains(got, "target=2>&1") {
-		t.Fatalf("failureMessageFromLogs() chose shell redirection as target: %q", got)
+
+	var got zfsv1.ZFSReplicationRun
+	if err := r.Get(context.Background(), request(run.Name).NamespacedName, &got); err != nil {
+		t.Fatal(err)
 	}
-	if strings.Contains(got, "zfs send") || strings.Contains(got, "/var/run/zfsrep/ssh/id_rsa") {
-		t.Fatalf("failureMessageFromLogs() contains raw pipeline or private key path: %q", got)
+	if got.Status.LastError != "sender terminated: reason OOMKilled, exit code 137" {
+		t.Fatalf("lastError = %q", got.Status.LastError)
 	}
 }
 
@@ -998,11 +1067,35 @@ func runSSHSecretForTest(run *zfsv1.ZFSReplicationRun, names runObjects) *corev1
 	}
 }
 
+func terminatedSenderPod(namespace, name string, job *batchv1.Job, finished metav1.Time, message string) *corev1.Pod {
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              name,
+			Namespace:         namespace,
+			CreationTimestamp: metav1.NewTime(finished.Add(-time.Minute)),
+			OwnerReferences: []metav1.OwnerReference{
+				*metav1.NewControllerRef(job, batchv1.SchemeGroupVersion.WithKind("Job")),
+			},
+		},
+		Status: corev1.PodStatus{ContainerStatuses: []corev1.ContainerStatus{
+			{
+				Name: "datamover",
+				State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+					ExitCode:   1,
+					Reason:     "Error",
+					Message:    message,
+					FinishedAt: finished,
+				}},
+			},
+		}},
+	}
+}
+
 func newRunReconciler(t *testing.T, objs ...client.Object) *ZFSReplicationRunReconciler {
 	t.Helper()
 	scheme := newTestScheme(t)
 	c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&zfsv1.ZFSReplicationRun{}, &zfsv1.ZFSReceiveTask{}).WithObjects(objs...).Build()
-	return &ZFSReplicationRunReconciler{Client: c, Scheme: scheme, DataMoverImage: "datamover:test"}
+	return &ZFSReplicationRunReconciler{Client: c, Scheme: scheme, ReleaseImage: "datamover:test"}
 }
 
 func newRunReconcilerWithInterceptors(t *testing.T, funcs interceptor.Funcs, objs ...client.Object) *ZFSReplicationRunReconciler {
@@ -1014,7 +1107,7 @@ func newRunReconcilerWithInterceptors(t *testing.T, funcs interceptor.Funcs, obj
 		WithObjects(objs...).
 		WithInterceptorFuncs(funcs).
 		Build()
-	return &ZFSReplicationRunReconciler{Client: c, Scheme: scheme, DataMoverImage: "datamover:test"}
+	return &ZFSReplicationRunReconciler{Client: c, Scheme: scheme, ReleaseImage: "datamover:test"}
 }
 
 func newScheduleReconciler(t *testing.T, now time.Time, objs ...client.Object) *ZFSReplicationScheduleReconciler {
@@ -1041,12 +1134,6 @@ func newTestScheme(t *testing.T) *runtime.Scheme {
 
 type capturedLogs struct {
 	entries []map[string]any
-}
-
-type fakePodLogs map[string]string
-
-func (f fakePodLogs) Logs(_ context.Context, _, podName string) (string, error) {
-	return f[podName], nil
 }
 
 func captureRunLogger() (context.Context, *capturedLogs) {

@@ -13,7 +13,7 @@ kubectl_cmd -n zfsreplication-system set image deployment/zfsreplication-control
 kubectl_cmd -n zfsreplication-system set image daemonset/zfs-receiver "receiver=${IMAGE_TAG}"
 kubectl_cmd -n zfsreplication-system patch deployment/zfsreplication-controller --type=json -p='[{"op":"replace","path":"/spec/template/spec/containers/0/imagePullPolicy","value":"IfNotPresent"}]'
 kubectl_cmd -n zfsreplication-system patch daemonset/zfs-receiver --type=json -p='[{"op":"replace","path":"/spec/template/spec/containers/0/imagePullPolicy","value":"IfNotPresent"}]'
-kubectl_cmd -n zfsreplication-system set env deployment/zfsreplication-controller "DATA_MOVER_IMAGE=${IMAGE_TAG}"
+kubectl_cmd -n zfsreplication-system set env deployment/zfsreplication-controller "RELEASE_IMAGE=${IMAGE_TAG}"
 kubectl_cmd -n zfsreplication-system rollout restart deployment/zfsreplication-controller
 kubectl_cmd -n zfsreplication-system rollout restart daemonset/zfs-receiver
 

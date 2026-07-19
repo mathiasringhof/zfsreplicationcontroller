@@ -3,10 +3,12 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
 	"github.com/mathias/zfsreplicationcontroller/internal/datamover"
+	"github.com/mathias/zfsreplicationcontroller/internal/replication/diagnosis"
 )
 
 type failingRunner struct{}
@@ -32,6 +34,7 @@ func (e mainExitError) ExitCode() int {
 
 func TestRunDoesNotPrintReturnedSyncoidFailure(t *testing.T) {
 	var stderr bytes.Buffer
+	publisher := &recordingPublisher{}
 
 	code := run(context.Background(), datamover.SenderConfig{
 		SrcDataset:       "tank/src",
@@ -44,7 +47,7 @@ func TestRunDoesNotPrintReturnedSyncoidFailure(t *testing.T) {
 		Compress:         "none",
 		ReceiveUnmounted: true,
 		ReceiveResumable: true,
-	}, &stderr, failingRunner{})
+	}, &stderr, failingRunner{}, publisher)
 	if code != 1 {
 		t.Fatalf("run() code = %d, want 1", code)
 	}
@@ -59,4 +62,39 @@ func TestRunDoesNotPrintReturnedSyncoidFailure(t *testing.T) {
 	if strings.Contains(out, "/var/run/zfsrep/ssh/id_rsa") {
 		t.Fatalf("stderr contains unredacted key path:\n%s", out)
 	}
+	if publisher.diagnosis.String() == "" {
+		t.Fatal("termination message was not published")
+	}
+}
+
+func TestRunPreservesFailureWhenTerminationPublicationFails(t *testing.T) {
+	var stderr bytes.Buffer
+	publisher := &recordingPublisher{err: errors.New("write failed --sshkey=unsafe-secret")}
+
+	code := run(context.Background(), datamover.SenderConfig{
+		SrcDataset:       "tank/src",
+		DstDataset:       "tank/dst",
+		Compress:         "none",
+		ReceiveResumable: true,
+	}, &stderr, failingRunner{}, publisher)
+
+	if code != 1 {
+		t.Fatalf("run() code = %d, want original failure code 1", code)
+	}
+	if got := publisher.diagnosis.String(); !strings.Contains(got, "CRITICAL ERROR") || !strings.Contains(got, "missingpool/dst") {
+		t.Fatalf("published diagnosis = %q", got)
+	}
+	if got := stderr.String(); !strings.Contains(got, "termination message publication failed") || strings.Contains(got, "unsafe-secret") {
+		t.Fatalf("stderr does not contain a safe publication failure:\n%s", got)
+	}
+}
+
+type recordingPublisher struct {
+	diagnosis diagnosis.Diagnosis
+	err       error
+}
+
+func (p *recordingPublisher) Publish(value diagnosis.Diagnosis) error {
+	p.diagnosis = value
+	return p.err
 }

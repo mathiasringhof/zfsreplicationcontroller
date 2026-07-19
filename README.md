@@ -78,11 +78,13 @@ The deployment chain is:
 Go source -> container image -> CRDs/RBAC/Deployment/DaemonSet -> manager pod -> custom resources -> ZFSReceiveTask + sender Job
 ```
 
-If you use a different registry or a pinned image, set it in both places in
+If you use a different registry or a pinned image, set the manager image in
 `config/manager/deployment.yaml`:
 
 - `spec.template.spec.containers[0].image`
-- `DATA_MOVER_IMAGE`
+
+Kustomize propagates that exact reference to `RELEASE_IMAGE` and the receiver
+DaemonSet. The manager uses `RELEASE_IMAGE` unchanged for every sender Job.
 
 Install the CRDs, RBAC, namespace, and controller Deployment.
 

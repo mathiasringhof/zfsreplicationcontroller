@@ -15,6 +15,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 const (
@@ -155,6 +156,7 @@ func TestE2ESyncoidFailure(t *testing.T) {
 	if !strings.Contains(status.LastError, sc.TargetDataset) {
 		t.Fatalf("lastError = %q, want to mention target dataset %q", status.LastError, sc.TargetDataset)
 	}
+	k.assertSenderTerminationDiagnosis(sc)
 	k.assertRunEphemeralCleanup(sc.Name)
 }
 
@@ -276,7 +278,6 @@ func TestE2EControllerServiceAccountRBAC(t *testing.T) {
 		{verb: "list", resource: "pods"},
 		{verb: "watch", resource: "pods"},
 		{verb: "delete", resource: "pods"},
-		{verb: "get", resource: "pods/log"},
 		{verb: "create", resource: "events"},
 		{verb: "patch", resource: "events"},
 	} {
@@ -605,6 +606,34 @@ func (k kubectlRunner) podsForReplicationInNamespace(namespace, name string) (po
 	return pods, nil
 }
 
+func (k kubectlRunner) assertSenderTerminationDiagnosis(sc replicationCase) {
+	k.t.Helper()
+	pods, err := k.podsForReplicationInNamespace(e2eNamespace, sc.Name)
+	if err != nil {
+		k.t.Fatal(err)
+	}
+	for _, pod := range pods.Items {
+		for _, status := range pod.Status.ContainerStatuses {
+			if status.Name != "datamover" || status.State.Terminated == nil {
+				continue
+			}
+			message := status.State.Terminated.Message
+			if !strings.Contains(message, "CRITICAL ERROR") || !strings.Contains(message, sc.TargetDataset) {
+				k.t.Fatalf("sender termination message = %q, want critical target diagnosis", message)
+			}
+			if len(message) > 4096 || !utf8.ValidString(message) || strings.ContainsAny(message, "\r\n") {
+				k.t.Fatalf("sender termination message is not bounded single-line UTF-8: %q", message)
+			}
+			if strings.Contains(message, "/var/run/zfsrep/ssh/id_rsa") {
+				k.t.Fatalf("sender termination message contains private key path: %q", message)
+			}
+			return
+		}
+	}
+	k.collectDiagnosticsInNamespace(e2eNamespace, sc.Name)
+	k.t.Fatalf("no terminated sender container found for %s", sc.Name)
+}
+
 func (k kubectlRunner) assertRunEphemeralCleanup(name string) {
 	k.t.Helper()
 	k.assertRunEphemeralCleanupInNamespace(e2eNamespace, name)
@@ -818,7 +847,7 @@ func (k kubectlRunner) useE2EImages() {
 	k.t.Helper()
 	k.run(60*time.Second, "set", "image", "deployment/"+e2eControllerDeploymentName, "-n", e2eControllerNamespace, "manager="+e2eImageTag())
 	k.run(60*time.Second, "set", "image", "daemonset/zfs-receiver", "-n", e2eControllerNamespace, "receiver="+e2eImageTag())
-	k.run(60*time.Second, "set", "env", "deployment/"+e2eControllerDeploymentName, "-n", e2eControllerNamespace, "DATA_MOVER_IMAGE="+e2eImageTag())
+	k.run(60*time.Second, "set", "env", "deployment/"+e2eControllerDeploymentName, "-n", e2eControllerNamespace, "RELEASE_IMAGE="+e2eImageTag())
 	controllerPatch := `{"spec":{"template":{"spec":{"containers":[{"name":"manager","imagePullPolicy":"IfNotPresent"}]}}}}`
 	k.run(60*time.Second, "patch", "deployment/"+e2eControllerDeploymentName, "-n", e2eControllerNamespace, "--type=strategic", "-p", controllerPatch)
 	receiverPatch := `{"spec":{"template":{"spec":{"containers":[{"name":"receiver","imagePullPolicy":"IfNotPresent"}]}}}}`
@@ -1091,6 +1120,16 @@ type podList struct {
 		Metadata struct {
 			Name string `json:"name"`
 		} `json:"metadata"`
+		Status struct {
+			ContainerStatuses []struct {
+				Name  string `json:"name"`
+				State struct {
+					Terminated *struct {
+						Message string `json:"message"`
+					} `json:"terminated"`
+				} `json:"state"`
+			} `json:"containerStatuses"`
+		} `json:"status"`
 	} `json:"items"`
 }
 
