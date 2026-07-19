@@ -433,7 +433,7 @@ type terminatedSender struct {
 func (r *ZFSReplicationRunReconciler) senderTerminationDiagnosis(ctx context.Context, job *batchv1.Job) (string, error) {
 	var pods corev1.PodList
 	if err := r.podReader().List(ctx, &pods, client.InNamespace(job.Namespace)); err != nil {
-		return "", err
+		return "", fmt.Errorf("list sender Pods in namespace %s: %w", job.Namespace, err)
 	}
 	var newest *terminatedSender
 	for i := range pods.Items {

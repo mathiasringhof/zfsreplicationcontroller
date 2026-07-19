@@ -79,6 +79,29 @@ func TestCaptureRedactsSecretAcrossChunksFromLogsAndFailure(t *testing.T) {
 	}
 }
 
+func TestCaptureRedactsSecretAtEveryChunkBoundary(t *testing.T) {
+	const (
+		raw  = `CRITICAL ERROR: ssh --sshkey=\"/secret key\" host cannot receive tank/archive` + "\n"
+		want = "CRITICAL ERROR: ssh --sshkey=<redacted> host cannot receive tank/archive"
+	)
+	for split := 0; split <= len(raw); split++ {
+		var live []string
+		capture := diagnosis.NewCapture(func(_ diagnosis.Stream, line string) {
+			live = append(live, line)
+		})
+		write(t, capture.Stderr(), raw[:split])
+		write(t, capture.Stderr(), raw[split:])
+
+		failure := capture.Failure(nil)
+		if got := failure.Diagnosis().String(); got != want {
+			t.Fatalf("split %d: diagnosis = %q, want %q", split, got, want)
+		}
+		if got := strings.Join(live, "\n"); got != want {
+			t.Fatalf("split %d: live output = %q, want %q", split, got, want)
+		}
+	}
+}
+
 func TestCaptureSelectsCauseFromBoundedOutputTail(t *testing.T) {
 	capture := diagnosis.NewCapture(nil)
 	write(t, capture.Stderr(), "CRITICAL ERROR: stale failure\n")
@@ -115,6 +138,57 @@ func TestCapturePrefersStderrSpecificCauseBeforeStdout(t *testing.T) {
 	}
 }
 
+func TestCaptureCausePriority(t *testing.T) {
+	tests := []struct {
+		name   string
+		stdout string
+		stderr string
+		err    error
+		want   string
+	}{
+		{
+			name:   "stdout critical before stderr specific",
+			stdout: "CRITICAL ERROR: remote refused replication\n",
+			stderr: "cannot open 'tank/source': dataset does not exist\n",
+			err:    exitError{code: 1, text: "exit status 1"},
+			want:   "CRITICAL ERROR: remote refused replication",
+		},
+		{
+			name:   "process error before ordinary tails",
+			stdout: "stdout detail\n",
+			stderr: "stderr detail\n",
+			err:    exitError{code: 1, text: "process launch failed"},
+			want:   "process launch failed",
+		},
+		{
+			name:   "stderr tail before stdout tail",
+			stdout: "stdout detail\n",
+			stderr: "stderr detail\n",
+			want:   "stderr detail",
+		},
+		{
+			name:   "stdout tail before generic",
+			stdout: "stdout detail\n",
+			want:   "stdout detail",
+		},
+		{
+			name: "generic without evidence",
+			want: "sender failed",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			capture := diagnosis.NewCapture(nil)
+			write(t, capture.Stdout(), tt.stdout)
+			write(t, capture.Stderr(), tt.stderr)
+
+			if got := capture.Failure(tt.err).Diagnosis().String(); got != tt.want {
+				t.Fatalf("diagnosis = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestSanitizeRedactsRecognizedSecrets(t *testing.T) {
 	tests := []struct {
 		name string
@@ -122,6 +196,7 @@ func TestSanitizeRedactsRecognizedSecrets(t *testing.T) {
 		want string
 	}{
 		{name: "sshkey", in: `before --sshkey="/secret/key" after`, want: `before --sshkey=<redacted> after`},
+		{name: "escaped quoted sshkey", in: `before --sshkey=\"/secret key\" after`, want: `before --sshkey=<redacted> after`},
 		{name: "identity", in: `ssh -i '/secret key' host`, want: `ssh -i <redacted> host`},
 		{name: "control socket", in: `ssh -S /tmp/control.sock host`, want: `ssh -S <redacted> host`},
 		{name: "known default path", in: `using /var/run/zfsrep/ssh/id_rsa directly`, want: `using <redacted> directly`},

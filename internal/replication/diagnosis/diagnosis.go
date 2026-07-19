@@ -35,8 +35,18 @@ type Capture struct {
 // NewCapture creates a bounded capture that emits only sanitized live lines.
 func NewCapture(log LineLogger) *Capture {
 	return &Capture{
-		stdout: &streamCapture{stream: Stdout, log: log, tail: outputTail{limit: outputTailBytes}},
-		stderr: &streamCapture{stream: Stderr, log: log, tail: outputTail{limit: outputTailBytes}},
+		stdout: &streamCapture{
+			stream:  Stdout,
+			log:     log,
+			tail:    outputTail{limit: outputTailBytes},
+			pending: make([]byte, 0, outputTailBytes),
+		},
+		stderr: &streamCapture{
+			stream:  Stderr,
+			log:     log,
+			tail:    outputTail{limit: outputTailBytes},
+			pending: make([]byte, 0, outputTailBytes),
+		},
 	}
 }
 
@@ -67,23 +77,27 @@ func (s *streamCapture) Write(p []byte) (int, error) {
 			continue
 		}
 		if i := bytes.IndexAny(p, "\r\n"); i >= 0 {
-			s.pending = append(s.pending, p[:i]...)
-			if len(s.pending) > outputTailBytes {
-				s.omitLine()
-			} else {
+			if s.appendFragment(p[:i]) {
 				s.flushLine()
 			}
 			p = p[i+1:]
 			continue
 		}
-		s.pending = append(s.pending, p...)
-		if len(s.pending) > outputTailBytes {
-			s.omitLine()
+		if !s.appendFragment(p) {
 			s.discarding = true
 		}
 		break
 	}
 	return written, nil
+}
+
+func (s *streamCapture) appendFragment(fragment []byte) bool {
+	if len(fragment) > outputTailBytes-len(s.pending) {
+		s.omitLine()
+		return false
+	}
+	s.pending = append(s.pending, fragment...)
+	return true
 }
 
 func (s *streamCapture) flushLine() {
@@ -249,24 +263,54 @@ func tokenEnd(value string, start int) int {
 	if start >= len(value) {
 		return start
 	}
-	if value[start] == '\'' || value[start] == '"' {
-		quote := value[start]
-		for i := start + 1; i < len(value); i++ {
-			if value[i] == '\\' && i+1 < len(value) {
-				i++
-				continue
+	if quote, consumed, ok := escapedQuoteAt(value, start); ok {
+		return quotedTokenEnd(value, start+consumed, quote, true, start)
+	}
+	if isQuote(value[start]) {
+		return quotedTokenEnd(value, start+1, value[start], false, start)
+	}
+	return unquotedTokenEnd(value, start)
+}
+
+func quotedTokenEnd(value string, start int, quote byte, escaped bool, fallbackStart int) int {
+	for i := start; i < len(value); i++ {
+		if escaped {
+			if foundQuote, consumed, ok := escapedQuoteAt(value, i); ok && foundQuote == quote {
+				return i + consumed
 			}
-			if value[i] == quote {
-				return i + 1
-			}
+		} else if value[i] == '\\' && i+1 < len(value) {
+			i++
+			continue
+		}
+		if value[i] == quote {
+			return i + 1
 		}
 	}
+	return unquotedTokenEnd(value, fallbackStart)
+}
+
+func unquotedTokenEnd(value string, start int) int {
 	for i := start; i < len(value); i++ {
 		if isSpace(value[i]) {
 			return i
 		}
 	}
 	return len(value)
+}
+
+func escapedQuoteAt(value string, pos int) (byte, int, bool) {
+	backslashes := 0
+	for pos+backslashes < len(value) && value[pos+backslashes] == '\\' {
+		backslashes++
+	}
+	if backslashes == 0 || pos+backslashes >= len(value) || !isQuote(value[pos+backslashes]) {
+		return 0, 0, false
+	}
+	return value[pos+backslashes], backslashes + 1, true
+}
+
+func isQuote(ch byte) bool {
+	return ch == '"' || ch == '\''
 }
 
 func isSpace(ch byte) bool {

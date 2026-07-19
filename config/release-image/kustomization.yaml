@@ -1,0 +1,18 @@
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+replacements:
+  - source:
+      kind: Deployment
+      name: zfsreplication-controller
+      fieldPath: spec.template.spec.containers.[name=manager].image
+    targets:
+      - select:
+          kind: Deployment
+          name: zfsreplication-controller
+        fieldPaths:
+          - spec.template.spec.containers.[name=manager].env.[name=RELEASE_IMAGE].value
+      - select:
+          kind: DaemonSet
+          name: zfs-receiver
+        fieldPaths:
+          - spec.template.spec.containers.[name=receiver].image
