@@ -3,19 +3,19 @@ package main
 import (
 	"bytes"
 	"context"
-	"errors"
+	"encoding/json"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
-	"syscall"
 	"testing"
-	"time"
 
 	zfsv1 "github.com/mathias/zfsreplicationcontroller/api/v1alpha1"
+	"github.com/mathias/zfsreplicationcontroller/internal/receiverauthorization"
 )
 
-func TestAuthorizeReceiverCommandAllowsSyncoidTargetCommands(t *testing.T) {
+const testReceiverPolicyID = "policy-0123456789abcdef0123456789abcdef"
+
+func TestModuleAdmissionAllowsSyncoidTargetCommands(t *testing.T) {
 	policy := testReceiverPolicy("tank/dst", zfsv1.ReceiveTaskPolicy{
 		ReceiveUnmounted:         true,
 		ReceiveResumable:         true,
@@ -44,14 +44,14 @@ func TestAuthorizeReceiverCommandAllowsSyncoidTargetCommands(t *testing.T) {
 		"zfs destroy tank/dst@syncoid_rel123_worker_old; zfs destroy tank/dst@syncoid_rel123_worker_older",
 	} {
 		t.Run(cmd, func(t *testing.T) {
-			if _, err := authorizeReceiverCommand(cmd, policy); err != nil {
-				t.Fatalf("authorizeReceiverCommand() error = %v, want nil", err)
+			if _, err := admitReceiverCommand(t, cmd, policy); err != nil {
+				t.Fatalf("Admit() error = %v, want nil", err)
 			}
 		})
 	}
 }
 
-func TestAuthorizeReceiverCommandRejectsCommandsOutsidePolicy(t *testing.T) {
+func TestModuleAdmissionRejectsCommandsOutsidePolicy(t *testing.T) {
 	policy := testReceiverPolicy("tank/dst", zfsv1.ReceiveTaskPolicy{
 		ReceiveUnmounted: true,
 		ReceiveResumable: true,
@@ -75,14 +75,14 @@ func TestAuthorizeReceiverCommandRejectsCommandsOutsidePolicy(t *testing.T) {
 		"command -v zstd",
 	} {
 		t.Run(cmd, func(t *testing.T) {
-			if _, err := authorizeReceiverCommand(cmd, policy); err == nil {
-				t.Fatal("authorizeReceiverCommand() error = nil, want rejection")
+			if _, err := admitReceiverCommand(t, cmd, policy); err == nil {
+				t.Fatal("Admit() error = nil, want rejection")
 			}
 		})
 	}
 }
 
-func TestAuthorizeReceiverCommandRejectsUnsafeReceiveFlags(t *testing.T) {
+func TestModuleAdmissionRejectsUnsafeReceiveFlags(t *testing.T) {
 	policy := testReceiverPolicy("tank/dst", zfsv1.ReceiveTaskPolicy{
 		ReceiveUnmounted: true,
 		ReceiveResumable: true,
@@ -98,14 +98,14 @@ func TestAuthorizeReceiverCommandRejectsUnsafeReceiveFlags(t *testing.T) {
 		"zfs receive -M -u -s tank/dst",
 	} {
 		t.Run(cmd, func(t *testing.T) {
-			if _, err := authorizeReceiverCommand(cmd, policy); err == nil {
-				t.Fatal("authorizeReceiverCommand() error = nil, want rejection")
+			if _, err := admitReceiverCommand(t, cmd, policy); err == nil {
+				t.Fatal("Admit() error = nil, want rejection")
 			}
 		})
 	}
 }
 
-func TestAuthorizeReceiverCommandAllowsMountedReceiveOnlyWhenPolicyAllowsMount(t *testing.T) {
+func TestModuleAdmissionAllowsMountedReceiveOnlyWhenPolicyAllowsMount(t *testing.T) {
 	policy := testReceiverPolicy("tank/dst", zfsv1.ReceiveTaskPolicy{
 		ReceiveUnmounted: true,
 		ReceiveResumable: true,
@@ -113,23 +113,23 @@ func TestAuthorizeReceiverCommandAllowsMountedReceiveOnlyWhenPolicyAllowsMount(t
 	})
 	cmd := "zfs receive -s tank/dst"
 
-	if _, err := authorizeReceiverCommand(cmd, policy); err == nil {
-		t.Fatal("authorizeReceiverCommand() error = nil, want mounted receive rejection")
+	if _, err := admitReceiverCommand(t, cmd, policy); err == nil {
+		t.Fatal("Admit() error = nil, want mounted receive rejection")
 	}
 
 	policy.AllowMount = true
-	if _, err := authorizeReceiverCommand(cmd, policy); err != nil {
-		t.Fatalf("authorizeReceiverCommand() error = %v, want mounted receive allowed", err)
+	if _, err := admitReceiverCommand(t, cmd, policy); err != nil {
+		t.Fatalf("Admit() error = %v, want mounted receive allowed", err)
 	}
 
 	policy.ReceiveUnmounted = false
 	policy.AllowMount = false
-	if _, err := authorizeReceiverCommand(cmd, policy); err == nil {
-		t.Fatal("authorizeReceiverCommand() error = nil, want mounted receive rejection without allowMount")
+	if _, err := admitReceiverCommand(t, cmd, policy); err == nil {
+		t.Fatal("Admit() error = nil, want mounted receive rejection without allowMount")
 	}
 }
 
-func TestAuthorizeReceiverCommandEnforcesDatasetAndSnapshotBoundaries(t *testing.T) {
+func TestModuleAdmissionEnforcesDatasetAndSnapshotBoundaries(t *testing.T) {
 	policy := testReceiverPolicy("tank/app", zfsv1.ReceiveTaskPolicy{
 		ReceiveUnmounted:         true,
 		ReceiveResumable:         true,
@@ -149,8 +149,8 @@ func TestAuthorizeReceiverCommandEnforcesDatasetAndSnapshotBoundaries(t *testing
 		"zfs destroy -r tank/app@syncoid_rel123_worker_2026-07-04",
 	} {
 		t.Run(cmd, func(t *testing.T) {
-			if _, err := authorizeReceiverCommand(cmd, policy); err == nil {
-				t.Fatal("authorizeReceiverCommand() error = nil, want rejection")
+			if _, err := admitReceiverCommand(t, cmd, policy); err == nil {
+				t.Fatal("Admit() error = nil, want rejection")
 			}
 		})
 	}
@@ -161,14 +161,14 @@ func TestAuthorizeReceiverCommandEnforcesDatasetAndSnapshotBoundaries(t *testing
 		"zfs destroy tank/app@syncoid_rel123_worker_2026-07-04",
 	} {
 		t.Run(cmd, func(t *testing.T) {
-			if _, err := authorizeReceiverCommand(cmd, policy); err != nil {
-				t.Fatalf("authorizeReceiverCommand() error = %v, want nil", err)
+			if _, err := admitReceiverCommand(t, cmd, policy); err != nil {
+				t.Fatalf("Admit() error = %v, want nil", err)
 			}
 		})
 	}
 }
 
-func TestAuthorizeReceiverCommandAllowsTargetSnapshotDestroyPolicy(t *testing.T) {
+func TestModuleAdmissionAllowsTargetSnapshotDestroyPolicy(t *testing.T) {
 	policy := testReceiverPolicy("tank/dst", zfsv1.ReceiveTaskPolicy{
 		ReceiveUnmounted:           true,
 		ReceiveResumable:           true,
@@ -186,8 +186,8 @@ func TestAuthorizeReceiverCommandAllowsTargetSnapshotDestroyPolicy(t *testing.T)
 		"zfs destroy tank/dst@manual-a; zfs destroy tank/dst@manual-b",
 	} {
 		t.Run(cmd, func(t *testing.T) {
-			if _, err := authorizeReceiverCommand(cmd, policy); err != nil {
-				t.Fatalf("authorizeReceiverCommand() error = %v, want nil", err)
+			if _, err := admitReceiverCommand(t, cmd, policy); err != nil {
+				t.Fatalf("Admit() error = %v, want nil", err)
 			}
 		})
 	}
@@ -206,14 +206,14 @@ func TestAuthorizeReceiverCommandAllowsTargetSnapshotDestroyPolicy(t *testing.T)
 		"zfs destroy tank/dst",
 	} {
 		t.Run(cmd, func(t *testing.T) {
-			if _, err := authorizeReceiverCommand(cmd, policy); err == nil {
-				t.Fatal("authorizeReceiverCommand() error = nil, want rejection")
+			if _, err := admitReceiverCommand(t, cmd, policy); err == nil {
+				t.Fatal("Admit() error = nil, want rejection")
 			}
 		})
 	}
 }
 
-func TestAuthorizeReceiverCommandAllowsBatchedSnapshotSyntaxForSyncPolicy(t *testing.T) {
+func TestModuleAdmissionAllowsBatchedSnapshotSyntaxForSyncPolicy(t *testing.T) {
 	policy := testReceiverPolicy("tank/dst", zfsv1.ReceiveTaskPolicy{
 		ReceiveUnmounted:         true,
 		ReceiveResumable:         true,
@@ -223,8 +223,8 @@ func TestAuthorizeReceiverCommandAllowsBatchedSnapshotSyntaxForSyncPolicy(t *tes
 	})
 
 	allowed := "zfs destroy 'tank/dst@syncoid_rel123_worker_old,syncoid_rel123_worker_older'"
-	if _, err := authorizeReceiverCommand(allowed, policy); err != nil {
-		t.Fatalf("authorizeReceiverCommand() error = %v, want nil", err)
+	if _, err := admitReceiverCommand(t, allowed, policy); err != nil {
+		t.Fatalf("Admit() error = %v, want nil", err)
 	}
 
 	for _, cmd := range []string{
@@ -232,14 +232,14 @@ func TestAuthorizeReceiverCommandAllowsBatchedSnapshotSyntaxForSyncPolicy(t *tes
 		"zfs destroy 'tank/dst@syncoid_rel123_worker_old,syncoid_other_worker_old'",
 	} {
 		t.Run(cmd, func(t *testing.T) {
-			if _, err := authorizeReceiverCommand(cmd, policy); err == nil {
-				t.Fatal("authorizeReceiverCommand() error = nil, want rejection")
+			if _, err := admitReceiverCommand(t, cmd, policy); err == nil {
+				t.Fatal("Admit() error = nil, want rejection")
 			}
 		})
 	}
 }
 
-func TestAuthorizeReceiverCommandLimitsDestroyBatches(t *testing.T) {
+func TestModuleAdmissionLimitsDestroyBatches(t *testing.T) {
 	policy := testReceiverPolicy("tank/dst", zfsv1.ReceiveTaskPolicy{
 		ReceiveUnmounted:         true,
 		ReceiveResumable:         true,
@@ -252,24 +252,24 @@ func TestAuthorizeReceiverCommandLimitsDestroyBatches(t *testing.T) {
 		parts = append(parts, "zfs destroy tank/dst@syncoid_rel123_worker_"+strings.Repeat("x", i+1))
 	}
 
-	if _, err := authorizeReceiverCommand(strings.Join(parts, "; "), policy); err == nil {
-		t.Fatal("authorizeReceiverCommand() error = nil, want batch size rejection")
+	if _, err := admitReceiverCommand(t, strings.Join(parts, "; "), policy); err == nil {
+		t.Fatal("Admit() error = nil, want batch size rejection")
 	}
 }
 
-func TestAuthorizeReceiverCommandLimitsCommandLength(t *testing.T) {
+func TestModuleAdmissionLimitsCommandLength(t *testing.T) {
 	policy := testReceiverPolicy("tank/dst", zfsv1.ReceiveTaskPolicy{
 		ReceiveUnmounted: true,
 		ReceiveResumable: true,
 		Compression:      "none",
 	})
 
-	if _, err := authorizeReceiverCommand(strings.Repeat("x", maxReceiverCommandLength+1), policy); err == nil {
-		t.Fatal("authorizeReceiverCommand() error = nil, want command length rejection")
+	if _, err := admitReceiverCommand(t, strings.Repeat("x", 8193), policy); err == nil {
+		t.Fatal("Admit() error = nil, want command length rejection")
 	}
 }
 
-func TestAuthorizeReceiverCommandAllowsForceDeletePolicy(t *testing.T) {
+func TestModuleAdmissionAllowsForceDeletePolicy(t *testing.T) {
 	policy := testReceiverPolicy("tank/dst", zfsv1.ReceiveTaskPolicy{
 		ReceiveUnmounted: true,
 		ReceiveResumable: true,
@@ -283,8 +283,8 @@ func TestAuthorizeReceiverCommandAllowsForceDeletePolicy(t *testing.T) {
 		"zfs destroy -r tank/dst;",
 	} {
 		t.Run(cmd, func(t *testing.T) {
-			if _, err := authorizeReceiverCommand(cmd, policy); err != nil {
-				t.Fatalf("authorizeReceiverCommand() error = %v, want nil", err)
+			if _, err := admitReceiverCommand(t, cmd, policy); err != nil {
+				t.Fatalf("Admit() error = %v, want nil", err)
 			}
 		})
 	}
@@ -333,59 +333,7 @@ func TestWriteReceiverPoliciesUsesPolicyIDsAndDoesNotFollowSymlinks(t *testing.T
 	}
 }
 
-func TestReadReceiverPolicyRejectsSymlink(t *testing.T) {
-	dir := t.TempDir()
-	target := filepath.Join(dir, "target.json")
-	if err := os.WriteFile(target, []byte(`{"targetDataset":"tank/dst","receiveUnmounted":true,"compression":"none"}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	link := filepath.Join(dir, "policy-0123456789abcdef0123456789abcdef.json")
-	if err := os.Symlink(target, link); err != nil {
-		t.Fatal(err)
-	}
-
-	if _, err := readReceiverPolicy(link); err == nil {
-		t.Fatal("readReceiverPolicy() error = nil, want symlink rejection")
-	}
-}
-
-func TestReadReceiverPolicyNormalizesLegacyMountedReceivePolicy(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "policy-0123456789abcdef0123456789abcdef.json")
-	if err := os.WriteFile(path, []byte(`{"targetDataset":"tank/dst","receiveUnmounted":false,"receiveResumable":true,"compression":"none"}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	policy, err := readReceiverPolicy(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !policy.AllowMount {
-		t.Fatal("AllowMount = false, want legacy receiveUnmounted=false policy to allow mounted receive")
-	}
-	if _, err := authorizeReceiverCommand("zfs receive -s tank/dst", policy); err != nil {
-		t.Fatalf("authorizeReceiverCommand() error = %v, want mounted receive allowed", err)
-	}
-}
-
-func TestReadReceiverPolicyPreservesExplicitMountedReceiveDenial(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "policy-0123456789abcdef0123456789abcdef.json")
-	if err := os.WriteFile(path, []byte(`{"targetDataset":"tank/dst","receiveUnmounted":false,"allowMount":false,"receiveResumable":true,"compression":"none"}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	policy, err := readReceiverPolicy(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if policy.AllowMount {
-		t.Fatal("AllowMount = true, want explicit allowMount=false preserved")
-	}
-	if _, err := authorizeReceiverCommand("zfs receive -s tank/dst", policy); err == nil {
-		t.Fatal("authorizeReceiverCommand() error = nil, want mounted receive rejected")
-	}
-}
-
-func TestAuthorizeReceiverCommandUsesCompressionPolicy(t *testing.T) {
+func TestModuleAdmissionUsesCompressionPolicy(t *testing.T) {
 	policy := testReceiverPolicy("tank/dst", zfsv1.ReceiveTaskPolicy{
 		ReceiveUnmounted: true,
 		ReceiveResumable: true,
@@ -397,17 +345,17 @@ func TestAuthorizeReceiverCommandUsesCompressionPolicy(t *testing.T) {
 		"mbuffer -q | zstd -dc | zfs receive -u -s tank/dst 2>&1",
 	} {
 		t.Run(cmd, func(t *testing.T) {
-			if _, err := authorizeReceiverCommand(cmd, policy); err != nil {
-				t.Fatalf("authorizeReceiverCommand() error = %v, want nil", err)
+			if _, err := admitReceiverCommand(t, cmd, policy); err != nil {
+				t.Fatalf("Admit() error = %v, want nil", err)
 			}
 		})
 	}
-	if _, err := authorizeReceiverCommand("mbuffer -q | gzip -dc | zfs receive -u -s tank/dst 2>&1", policy); err == nil {
-		t.Fatal("authorizeReceiverCommand() error = nil, want compressor mismatch rejection")
+	if _, err := admitReceiverCommand(t, "mbuffer -q | gzip -dc | zfs receive -u -s tank/dst 2>&1", policy); err == nil {
+		t.Fatal("Admit() error = nil, want compressor mismatch rejection")
 	}
 }
 
-func TestAuthorizeReceiverCommandAllowsSyncoidDecompressorForms(t *testing.T) {
+func TestModuleAdmissionAllowsSyncoidDecompressorForms(t *testing.T) {
 	for _, tt := range []struct {
 		name        string
 		compression string
@@ -425,20 +373,21 @@ func TestAuthorizeReceiverCommandAllowsSyncoidDecompressorForms(t *testing.T) {
 				ReceiveResumable: true,
 				Compression:      tt.compression,
 			})
-			if _, err := authorizeReceiverCommand(tt.command, policy); err != nil {
-				t.Fatalf("authorizeReceiverCommand() error = %v, want nil", err)
+			if _, err := admitReceiverCommand(t, tt.command, policy); err != nil {
+				t.Fatalf("Admit() error = %v, want nil", err)
 			}
 		})
 	}
 }
 
-func TestExecuteReceiverCommandPlanEmulatesBuiltins(t *testing.T) {
-	var stdout bytes.Buffer
-	err := executeReceiverCommandPlan(context.Background(), forcedCommandConfig{Stdout: &stdout}, receiverCommandPlan{
-		kind:     receiverCommandEcho,
-		echoArgs: []string{"hello", "world"},
-	})
+func TestPlanExecuteEmulatesBuiltins(t *testing.T) {
+	policy := testReceiverPolicy("tank/dst", zfsv1.ReceiveTaskPolicy{Compression: "none"})
+	plan, err := admitReceiverCommand(t, "echo -n hello world", policy)
 	if err != nil {
+		t.Fatal(err)
+	}
+	var stdout bytes.Buffer
+	if err := plan.Execute(context.Background(), nil, &stdout, nil); err != nil {
 		t.Fatal(err)
 	}
 	if stdout.String() != "hello world" {
@@ -446,18 +395,18 @@ func TestExecuteReceiverCommandPlanEmulatesBuiltins(t *testing.T) {
 	}
 }
 
-func TestExecuteReceiverCommandPlanEmulatesProcessList(t *testing.T) {
+func TestPlanExecuteEmulatesProcessList(t *testing.T) {
 	policy := testReceiverPolicy("tank/dst", zfsv1.ReceiveTaskPolicy{
 		ReceiveUnmounted: true,
 		ReceiveResumable: true,
 		Compression:      "none",
 	})
-	plan, err := authorizeReceiverCommand("ps -Ao args=", policy)
+	plan, err := admitReceiverCommand(t, "ps -Ao args=", policy)
 	if err != nil {
 		t.Fatal(err)
 	}
 	var stdout bytes.Buffer
-	if err := executeReceiverCommandPlan(context.Background(), forcedCommandConfig{Stdout: &stdout}, plan); err != nil {
+	if err := plan.Execute(context.Background(), nil, &stdout, nil); err != nil {
 		t.Fatal(err)
 	}
 	if stdout.Len() != 0 {
@@ -465,114 +414,15 @@ func TestExecuteReceiverCommandPlanEmulatesProcessList(t *testing.T) {
 	}
 }
 
-func TestExecuteReceiverPipelineUsesMinimalEnvironment(t *testing.T) {
-	dir := t.TempDir()
-	envPath := filepath.Join(dir, "env.txt")
-	script := filepath.Join(dir, "zfs")
-	writeScript(t, script, "#!/bin/sh\nprintf '%s|%s|%s|%s\\n' \"$SSH_ORIGINAL_COMMAND\" \"$LD_PRELOAD\" \"$LC_ALL\" \"$LANG\" > \"$1\"\n")
-	restore := replaceAllowedCommandResolver(t, map[string]string{"zfs": script})
-	defer restore()
-	t.Setenv("SSH_ORIGINAL_COMMAND", "attacker-controlled")
-	t.Setenv("LD_PRELOAD", "/tmp/injected.dylib")
-
-	err := executeReceiverPipeline(context.Background(), strings.NewReader(""), &bytes.Buffer{}, &bytes.Buffer{}, []receiverCommandStep{
-		{Name: "zfs", Args: []string{envPath}},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	data, err := os.ReadFile(envPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := strings.TrimSpace(string(data)); got != "||C|C" {
-		t.Fatalf("child environment = %q, want only explicit locale values", got)
-	}
-}
-
-func TestExecuteReceiverPipelineCancelsAndWaitsForRemainingProcesses(t *testing.T) {
-	dir := t.TempDir()
-	fail := filepath.Join(dir, "mbuffer")
-	pidFile := filepath.Join(dir, "zfs.pid")
-	block := filepath.Join(dir, "zfs")
-	writeScript(t, fail, "#!/bin/sh\nsleep 0.5\nexit 42\n")
-	writeScript(t, block, "#!/bin/sh\nprintf '%s' \"$$\" > \"$1\"\nwhile :; do sleep 1; done\n")
-	restore := replaceAllowedCommandResolver(t, map[string]string{
-		"mbuffer": fail,
-		"zfs":     block,
-	})
-	defer restore()
-
-	err := executeReceiverPipeline(context.Background(), strings.NewReader(""), &bytes.Buffer{}, &bytes.Buffer{}, []receiverCommandStep{
-		{Name: "mbuffer"},
-		{Name: "zfs", Args: []string{pidFile}},
-	})
-	if err == nil {
-		t.Fatal("executeReceiverPipeline() error = nil, want pipeline failure")
-	}
-	waitForFile(t, pidFile)
-	pidText, err := os.ReadFile(pidFile)
-	if err != nil {
-		t.Fatal(err)
-	}
-	pid, err := strconv.Atoi(string(pidText))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if processExists(pid) {
-		if err := syscall.Kill(pid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
-			t.Fatalf("kill downstream process %d: %v", pid, err)
-		}
-		t.Fatalf("downstream process %d is still running after pipeline returned", pid)
-	}
-}
-
 func TestRunForcedCommandRejectsMissingOriginalCommand(t *testing.T) {
 	err := runForcedCommand(context.Background(), forcedCommandConfig{
+		Authorization:   receiverauthorization.New(t.TempDir()),
+		PolicyID:        testReceiverPolicyID,
 		OriginalCommand: "",
-		Policy:          testReceiverPolicy("tank/dst", zfsv1.ReceiveTaskPolicy{Compression: "none"}),
 	})
 	if err == nil {
 		t.Fatal("runForcedCommand() error = nil, want missing command rejection")
 	}
-}
-
-func writeScript(t *testing.T, path, content string) {
-	t.Helper()
-	if err := os.WriteFile(path, []byte(content), 0o700); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func replaceAllowedCommandResolver(t *testing.T, paths map[string]string) func() {
-	t.Helper()
-	previous := resolveAllowedCommand
-	resolveAllowedCommand = func(name string) (string, error) {
-		if path, ok := paths[name]; ok {
-			return path, nil
-		}
-		return "", errors.New("unexpected command: " + name)
-	}
-	return func() {
-		resolveAllowedCommand = previous
-	}
-}
-
-func waitForFile(t *testing.T, path string) {
-	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if _, err := os.Stat(path); err == nil {
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	t.Fatalf("timed out waiting for %s", path)
-}
-
-func processExists(pid int) bool {
-	err := syscall.Kill(pid, 0)
-	return err == nil || errors.Is(err, syscall.EPERM)
 }
 
 func testReceiverPolicy(targetDataset string, policy zfsv1.ReceiveTaskPolicy) receiverCommandPolicy {
@@ -580,4 +430,29 @@ func testReceiverPolicy(targetDataset string, policy zfsv1.ReceiveTaskPolicy) re
 		TargetDataset:     targetDataset,
 		ReceiveTaskPolicy: policy,
 	}
+}
+
+func admitReceiverCommand(t *testing.T, raw string, policy receiverCommandPolicy) (receiverauthorization.Plan, error) {
+	t.Helper()
+	dir := t.TempDir()
+	data, err := json.Marshal(policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		t.Fatal(err)
+	}
+	fields["allowMount"] = json.RawMessage("false")
+	if policy.AllowMount {
+		fields["allowMount"] = json.RawMessage("true")
+	}
+	data, err = json.Marshal(fields)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, testReceiverPolicyID+".json"), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return receiverauthorization.New(dir).Admit(testReceiverPolicyID, raw)
 }

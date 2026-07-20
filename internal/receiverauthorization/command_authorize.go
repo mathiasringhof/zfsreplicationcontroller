@@ -1,4 +1,4 @@
-package main
+package receiverauthorization
 
 import (
 	"fmt"
@@ -8,7 +8,7 @@ import (
 	"github.com/mathias/zfsreplicationcontroller/internal/replication"
 )
 
-func authorizeReceiverCommand(raw string, policy receiverCommandPolicy) (receiverCommandPlan, error) {
+func authorizeReceiverCommand(raw string, policy commandPolicy) (receiverCommandPlan, error) {
 	raw = strings.TrimSpace(raw)
 	if len(raw) > maxReceiverCommandLength {
 		return receiverCommandPlan{}, fmt.Errorf("command is too long")
@@ -70,7 +70,7 @@ func authorizeReceiverCommand(raw string, policy receiverCommandPolicy) (receive
 	return receiverCommandPlan{kind: receiverCommandPipeline, pipeline: steps}, nil
 }
 
-func authorizeReceiverCommandBatch(raw string, policy receiverCommandPolicy) (receiverCommandPlan, error) {
+func authorizeReceiverCommandBatch(raw string, policy commandPolicy) (receiverCommandPlan, error) {
 	parts := strings.Split(raw, ";")
 	batch := make([]receiverCommandPlan, 0, len(parts))
 	for i, part := range parts {
@@ -107,14 +107,14 @@ func receiverPlanIsDestroy(plan receiverCommandPlan) bool {
 		plan.pipeline[0].Args[0] == "destroy"
 }
 
-func commandLookupAllowed(name string, policy receiverCommandPolicy) bool {
+func commandLookupAllowed(name string, policy commandPolicy) bool {
 	if name == "mbuffer" {
 		return true
 	}
 	return policy.Compression != replication.CompressionNone && name == policy.Compression && replication.CompressorAllowed(name)
 }
 
-func validateSingleReceiverStep(step receiverCommandStep, policy receiverCommandPolicy) error {
+func validateSingleReceiverStep(step receiverCommandStep, policy commandPolicy) error {
 	switch step.Name {
 	case "ps":
 		if !receiverStepHasNoRedirects(step) || !slices.Equal(step.Args, []string{"-Ao", "args="}) {
@@ -134,7 +134,7 @@ func validateSingleReceiverStep(step receiverCommandStep, policy receiverCommand
 	return nil
 }
 
-func validateZFSStep(step receiverCommandStep, policy receiverCommandPolicy) error {
+func validateZFSStep(step receiverCommandStep, policy commandPolicy) error {
 	if len(step.Args) == 0 {
 		return fmt.Errorf("missing zfs subcommand")
 	}
@@ -173,7 +173,7 @@ func zfsGetAllowed(args []string, target string) bool {
 	return false
 }
 
-func validateZpoolFeatureCheck(steps []receiverCommandStep, policy receiverCommandPolicy) error {
+func validateZpoolFeatureCheck(steps []receiverCommandStep, policy commandPolicy) error {
 	if len(steps) != 2 {
 		return fmt.Errorf("not a zpool feature check")
 	}
@@ -194,13 +194,13 @@ func validateZpoolFeatureCheck(steps []receiverCommandStep, policy receiverComma
 	return nil
 }
 
-func zpoolFeatureGetAllowed(step receiverCommandStep, policy receiverCommandPolicy) bool {
+func zpoolFeatureGetAllowed(step receiverCommandStep, policy commandPolicy) bool {
 	return step.Name == "zpool" &&
 		receiverStepHasNoStdoutRedirects(step) &&
 		slices.Equal(step.Args, []string{"get", "-o", "value", "-H", "feature@extensible_dataset", replication.TargetPool(policy.TargetDataset)})
 }
 
-func validateReceivePipeline(steps []receiverCommandStep, policy receiverCommandPolicy) error {
+func validateReceivePipeline(steps []receiverCommandStep, policy commandPolicy) error {
 	if len(steps) < 1 || len(steps) > 3 {
 		return fmt.Errorf("unsupported receive pipeline length")
 	}
@@ -278,7 +278,7 @@ func safeMbufferValue(value string) bool {
 	return true
 }
 
-func validateDecompressorStep(step receiverCommandStep, policy receiverCommandPolicy) error {
+func validateDecompressorStep(step receiverCommandStep, policy commandPolicy) error {
 	if policy.Compression == replication.CompressionNone {
 		return fmt.Errorf("decompressor is not allowed when compression is none")
 	}
@@ -291,7 +291,7 @@ func validateDecompressorStep(step receiverCommandStep, policy receiverCommandPo
 	return fmt.Errorf("unsupported decompressor arguments")
 }
 
-func validateZFSReceiveStep(step receiverCommandStep, policy receiverCommandPolicy) error {
+func validateZFSReceiveStep(step receiverCommandStep, policy commandPolicy) error {
 	if len(step.Args) == 3 && step.Args[0] == "receive" && step.Args[1] == "-A" {
 		if !replication.ValidDatasetName(step.Args[2]) || step.Args[2] != policy.TargetDataset {
 			return fmt.Errorf("zfs receive abort target is outside policy")
@@ -337,7 +337,7 @@ func validateZFSReceiveStep(step receiverCommandStep, policy receiverCommandPoli
 	return nil
 }
 
-func zfsDestroyAllowed(args []string, policy receiverCommandPolicy) bool {
+func zfsDestroyAllowed(args []string, policy commandPolicy) bool {
 	if len(args) == 2 && args[0] == "destroy" {
 		if snapshotDestroyAllowed(args[1], policy) {
 			return true
@@ -350,7 +350,7 @@ func zfsDestroyAllowed(args []string, policy receiverCommandPolicy) bool {
 	return false
 }
 
-func snapshotDestroyAllowed(target string, policy receiverCommandPolicy) bool {
+func snapshotDestroyAllowed(target string, policy commandPolicy) bool {
 	dataset, snapshots, ok := strings.Cut(target, "@")
 	if !ok || strings.Contains(snapshots, "@") || dataset != policy.TargetDataset {
 		return false

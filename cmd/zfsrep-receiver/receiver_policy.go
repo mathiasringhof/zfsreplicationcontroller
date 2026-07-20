@@ -16,46 +16,6 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
-func readReceiverPolicy(path string) (receiverCommandPolicy, error) {
-	info, err := os.Lstat(path)
-	if err != nil {
-		return receiverCommandPolicy{}, fmt.Errorf("stat receiver policy: %w", err)
-	}
-	if info.Mode()&os.ModeSymlink != 0 {
-		return receiverCommandPolicy{}, fmt.Errorf("receiver policy must not be a symlink")
-	}
-	if !info.Mode().IsRegular() {
-		return receiverCommandPolicy{}, fmt.Errorf("receiver policy must be a regular file")
-	}
-	if info.Mode().Perm()&0o022 != 0 {
-		return receiverCommandPolicy{}, fmt.Errorf("receiver policy must not be group or world writable")
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return receiverCommandPolicy{}, fmt.Errorf("read receiver policy: %w", err)
-	}
-	var policy receiverCommandPolicy
-	if err := json.Unmarshal(data, &policy); err != nil {
-		return receiverCommandPolicy{}, fmt.Errorf("parse receiver policy: %w", err)
-	}
-	if err := normalizeReceiverPolicy(data, &policy); err != nil {
-		return receiverCommandPolicy{}, fmt.Errorf("parse receiver policy fields: %w", err)
-	}
-	policy.Compression = replication.CompressionDefault(policy.Compression)
-	return policy, nil
-}
-
-func normalizeReceiverPolicy(data []byte, policy *receiverCommandPolicy) error {
-	var fields map[string]json.RawMessage
-	if err := json.Unmarshal(data, &fields); err != nil {
-		return err
-	}
-	if _, ok := fields["allowMount"]; !ok && !policy.ReceiveUnmounted {
-		policy.AllowMount = true
-	}
-	return nil
-}
-
 func receiveTaskAuthorization(cfg receiverConfig, task *zfsv1.ZFSReceiveTask) (receiverTaskAuthorization, error) {
 	publicKey, err := canonicalAuthorizedPublicKey(task.Spec.SSH.AuthorizedPublicKey)
 	if err != nil {

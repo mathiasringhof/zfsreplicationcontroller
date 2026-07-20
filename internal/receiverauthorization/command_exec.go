@@ -1,4 +1,4 @@
-package main
+package receiverauthorization
 
 import (
 	"context"
@@ -11,16 +11,16 @@ import (
 	"sync"
 )
 
-func executeReceiverCommandPlan(ctx context.Context, cfg forcedCommandConfig, plan receiverCommandPlan) error {
-	stdin := cfg.Stdin
+func executeReceiverCommandPlan(ctx context.Context, streams commandStreams, plan receiverCommandPlan) error {
+	stdin := streams.stdin
 	if stdin == nil {
 		stdin = os.Stdin
 	}
-	stdout := cfg.Stdout
+	stdout := streams.stdout
 	if stdout == nil {
 		stdout = os.Stdout
 	}
-	stderr := cfg.Stderr
+	stderr := streams.stderr
 	if stderr == nil {
 		stderr = os.Stderr
 	}
@@ -28,26 +28,29 @@ func executeReceiverCommandPlan(ctx context.Context, cfg forcedCommandConfig, pl
 	case receiverCommandExit:
 		return nil
 	case receiverCommandEcho:
-		_, err := fmt.Fprint(stdout, strings.Join(plan.echoArgs, " "))
-		return err
+		if _, err := fmt.Fprint(stdout, strings.Join(plan.echoArgs, " ")); err != nil {
+			return fmt.Errorf("write echo output: %w", err)
+		}
+		return nil
 	case receiverCommandLookup:
 		path, err := resolveAllowedCommand(plan.lookupCommand)
 		if err != nil {
-			return forcedCommandExitError{code: 1}
+			return exitError{code: 1}
 		}
-		_, err = fmt.Fprintln(stdout, path)
-		return err
+		if _, err := fmt.Fprintln(stdout, path); err != nil {
+			return fmt.Errorf("write command path: %w", err)
+		}
+		return nil
 	case receiverCommandPS:
 		return nil
 	case receiverCommandPipeline:
 		return executeReceiverPipeline(ctx, stdin, stdout, stderr, plan.pipeline)
 	case receiverCommandBatch:
 		for _, item := range plan.batch {
-			if err := executeReceiverCommandPlan(ctx, forcedCommandConfig{
-				Policy: cfg.Policy,
-				Stdin:  stdin,
-				Stdout: stdout,
-				Stderr: stderr,
+			if err := executeReceiverCommandPlan(ctx, commandStreams{
+				stdin:  stdin,
+				stdout: stdout,
+				stderr: stderr,
 			}, item); err != nil {
 				return err
 			}
@@ -149,7 +152,7 @@ func waitReceiverCommands(cmds []*exec.Cmd) {
 func commandExitError(err error) error {
 	var exitErr *exec.ExitError
 	if errors.As(err, &exitErr) {
-		return forcedCommandExitError{code: exitErr.ExitCode()}
+		return exitError{code: exitErr.ExitCode()}
 	}
 	return err
 }

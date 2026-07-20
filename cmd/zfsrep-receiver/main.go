@@ -40,7 +40,10 @@ func main() {
 
 	if len(os.Args) > 1 && os.Args[1] == "exec" {
 		if err := runForcedCommandFromArgs(ctx, os.Args[2:]); err != nil {
-			var exitErr forcedCommandExitError
+			var exitErr interface {
+				error
+				ExitCode() int
+			}
 			if errors.As(err, &exitErr) {
 				if exitErr.Error() != "" {
 					fmt.Fprintln(os.Stderr, exitErr)
