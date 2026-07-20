@@ -3,17 +3,26 @@ package main
 import (
 	"bytes"
 	"context"
-	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	zfsv1 "github.com/mathias/zfsreplicationcontroller/api/v1alpha1"
 	"github.com/mathias/zfsreplicationcontroller/internal/receiverauthorization"
 )
 
-const testReceiverPolicyID = "policy-0123456789abcdef0123456789abcdef"
+const (
+	testReceiverTaskUID  = "11111111-2222-3333-4444-555555555555"
+	testReceiverPolicyID = "grant-666ff6ccaa5b3c07feaa3a95d3a4bd2c46ac9e9abdb09ca9133528d3dc1e8952"
+)
+
+type receiverCommandPolicy struct {
+	TargetDataset string
+	zfsv1.ReceiveTaskPolicy
+}
 
 func TestModuleAdmissionAllowsSyncoidTargetCommands(t *testing.T) {
 	policy := testReceiverPolicy("tank/dst", zfsv1.ReceiveTaskPolicy{
@@ -290,49 +299,6 @@ func TestModuleAdmissionAllowsForceDeletePolicy(t *testing.T) {
 	}
 }
 
-func TestWriteReceiverPoliciesUsesPolicyIDsAndDoesNotFollowSymlinks(t *testing.T) {
-	dir := t.TempDir()
-	outside := filepath.Join(t.TempDir(), "outside.json")
-	if err := os.WriteFile(outside, []byte("outside\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	id := "policy-0123456789abcdef0123456789abcdef"
-	if err := os.Symlink(outside, filepath.Join(dir, id+".json")); err != nil {
-		t.Fatal(err)
-	}
-
-	err := writeReceiverPolicies(dir, map[string]receiverCommandPolicy{
-		id: testReceiverPolicy("tank/dst", zfsv1.ReceiveTaskPolicy{
-			ReceiveUnmounted: true,
-			Compression:      "none",
-		}),
-	})
-	if err != nil {
-		t.Fatalf("writeReceiverPolicies() error = %v", err)
-	}
-	data, err := os.ReadFile(outside)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(data) != "outside\n" {
-		t.Fatalf("symlink target was overwritten: %q", data)
-	}
-	info, err := os.Lstat(filepath.Join(dir, id+".json"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if info.Mode()&os.ModeSymlink != 0 {
-		t.Fatalf("policy path is still a symlink: %s", info.Mode())
-	}
-	if got := info.Mode().Perm(); got != 0o600 {
-		t.Fatalf("policy mode = %o, want 0600", got)
-	}
-
-	if err := writeReceiverPolicies(dir, map[string]receiverCommandPolicy{"../escape": {TargetDataset: "tank/dst"}}); err == nil {
-		t.Fatal("writeReceiverPolicies() error = nil, want unsafe policy ID rejection")
-	}
-}
-
 func TestModuleAdmissionUsesCompressionPolicy(t *testing.T) {
 	policy := testReceiverPolicy("tank/dst", zfsv1.ReceiveTaskPolicy{
 		ReceiveUnmounted: true,
@@ -417,12 +383,12 @@ func TestPlanExecuteEmulatesProcessList(t *testing.T) {
 func TestRunForcedCommandRejectsMissingOriginalCommand(t *testing.T) {
 	dir := t.TempDir()
 	policy := testReceiverPolicy("tank/dst", zfsv1.ReceiveTaskPolicy{Compression: "none"})
-	if err := writeReceiverPolicies(dir, map[string]receiverCommandPolicy{testReceiverPolicyID: policy}); err != nil {
+	if err := activateReceiverPolicyFixture(dir, policy); err != nil {
 		t.Fatal(err)
 	}
 	err := runForcedCommand(context.Background(), forcedCommandConfig{
-		Authorization:   receiverauthorization.New(dir),
-		Reference:       testAuthorizationReference(t),
+		Authorization:   receiverauthorization.New(testManifestPath(dir)),
+		Reference:       testAuthorizationReference(t, dir),
 		OriginalCommand: "",
 	})
 	if err == nil {
@@ -433,14 +399,14 @@ func TestRunForcedCommandRejectsMissingOriginalCommand(t *testing.T) {
 func TestRunForcedCommandUsesOpaqueAuthorizationReference(t *testing.T) {
 	dir := t.TempDir()
 	policy := testReceiverPolicy("tank/dst", zfsv1.ReceiveTaskPolicy{Compression: "none"})
-	if err := writeReceiverPolicies(dir, map[string]receiverCommandPolicy{testReceiverPolicyID: policy}); err != nil {
+	if err := activateReceiverPolicyFixture(dir, policy); err != nil {
 		t.Fatal(err)
 	}
 	var stdout bytes.Buffer
 
 	err := runForcedCommand(context.Background(), forcedCommandConfig{
-		Authorization:   receiverauthorization.New(dir),
-		Reference:       testAuthorizationReference(t),
+		Authorization:   receiverauthorization.New(testManifestPath(dir)),
+		Reference:       testAuthorizationReference(t, dir),
 		OriginalCommand: "echo -n hello",
 		Stdout:          &stdout,
 	})
@@ -462,33 +428,58 @@ func testReceiverPolicy(targetDataset string, policy zfsv1.ReceiveTaskPolicy) re
 func admitReceiverCommand(t *testing.T, raw string, policy receiverCommandPolicy) (receiverauthorization.Plan, error) {
 	t.Helper()
 	dir := t.TempDir()
-	data, err := json.Marshal(policy)
-	if err != nil {
+	if err := activateReceiverPolicyFixture(dir, policy); err != nil {
 		t.Fatal(err)
 	}
-	var fields map[string]json.RawMessage
-	if err := json.Unmarshal(data, &fields); err != nil {
-		t.Fatal(err)
-	}
-	fields["allowMount"] = json.RawMessage("false")
-	if policy.AllowMount {
-		fields["allowMount"] = json.RawMessage("true")
-	}
-	data, err = json.Marshal(fields)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, testReceiverPolicyID+".json"), data, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	return receiverauthorization.New(dir).Admit(testAuthorizationReference(t), raw)
+	return receiverauthorization.New(testManifestPath(dir)).Admit(testAuthorizationReference(t, dir), raw)
 }
 
-func testAuthorizationReference(t *testing.T) receiverauthorization.Reference {
+func testAuthorizationReference(t *testing.T, dir string) receiverauthorization.Reference {
 	t.Helper()
-	reference, err := receiverauthorization.ReferenceFromArgs([]string{"--policy-id", testReceiverPolicyID})
+	data, err := os.ReadFile(testManifestPath(dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	header := strings.Fields(strings.SplitN(string(data), "\n", 2)[0])
+	if len(header) != 3 {
+		t.Fatalf("manifest header = %q, want snapshot identity", data)
+	}
+	reference, err := receiverauthorization.ReferenceFromArgs([]string{"--snapshot-id", header[2], "--grant-id", testReceiverPolicyID})
 	if err != nil {
 		t.Fatal(err)
 	}
 	return reference
+}
+
+func activateReceiverPolicyFixture(dir string, policy receiverCommandPolicy) error {
+	candidate := receiverauthorization.Candidate{
+		TaskUID:                    testReceiverTaskUID,
+		AuthorizedPublicKey:        validReceiverPublicKey,
+		ExpiresAt:                  time.Now().Add(10 * time.Minute),
+		TargetDataset:              policy.TargetDataset,
+		ReceiveUnmounted:           policy.ReceiveUnmounted,
+		ReceiveResumable:           policy.ReceiveResumable,
+		AllowRollback:              policy.AllowRollback,
+		AllowDestroy:               policy.AllowDestroy,
+		AllowMount:                 policy.AllowMount,
+		AllowSyncSnapshotDestroy:   policy.AllowSyncSnapshotDestroy,
+		AllowTargetSnapshotDestroy: policy.AllowTargetSnapshotDestroy,
+		SyncSnapshotIdentifier:     policy.SyncSnapshotIdentifier,
+		Compression:                policy.Compression,
+	}
+	module := receiverauthorization.New(testManifestPath(dir))
+	activation, err := module.Replace([]receiverauthorization.Candidate{candidate})
+	if err != nil {
+		return fmt.Errorf("activate receiver policy fixture: %w", err)
+	}
+	for _, outcome := range activation.Outcomes() {
+		if outcome.Rejection != "" {
+			return fmt.Errorf("compile receiver grant: %s", outcome.Rejection)
+		}
+	}
+	return nil
+}
+
+func testManifestPath(dir string) string {
+	return filepath.Join(dir, "authorized_keys")
 }

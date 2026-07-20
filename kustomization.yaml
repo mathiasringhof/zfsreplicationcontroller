@@ -12,6 +12,8 @@ resources:
   - config/rbac/receiver_service_account.yaml
   - config/rbac/namespaced_role.yaml
   - config/rbac/namespaced_role_binding.yaml
+  - config/rbac/receiver_pod_reader_role.yaml
+  - config/rbac/receiver_pod_reader_role_binding.yaml
   - config/rbac/receiver_namespaced_role.yaml
   - config/rbac/receiver_namespaced_role_binding.yaml
   - config/manager/deployment.yaml

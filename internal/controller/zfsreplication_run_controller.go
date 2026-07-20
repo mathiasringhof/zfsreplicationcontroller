@@ -30,9 +30,11 @@ import (
 
 type ZFSReplicationRunReconciler struct {
 	client.Client
-	APIReader    client.Reader
-	Scheme       *runtime.Scheme
-	ReleaseImage string
+	APIReader         client.Reader
+	Scheme            *runtime.Scheme
+	ReleaseImage      string
+	ReceiverNamespace string
+	now               func() time.Time
 }
 
 type runReceiverStatus struct {
@@ -40,7 +42,11 @@ type runReceiverStatus struct {
 	podIP   string
 }
 
-const senderPodHostname = "zfsrep-sender"
+const (
+	senderPodHostname      = "zfsrep-sender"
+	authorizationLease     = 30 * time.Minute
+	authorizationRenewLead = 10 * time.Minute
+)
 
 func (r *ZFSReplicationRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	var run zfsv1.ZFSReplicationRun
@@ -76,6 +82,13 @@ func (r *ZFSReplicationRunReconciler) Reconcile(ctx context.Context, req ctrl.Re
 		}
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, err
 	}
+	leaseRequeueAfter, leaseMessage, err := r.reconcileRunReceiveTaskLease(ctx, &run, names)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if leaseMessage != "" {
+		return ctrl.Result{}, r.failRunObject(ctx, &run, names, leaseMessage)
+	}
 
 	receiver := runReceiverStatus{
 		podName: run.Status.ReceiverPodName,
@@ -90,7 +103,11 @@ func (r *ZFSReplicationRunReconciler) Reconcile(ctx context.Context, req ctrl.Re
 		if result, done, err := r.finishFromSenderJob(ctx, &run, names, receiver); err != nil || done {
 			return result, err
 		}
-		return ctrl.Result{RequeueAfter: 5 * time.Second}, r.patchRunStatus(ctx, &run, func(st *zfsv1.ZFSReplicationRunStatus) {
+		result := ctrl.Result{RequeueAfter: leaseRequeueAfter}
+		if result.RequeueAfter == 0 {
+			result.RequeueAfter = 5 * time.Second
+		}
+		return result, r.patchRunStatus(ctx, &run, func(st *zfsv1.ZFSReplicationRunStatus) {
 			st.Phase = zfsv1.PhaseRunning
 			st.ReceiverPodName = receiver.podName
 			st.ReceiverPodIP = receiver.podIP
@@ -115,7 +132,7 @@ func (r *ZFSReplicationRunReconciler) Reconcile(ctx context.Context, req ctrl.Re
 
 	nextReceiver, result, done, err := r.ensureSenderStarted(ctx, &run, names)
 	if err != nil || done {
-		return result, err
+		return withEarlierRequeue(result, leaseRequeueAfter), err
 	}
 	receiver = nextReceiver
 
@@ -123,7 +140,7 @@ func (r *ZFSReplicationRunReconciler) Reconcile(ctx context.Context, req ctrl.Re
 		return result, err
 	}
 
-	return ctrl.Result{RequeueAfter: 5 * time.Second}, r.patchRunStatus(ctx, &run, func(st *zfsv1.ZFSReplicationRunStatus) {
+	return withEarlierRequeue(ctrl.Result{RequeueAfter: 5 * time.Second}, leaseRequeueAfter), r.patchRunStatus(ctx, &run, func(st *zfsv1.ZFSReplicationRunStatus) {
 		st.Phase = zfsv1.PhaseRunning
 		st.ReceiverPodName = receiver.podName
 		st.ReceiverPodIP = receiver.podIP
@@ -177,6 +194,17 @@ func (r *ZFSReplicationRunReconciler) ensureSenderStarted(ctx context.Context, r
 	if initialStatus {
 		log.FromContext(ctx).Info("accepted replication run")
 	}
+	eligible, msg, err := r.receiveTaskEligibleForSender(ctx, task)
+	if err != nil {
+		return runReceiverStatus{}, ctrl.Result{}, false, err
+	}
+	if msg != "" {
+		return runReceiverStatus{}, ctrl.Result{}, true, r.failRunObject(ctx, run, names, msg)
+	}
+	if !eligible {
+		result, err := r.waitForReplicationReceiver(ctx, run, names)
+		return runReceiverStatus{}, result, true, err
+	}
 	created, recheck, err := r.ensureRunSenderJob(ctx, run, names, receiver.podIP)
 	if err != nil {
 		return runReceiverStatus{}, ctrl.Result{}, false, err
@@ -188,6 +216,27 @@ func (r *ZFSReplicationRunReconciler) ensureSenderStarted(ctx context.Context, r
 		return receiver, ctrl.Result{RequeueAfter: time.Second}, true, nil
 	}
 	return receiver, ctrl.Result{}, false, nil
+}
+
+func (r *ZFSReplicationRunReconciler) receiveTaskEligibleForSender(ctx context.Context, expected *zfsv1.ZFSReceiveTask) (bool, string, error) {
+	if r.APIReader == nil {
+		return false, "", fmt.Errorf("fresh API reader must not be nil")
+	}
+	var fresh zfsv1.ZFSReceiveTask
+	key := client.ObjectKeyFromObject(expected)
+	if err := r.APIReader.Get(ctx, key, &fresh); err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, "", nil
+		}
+		return false, "", fmt.Errorf("read current receive task %s/%s before sender creation: %w", key.Namespace, key.Name, err)
+	}
+	if fresh.UID != expected.UID {
+		return false, "", nil
+	}
+	if msg := receiveTaskLeaseRefusal(&fresh, r.controllerNow()); msg != "" {
+		return false, msg, nil
+	}
+	return true, "", nil
 }
 
 func (r *ZFSReplicationRunReconciler) finishFromSenderJob(ctx context.Context, run *zfsv1.ZFSReplicationRun, names runObjects, receiver runReceiverStatus) (ctrl.Result, bool, error) {
@@ -297,7 +346,7 @@ func (r *ZFSReplicationRunReconciler) ensureRunReceiveTask(ctx context.Context, 
 	if !apierrors.IsNotFound(err) {
 		return false, err
 	}
-	expiresAt := metav1.NewTime(time.Now().Add(30 * time.Minute))
+	expiresAt := metav1.NewTime(r.controllerNow().Add(authorizationLease))
 	task := runReceiveTask(run, names, publicKey, expiresAt)
 	if err := ctrl.SetControllerReference(run, task, r.Scheme); err != nil {
 		return false, err
@@ -309,6 +358,78 @@ func (r *ZFSReplicationRunReconciler) ensureRunReceiveTask(ctx context.Context, 
 		return false, err
 	}
 	return true, nil
+}
+
+func (r *ZFSReplicationRunReconciler) reconcileRunReceiveTaskLease(ctx context.Context, run *zfsv1.ZFSReplicationRun, names runObjects) (time.Duration, string, error) {
+	if run.Status.Phase.Terminal() {
+		return 0, "", nil
+	}
+	if r.APIReader == nil {
+		return 0, "", fmt.Errorf("fresh API reader must not be nil")
+	}
+	var freshRun zfsv1.ZFSReplicationRun
+	runKey := client.ObjectKeyFromObject(run)
+	if err := r.APIReader.Get(ctx, runKey, &freshRun); err != nil {
+		if apierrors.IsNotFound(err) {
+			return 0, "", nil
+		}
+		return 0, "", fmt.Errorf("read current replication run %s/%s for lease renewal: %w", runKey.Namespace, runKey.Name, err)
+	}
+	if run.UID != "" && freshRun.UID != run.UID {
+		return 0, "", nil
+	}
+	if freshRun.Status.Phase.Terminal() {
+		return 0, "", nil
+	}
+	var task zfsv1.ZFSReceiveTask
+	key := types.NamespacedName{Name: names.ReceiveTaskName, Namespace: run.Namespace}
+	if err := r.APIReader.Get(ctx, key, &task); err != nil {
+		if apierrors.IsNotFound(err) {
+			return 0, "", nil
+		}
+		return 0, "", fmt.Errorf("read current receive task %s/%s for lease renewal: %w", key.Namespace, key.Name, err)
+	}
+	now := r.controllerNow()
+	if msg := receiveTaskLeaseRefusal(&task, now); msg != "" {
+		return 0, msg, nil
+	}
+	remaining := task.Spec.SSH.ExpiresAt.Sub(now)
+	if remaining > authorizationRenewLead {
+		return remaining - authorizationRenewLead, "", nil
+	}
+	renewedTask := task.DeepCopy()
+	renewedTask.Spec.SSH.ExpiresAt = metav1.NewTime(now.Add(authorizationLease))
+	if err := r.Update(ctx, renewedTask); err != nil {
+		return 0, "", fmt.Errorf("renew receive task %s/%s authorization lease: %w", key.Namespace, key.Name, err)
+	}
+	return authorizationLease - authorizationRenewLead, "", nil
+}
+
+func receiveTaskLeaseRefusal(task *zfsv1.ZFSReceiveTask, now time.Time) string {
+	if task.Status.Phase == zfsv1.ReceiveTaskPhaseFailed && task.Status.Error != "" {
+		return task.Status.Error
+	}
+	if task.Status.Phase.Terminal() {
+		return fmt.Sprintf("receive task is terminal with phase %s", task.Status.Phase)
+	}
+	if !task.Spec.SSH.ExpiresAt.After(now) {
+		return "receive task authorization lease has expired"
+	}
+	return ""
+}
+
+func (r *ZFSReplicationRunReconciler) controllerNow() time.Time {
+	if r.now != nil {
+		return r.now()
+	}
+	return time.Now()
+}
+
+func withEarlierRequeue(result ctrl.Result, leaseRequeueAfter time.Duration) ctrl.Result {
+	if leaseRequeueAfter > 0 && (result.RequeueAfter == 0 || leaseRequeueAfter < result.RequeueAfter) {
+		result.RequeueAfter = leaseRequeueAfter
+	}
+	return result
 }
 
 func (r *ZFSReplicationRunReconciler) ensureRunSenderJob(ctx context.Context, run *zfsv1.ZFSReplicationRun, names runObjects, receiverPodIP string) (bool, bool, error) {
@@ -353,12 +474,27 @@ func (r *ZFSReplicationRunReconciler) readyReceiveTask(ctx context.Context, run 
 	if err := r.Get(ctx, types.NamespacedName{Name: names.ReceiveTaskName, Namespace: run.Namespace}, &task); err != nil {
 		return nil, false, "", err
 	}
-	switch task.Status.Phase {
-	case zfsv1.ReceiveTaskPhaseFailed:
-		if task.Status.Error != "" {
-			return &task, false, task.Status.Error, nil
+	if task.UID == "" {
+		return &task, false, "receive task is missing its UID", nil
+	}
+	if r.APIReader == nil {
+		return nil, false, "", fmt.Errorf("fresh API reader must not be nil")
+	}
+	var fresh zfsv1.ZFSReceiveTask
+	if err := r.APIReader.Get(ctx, types.NamespacedName{Name: names.ReceiveTaskName, Namespace: run.Namespace}, &fresh); err != nil {
+		if apierrors.IsNotFound(err) {
+			return &task, false, "", nil
 		}
-		return &task, false, "receive task failed", nil
+		return nil, false, "", fmt.Errorf("read current receive task %s/%s: %w", run.Namespace, names.ReceiveTaskName, err)
+	}
+	if fresh.UID != task.UID {
+		return &task, false, "", nil
+	}
+	task = fresh
+	if msg := receiveTaskLeaseRefusal(&task, r.controllerNow()); msg != "" {
+		return &task, false, msg, nil
+	}
+	switch task.Status.Phase {
 	case zfsv1.ReceiveTaskPhaseReady:
 		if task.Status.Endpoint.Host == "" {
 			return &task, false, "receive task is Ready without endpoint host", nil
@@ -369,10 +505,49 @@ func (r *ZFSReplicationRunReconciler) readyReceiveTask(ctx context.Context, run 
 		if task.Status.SSH.HostKey == "" {
 			return &task, false, "receive task is Ready without SSH host key", nil
 		}
+		if task.Status.ReceiverPod.Name == "" {
+			return &task, false, "receive task is Ready without receiver Pod name", nil
+		}
+		if task.Status.ReceiverPod.UID == "" {
+			return &task, false, "receive task is Ready without receiver Pod UID", nil
+		}
+		podReady, err := r.exactReceiverPodReady(ctx, task.Status.ReceiverPod)
+		if err != nil {
+			return nil, false, "", err
+		}
+		if !podReady {
+			return &task, false, "", nil
+		}
 		return &task, true, "", nil
 	default:
 		return &task, false, "", nil
 	}
+}
+
+func (r *ZFSReplicationRunReconciler) exactReceiverPodReady(ctx context.Context, reported zfsv1.ReceiveTaskPodStatus) (bool, error) {
+	if r.ReceiverNamespace == "" {
+		return false, fmt.Errorf("receiver namespace must not be empty")
+	}
+	if r.APIReader == nil {
+		return false, fmt.Errorf("fresh API reader must not be nil")
+	}
+	var pod corev1.Pod
+	key := types.NamespacedName{Namespace: r.ReceiverNamespace, Name: reported.Name}
+	if err := r.APIReader.Get(ctx, key, &pod); err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("read receiver Pod %s/%s with UID %s: %w", key.Namespace, key.Name, reported.UID, err)
+	}
+	if string(pod.UID) != reported.UID || !pod.DeletionTimestamp.IsZero() {
+		return false, nil
+	}
+	for _, condition := range pod.Status.Conditions {
+		if condition.Type == corev1.PodReady {
+			return condition.Status == corev1.ConditionTrue, nil
+		}
+	}
+	return false, nil
 }
 
 func (r *ZFSReplicationRunReconciler) ensureRunKnownHosts(ctx context.Context, run *zfsv1.ZFSReplicationRun, names runObjects, task *zfsv1.ZFSReceiveTask) error {

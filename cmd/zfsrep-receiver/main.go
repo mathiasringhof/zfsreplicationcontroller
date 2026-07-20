@@ -9,18 +9,21 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
 	zfsv1 "github.com/mathias/zfsreplicationcontroller/api/v1alpha1"
+	"github.com/mathias/zfsreplicationcontroller/internal/receiverauthorization"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/event"
+	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 )
 
 type receiverConfig struct {
@@ -87,26 +90,17 @@ func run(ctx context.Context, cfg receiverConfig) error {
 	if err := os.Chmod(filepath.Dir(cfg.AuthorizedKeysFile), 0o700); err != nil {
 		return fmt.Errorf("set authorized_keys directory mode: %w", err)
 	}
-	if err := os.MkdirAll(receiverPolicyDir(cfg), 0o700); err != nil {
-		return fmt.Errorf("create receiver policy directory: %w", err)
-	}
-	if err := os.Chmod(receiverPolicyDir(cfg), 0o700); err != nil {
-		return fmt.Errorf("set receiver policy directory mode: %w", err)
-	}
+	authorization := receiverauthorization.New(cfg.AuthorizedKeysFile)
 	if err := os.MkdirAll("/run/sshd", 0o755); err != nil {
 		return fmt.Errorf("create sshd runtime directory: %w", err)
 	}
-	if err := writeAuthorizedKeys(cfg.AuthorizedKeysFile, nil); err != nil {
-		return err
+	if err := authorization.Reset(); err != nil {
+		return fmt.Errorf("reset receiver authorization: %w", err)
 	}
 	if err := ensureSSHHostKeys(ctx); err != nil {
 		return err
 	}
 	hostKey, err := readSSHHostKey()
-	if err != nil {
-		return err
-	}
-	sshdDone, err := startSSHD(ctx, cfg)
 	if err != nil {
 		return err
 	}
@@ -121,28 +115,95 @@ func run(ctx context.Context, cfg receiverConfig) error {
 	if err := corev1.AddToScheme(scheme); err != nil {
 		return err
 	}
-	kubeClient, err := client.New(ctrl.GetConfigOrDie(), client.Options{Scheme: scheme})
+	managerOptions := ctrl.Options{
+		Scheme:                 scheme,
+		Metrics:                metricsserver.Options{BindAddress: "0"},
+		HealthProbeBindAddress: "0",
+	}
+	if cfg.WatchNamespace != "" {
+		managerOptions.Cache.DefaultNamespaces = map[string]cache.Config{cfg.WatchNamespace: {}}
+	}
+	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), managerOptions)
 	if err != nil {
-		return fmt.Errorf("create kubernetes client: %w", err)
+		return fmt.Errorf("create receiver authorization manager: %w", err)
+	}
+	fatalAuthorization := make(chan error, 1)
+	authorizationReconciler := &receiverAuthorizationReconciler{
+		client:         mgr.GetClient(),
+		apiReader:      mgr.GetAPIReader(),
+		cfg:            cfg,
+		hostKey:        hostKey,
+		authorization:  authorization,
+		fatal:          fatalAuthorization,
+		now:            time.Now,
+		initialTrigger: make(chan event.GenericEvent, 1),
+		startupGate:    make(chan struct{}),
+		initialResult:  make(chan error, 1),
+	}
+	if err := authorizationReconciler.SetupWithManager(mgr); err != nil {
+		return fmt.Errorf("set up receiver authorization controller: %w", err)
+	}
+	managerDone := make(chan error, 1)
+	go func() {
+		managerDone <- mgr.Start(ctx)
+		close(managerDone)
+	}()
+	sshdDone, err := startSynchronizedAuthorizedSSHD(
+		ctx,
+		cfg,
+		mgr.GetCache().WaitForCacheSync,
+		authorizationReconciler.StartInitial,
+		startSSHD,
+	)
+	if err != nil {
+		return err
 	}
 
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
 	for {
-		if err := reconcileReceiveTasks(ctx, kubeClient, cfg, hostKey); err != nil {
-			log.Printf("reconcile receive tasks: %v", err)
-		}
 		select {
 		case <-ctx.Done():
 			return nil
+		case err := <-fatalAuthorization:
+			return err
+		case err := <-managerDone:
+			if err == nil || errors.Is(err, context.Canceled) {
+				return nil
+			}
+			return fmt.Errorf("receiver authorization manager exited: %w", err)
 		case err := <-sshdDone:
 			if err == nil || errors.Is(err, context.Canceled) {
 				return nil
 			}
 			return fmt.Errorf("sshd exited: %w", err)
-		case <-ticker.C:
 		}
 	}
+}
+
+type sshdStarter func(context.Context, receiverConfig) (<-chan error, error)
+
+func startSynchronizedAuthorizedSSHD(
+	ctx context.Context,
+	cfg receiverConfig,
+	waitForCacheSync func(context.Context) bool,
+	activateInitial func(context.Context) error,
+	start sshdStarter,
+) (<-chan error, error) {
+	if !waitForCacheSync(ctx) {
+		return nil, fmt.Errorf("synchronize receiver authorization cache")
+	}
+	return startAuthorizedSSHD(ctx, cfg, activateInitial, start)
+}
+
+func startAuthorizedSSHD(
+	ctx context.Context,
+	cfg receiverConfig,
+	activateInitial func(context.Context) error,
+	start sshdStarter,
+) (<-chan error, error) {
+	if err := activateInitial(ctx); err != nil {
+		return nil, fmt.Errorf("activate initial receiver authorization snapshot: %w", err)
+	}
+	return start(ctx, cfg)
 }
 
 func startSSHD(ctx context.Context, cfg receiverConfig) (<-chan error, error) {
@@ -188,21 +249,18 @@ Subsystem sftp internal-sftp
 `, cfg.SSHPort, cfg.AuthorizedKeysFile)
 }
 
-func reconcileReceiveTasks(ctx context.Context, kubeClient client.Client, cfg receiverConfig, hostKey string) error {
+func listReceiveTaskCandidates(ctx context.Context, kubeClient client.Client, cfg receiverConfig) ([]receiverauthorization.Candidate, []*zfsv1.ZFSReceiveTask, error) {
 	var tasks zfsv1.ZFSReceiveTaskList
 	var opts []client.ListOption
 	if cfg.WatchNamespace != "" {
 		opts = append(opts, client.InNamespace(cfg.WatchNamespace))
 	}
 	if err := kubeClient.List(ctx, &tasks, opts...); err != nil {
-		return err
+		return nil, nil, err
 	}
 
-	now := time.Now()
-	activeKeys := map[string]struct{}{}
-	activePolicies := map[string]receiverCommandPolicy{}
-	var readyTasks []*zfsv1.ZFSReceiveTask
-	var reconcileErrs []error
+	var candidates []receiverauthorization.Candidate
+	var candidateTasks []*zfsv1.ZFSReceiveTask
 	for i := range tasks.Items {
 		task := &tasks.Items[i]
 		if task.Spec.NodeName != cfg.NodeName {
@@ -211,51 +269,14 @@ func reconcileReceiveTasks(ctx context.Context, kubeClient client.Client, cfg re
 		if task.Status.Phase.Terminal() {
 			continue
 		}
-		if task.Spec.SSH.ExpiresAt.Time.Before(now) {
-			if err := patchTaskFailed(ctx, kubeClient, task, "receive task expired"); err != nil {
-				reconcileErrs = append(reconcileErrs, err)
-			}
-			continue
-		}
-		if !datasetAllowed(task.Spec.Destination.Dataset, cfg.AllowedPrefixes) {
-			if err := patchTaskFailed(ctx, kubeClient, task, "destination dataset is not allowed on this receiver"); err != nil {
-				reconcileErrs = append(reconcileErrs, err)
-			}
-			continue
-		}
-		auth, err := receiveTaskAuthorization(cfg, task)
-		if err != nil {
-			if patchErr := patchTaskFailed(ctx, kubeClient, task, err.Error()); patchErr != nil {
-				reconcileErrs = append(reconcileErrs, patchErr)
-			}
-			continue
-		}
-		activeKeys[auth.AuthorizedKey] = struct{}{}
-		activePolicies[auth.PolicyID] = auth.Policy
-		readyTasks = append(readyTasks, task)
+		candidates = append(candidates, receiveTaskCandidate(cfg, task))
+		candidateTasks = append(candidateTasks, task)
 	}
-
-	if err := writeReceiverPolicies(receiverPolicyDir(cfg), activePolicies); err != nil {
-		return err
-	}
-	keys := make([]string, 0, len(activeKeys))
-	for key := range activeKeys {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	if err := writeAuthorizedKeys(cfg.AuthorizedKeysFile, keys); err != nil {
-		return err
-	}
-	for _, task := range readyTasks {
-		if err := patchTaskReady(ctx, kubeClient, task, cfg, hostKey); err != nil {
-			reconcileErrs = append(reconcileErrs, err)
-		}
-	}
-	return errors.Join(reconcileErrs...)
+	return candidates, candidateTasks, nil
 }
 
-func patchTaskReady(ctx context.Context, kubeClient client.Client, task *zfsv1.ZFSReceiveTask, cfg receiverConfig, hostKey string) error {
-	latest, ok, err := latestNonTerminalTask(ctx, kubeClient, task)
+func patchTaskReady(ctx context.Context, kubeClient client.Client, apiReader client.Reader, task *zfsv1.ZFSReceiveTask, cfg receiverConfig, hostKey string) error {
+	latest, ok, err := latestNonTerminalTask(ctx, apiReader, task)
 	if err != nil || !ok {
 		return err
 	}
@@ -275,11 +296,11 @@ func patchTaskReady(ctx context.Context, kubeClient client.Client, task *zfsv1.Z
 	copy.Status.SSH = zfsv1.ReceiveTaskSSHStatus{HostKey: hostKey}
 	copy.Status.ReceiverPod = zfsv1.ReceiveTaskPodStatus{Name: cfg.PodName, UID: cfg.PodUID}
 	copy.Status.Error = ""
-	return kubeClient.Status().Patch(ctx, copy, client.MergeFrom(task))
+	return kubeClient.Status().Patch(ctx, copy, client.MergeFromWithOptions(task, client.MergeFromWithOptimisticLock{}))
 }
 
-func patchTaskFailed(ctx context.Context, kubeClient client.Client, task *zfsv1.ZFSReceiveTask, msg string) error {
-	latest, ok, err := latestNonTerminalTask(ctx, kubeClient, task)
+func patchTaskFailed(ctx context.Context, kubeClient client.Client, apiReader client.Reader, task *zfsv1.ZFSReceiveTask, msg string) error {
+	latest, ok, err := latestNonTerminalTask(ctx, apiReader, task)
 	if err != nil || !ok {
 		return err
 	}
@@ -290,34 +311,21 @@ func patchTaskFailed(ctx context.Context, kubeClient client.Client, task *zfsv1.
 	copy := task.DeepCopy()
 	copy.Status.Phase = zfsv1.ReceiveTaskPhaseFailed
 	copy.Status.Error = msg
-	return kubeClient.Status().Patch(ctx, copy, client.MergeFrom(task))
+	return kubeClient.Status().Patch(ctx, copy, client.MergeFromWithOptions(task, client.MergeFromWithOptimisticLock{}))
 }
 
-func latestNonTerminalTask(ctx context.Context, kubeClient client.Client, task *zfsv1.ZFSReceiveTask) (*zfsv1.ZFSReceiveTask, bool, error) {
+func latestNonTerminalTask(ctx context.Context, apiReader client.Reader, task *zfsv1.ZFSReceiveTask) (*zfsv1.ZFSReceiveTask, bool, error) {
 	var latest zfsv1.ZFSReceiveTask
-	if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(task), &latest); err != nil {
+	if err := apiReader.Get(ctx, client.ObjectKeyFromObject(task), &latest); err != nil {
 		return nil, false, err
+	}
+	if latest.UID != task.UID {
+		return &latest, false, nil
 	}
 	if latest.Status.Phase.Terminal() {
 		return &latest, false, nil
 	}
 	return &latest, true, nil
-}
-
-func writeAuthorizedKeys(path string, keys []string) error {
-	tmp := path + ".tmp"
-	var content strings.Builder
-	for _, key := range keys {
-		content.WriteString(key)
-		content.WriteByte('\n')
-	}
-	if err := os.WriteFile(tmp, []byte(content.String()), 0o600); err != nil {
-		return fmt.Errorf("write authorized_keys: %w", err)
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		return fmt.Errorf("replace authorized_keys: %w", err)
-	}
-	return nil
 }
 
 func ensureSSHHostKeys(ctx context.Context) error {
@@ -344,21 +352,6 @@ func readSSHHostKey() (string, error) {
 		}
 	}
 	return "", fmt.Errorf("no ssh host public key found")
-}
-
-func datasetAllowed(dataset string, prefixes []string) bool {
-	if dataset == "" {
-		return false
-	}
-	if len(prefixes) == 0 {
-		return true
-	}
-	for _, prefix := range prefixes {
-		if dataset == prefix || strings.HasPrefix(dataset, prefix+"/") {
-			return true
-		}
-	}
-	return false
 }
 
 func getenv(key, def string) string {

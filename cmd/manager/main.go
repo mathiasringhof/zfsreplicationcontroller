@@ -55,10 +55,11 @@ func main() {
 		panic(err)
 	}
 	runReconciler := &controller.ZFSReplicationRunReconciler{
-		Client:       mgr.GetClient(),
-		APIReader:    mgr.GetAPIReader(),
-		Scheme:       scheme,
-		ReleaseImage: releaseImage,
+		Client:            mgr.GetClient(),
+		APIReader:         mgr.GetAPIReader(),
+		Scheme:            scheme,
+		ReleaseImage:      releaseImage,
+		ReceiverNamespace: os.Getenv("POD_NAMESPACE"),
 	}
 	if err := runReconciler.SetupWithManager(mgr); err != nil {
 		panic(err)

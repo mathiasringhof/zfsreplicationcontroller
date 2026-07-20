@@ -3,6 +3,7 @@ package receiverauthorization
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -14,7 +15,10 @@ import (
 	"time"
 )
 
-const testPolicyID = "policy-0123456789abcdef0123456789abcdef"
+const (
+	testTaskUID  = "11111111-2222-3333-4444-555555555555"
+	testPolicyID = "grant-666ff6ccaa5b3c07feaa3a95d3a4bd2c46ac9e9abdb09ca9133528d3dc1e8952"
+)
 
 func TestModuleAdmitsAllowedCommand(t *testing.T) {
 	dir := t.TempDir()
@@ -25,13 +29,15 @@ func TestModuleAdmitsAllowedCommand(t *testing.T) {
 		"compression":"none"
 	}`)
 
-	if _, err := New(dir).Admit(testReference(t), "zfs receive -u -s tank/dst"); err != nil {
+	if _, err := newTestModule(dir).Admit(testReference(t, dir), "zfs receive -u -s tank/dst"); err != nil {
 		t.Fatalf("Admit() error = %v, want nil", err)
 	}
 }
 
 func TestModuleAdmissionLoadsPolicyBeforeCheckingOriginalCommand(t *testing.T) {
-	_, err := New(t.TempDir()).Admit(testReference(t), "")
+	dir := t.TempDir()
+	prepareTestSnapshot(t, dir)
+	_, err := newTestModule(dir).Admit(testReference(t, dir), "")
 	if !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("Admit() error = %v, want missing policy error", err)
 	}
@@ -39,30 +45,18 @@ func TestModuleAdmissionLoadsPolicyBeforeCheckingOriginalCommand(t *testing.T) {
 
 func TestModuleAdmissionRejectsSymlinkedPolicy(t *testing.T) {
 	dir := t.TempDir()
-	target := filepath.Join(dir, "target.json")
-	if err := os.WriteFile(target, []byte(`{"targetDataset":"tank/dst","receiveUnmounted":true,"compression":"none"}`), 0o600); err != nil {
+	writeTestPolicy(t, dir, `{"targetDataset":"tank/dst","receiveUnmounted":true,"compression":"none"}`)
+	path := testGrantPath(t, dir)
+	target := filepath.Join(t.TempDir(), "target.json")
+	if err := os.Rename(path, target); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Symlink(target, filepath.Join(dir, testPolicyID+".json")); err != nil {
+	if err := os.Symlink(target, path); err != nil {
 		t.Fatal(err)
 	}
 
-	if _, err := New(dir).Admit(testReference(t), "zfs receive -u tank/dst"); err == nil {
+	if _, err := newTestModule(dir).Admit(testReference(t, dir), "zfs receive -u tank/dst"); err == nil {
 		t.Fatal("Admit() error = nil, want symlink rejection")
-	}
-}
-
-func TestModuleAdmissionPreservesLegacyMountedReceiveBehavior(t *testing.T) {
-	dir := t.TempDir()
-	writeTestPolicy(t, dir, `{
-		"targetDataset":"tank/dst",
-		"receiveUnmounted":false,
-		"receiveResumable":true,
-		"compression":"none"
-	}`)
-
-	if _, err := New(dir).Admit(testReference(t), "zfs receive -s tank/dst"); err != nil {
-		t.Fatalf("Admit() error = %v, want legacy mounted receive allowed", err)
 	}
 }
 
@@ -76,7 +70,7 @@ func TestModuleAdmissionPreservesExplicitMountedReceiveDenial(t *testing.T) {
 		"compression":"none"
 	}`)
 
-	if _, err := New(dir).Admit(testReference(t), "zfs receive -s tank/dst"); err == nil {
+	if _, err := newTestModule(dir).Admit(testReference(t, dir), "zfs receive -s tank/dst"); err == nil {
 		t.Fatal("Admit() error = nil, want mounted receive rejected")
 	}
 }
@@ -291,15 +285,55 @@ func TestPlanExecutePreservesExitCode(t *testing.T) {
 
 func writeTestPolicy(t *testing.T, dir, policy string) {
 	t.Helper()
-	path := filepath.Join(dir, testPolicyID+".json")
-	if err := os.WriteFile(path, []byte(policy), 0o600); err != nil {
+	fields := map[string]json.RawMessage{
+		"taskUID":                    json.RawMessage(`"` + testTaskUID + `"`),
+		"authorizedPublicKey":        json.RawMessage(`"` + testAuthorizedPublicKey + `"`),
+		"targetDataset":              json.RawMessage(`"tank/dst"`),
+		"receiveUnmounted":           json.RawMessage("false"),
+		"receiveResumable":           json.RawMessage("false"),
+		"allowRollback":              json.RawMessage("false"),
+		"allowDestroy":               json.RawMessage("false"),
+		"allowMount":                 json.RawMessage("false"),
+		"allowSyncSnapshotDestroy":   json.RawMessage("false"),
+		"allowTargetSnapshotDestroy": json.RawMessage("false"),
+		"syncSnapshotIdentifier":     json.RawMessage(`""`),
+		"compression":                json.RawMessage(`"none"`),
+	}
+	expiresAt, err := json.Marshal(time.Now().Add(10 * time.Minute).UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fields["expiresAt"] = expiresAt
+	var overrides map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(policy), &overrides); err != nil {
+		t.Fatal(err)
+	}
+	for name, value := range overrides {
+		fields[name] = value
+	}
+	data, err := json.Marshal(fields)
+	if err != nil {
+		t.Fatal(err)
+	}
+	compiledGrant, err := decodeGrant(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, snapshotID, err := canonicalSnapshot([]grant{compiledGrant})
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepareTestSnapshot(t, dir, snapshotID)
+	path := testGrantPath(t, dir)
+	if err := os.WriteFile(path, data, 0o600); err != nil {
 		t.Fatal(err)
 	}
 }
 
-func testReference(t *testing.T) Reference {
+func testReference(t *testing.T, dir string) Reference {
 	t.Helper()
-	reference, err := ReferenceFromArgs([]string{"--policy-id", testPolicyID})
+	snapshotID := activeSnapshotID(t, filepath.Join(dir, "authorized_keys"))
+	reference, err := ReferenceFromArgs([]string{"--snapshot-id", snapshotID, "--grant-id", testPolicyID})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -310,11 +344,46 @@ func admitTestPlan(t *testing.T, command, policy string) Plan {
 	t.Helper()
 	dir := t.TempDir()
 	writeTestPolicy(t, dir, policy)
-	plan, err := New(dir).Admit(testReference(t), command)
+	plan, err := newTestModule(dir).Admit(testReference(t, dir), command)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return plan
+}
+
+func newTestModule(dir string) Module {
+	return New(filepath.Join(dir, "authorized_keys"))
+}
+
+func prepareTestSnapshot(t *testing.T, dir string, snapshotIDs ...string) {
+	t.Helper()
+	snapshotID := ""
+	if len(snapshotIDs) == 0 {
+		var err error
+		_, snapshotID, err = canonicalSnapshot(nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+	} else {
+		snapshotID = snapshotIDs[0]
+	}
+	grantDir := filepath.Join(dir, "receiver-authorization", "generations", snapshotID, "grants")
+	if err := os.MkdirAll(grantDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	manifest := manifestHeaderPrefix + snapshotID + "\n"
+	if err := os.WriteFile(filepath.Join(dir, "authorized_keys"), []byte(manifest), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(filepath.Dir(grantDir), "authorized_keys"), []byte(manifest), 0o400); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func testGrantPath(t *testing.T, dir string) string {
+	t.Helper()
+	snapshotID := activeSnapshotID(t, filepath.Join(dir, "authorized_keys"))
+	return filepath.Join(dir, "receiver-authorization", "generations", snapshotID, "grants", testPolicyID+".json")
 }
 
 func writeScript(t *testing.T, path, content string) {

@@ -101,6 +101,38 @@ Do not upgrade while a sender Job is active. Existing Jobs and Pods are not
 replaced atomically with the manager and receiver, and cross-version operation is
 not supported.
 
+## Receiver Authorization Operations
+
+Treat each Receiver's authorization state as an immutable, complete snapshot.
+The Receiver atomically activates a new snapshot after observing the full
+node-local `ZFSReceiveTask` view; it never edits an active grant in place. An
+idle Receiver with the canonical empty snapshot is healthy and should remain
+Kubernetes-ready. A terminal or expired task removes only its own grant, so an
+unrelated replication must continue to authenticate normally.
+
+Task Ready status is eventually consistent. It records that the exact task UID
+was active on the exact reported Receiver Pod UID at the last successful status
+update; it is not the authorization decision. OpenSSH key expiry and the
+Receiver's forced-command admission are the live enforcement points. Before a
+sender Job is created, the manager also performs fresh reads of the task and
+reported Pod and requires that exact Pod to be currently ready.
+
+The task's `spec.ssh.expiresAt` is a renewable lease. The manager extends it
+monotonically while the run remains active, and the Receiver publishes the
+renewed grant in a new snapshot. If control-plane access or renewal fails long
+enough to cross the deadline, new SSH authentication fails closed even when a
+Ready status update cannot be persisted. Already-admitted receive commands are
+allowed to finish; later commands and lapsed or terminal tasks are denied.
+
+When diagnosing a wait at `StartingReceiver`, inspect the task and the exact Pod
+it reports together:
+
+```sh
+kubectl -n zfsreplication get zfsreceivetask <task> -o yaml
+kubectl -n zfsreplication-system get pod <reported-pod> -o yaml
+kubectl -n zfsreplication-system logs ds/zfs-receiver --since=15m
+```
+
 ## v0.4.0 Notes
 
 The `v0.4.0` release needs manifest updates in addition to image pins:

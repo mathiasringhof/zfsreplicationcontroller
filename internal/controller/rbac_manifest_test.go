@@ -39,6 +39,26 @@ type manifestObject struct {
 			} `yaml:"spec"`
 		} `yaml:"template"`
 	} `yaml:"spec"`
+	Rules    []manifestPolicyRule `yaml:"rules"`
+	RoleRef  manifestRoleRef      `yaml:"roleRef"`
+	Subjects []manifestSubject    `yaml:"subjects"`
+}
+
+type manifestRoleRef struct {
+	Kind string `yaml:"kind"`
+	Name string `yaml:"name"`
+}
+
+type manifestSubject struct {
+	Kind      string `yaml:"kind"`
+	Name      string `yaml:"name"`
+	Namespace string `yaml:"namespace"`
+}
+
+type manifestPolicyRule struct {
+	APIGroups []string `yaml:"apiGroups"`
+	Resources []string `yaml:"resources"`
+	Verbs     []string `yaml:"verbs"`
 }
 
 type manifestContainer struct {
@@ -97,8 +117,17 @@ type manifestTCPSocketAction struct {
 }
 
 type manifestEnvVar struct {
-	Name  string `yaml:"name"`
-	Value string `yaml:"value"`
+	Name      string               `yaml:"name"`
+	Value     string               `yaml:"value"`
+	ValueFrom manifestEnvVarSource `yaml:"valueFrom"`
+}
+
+type manifestEnvVarSource struct {
+	FieldRef manifestObjectFieldSelector `yaml:"fieldRef"`
+}
+
+type manifestObjectFieldSelector struct {
+	FieldPath string `yaml:"fieldPath"`
 }
 
 func TestControllerClusterRoleHasRequiredPermissions(t *testing.T) {
@@ -111,11 +140,7 @@ func TestControllerClusterRoleHasRequiredPermissions(t *testing.T) {
 	}
 
 	var role struct {
-		Rules []struct {
-			APIGroups []string `yaml:"apiGroups"`
-			Resources []string `yaml:"resources"`
-			Verbs     []string `yaml:"verbs"`
-		} `yaml:"rules"`
+		Rules []manifestPolicyRule `yaml:"rules"`
 	}
 	if err := yaml.Unmarshal(data, &role); err != nil {
 		t.Fatalf("parse %s: %v", rolePath, err)
@@ -173,6 +198,88 @@ func TestControllerClusterRoleHasRequiredPermissions(t *testing.T) {
 		if !contains(verbs, verb) {
 			t.Fatalf("secrets RBAC verbs = %v, missing %q", verbs, verb)
 		}
+	}
+}
+
+func TestRenderedControllerPodReadRBACIsLeastPrivilege(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		path     string
+		roleKind string
+	}{
+		{name: "cluster-wide", path: filepath.Join("..", "..", "config"), roleKind: "ClusterRole"},
+		{name: "namespaced", path: filepath.Join("..", ".."), roleKind: "Role"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			objects := renderKustomize(t, tt.path)
+			var role *manifestObject
+			var manager *manifestContainer
+			for i := range objects {
+				obj := &objects[i]
+				if obj.Kind == tt.roleKind && obj.Metadata.Name == "zfsreplication-controller" {
+					role = obj
+				}
+				if obj.Kind == "Deployment" && obj.Metadata.Name == "zfsreplication-controller" {
+					manager = findContainer(obj.Spec.Template.Spec.Containers, "manager")
+				}
+			}
+			if role == nil {
+				t.Fatalf("rendered %s has no zfsreplication-controller %s", tt.name, tt.roleKind)
+			}
+
+			podVerbs := verbsForResource(role.Rules, "", "pods")
+			for _, verb := range []string{"get", "list", "watch"} {
+				if !contains(podVerbs, verb) {
+					t.Fatalf("rendered %s Pod verbs = %v, missing read verb %q", tt.name, podVerbs, verb)
+				}
+			}
+			for _, verb := range []string{"create", "update", "patch"} {
+				if contains(podVerbs, verb) {
+					t.Fatalf("rendered %s Pod verbs = %v, includes unnecessary mutation verb %q", tt.name, podVerbs, verb)
+				}
+			}
+			if logVerbs := verbsForResource(role.Rules, "", "pods/log"); len(logVerbs) != 0 {
+				t.Fatalf("rendered %s pods/log verbs = %v, want none", tt.name, logVerbs)
+			}
+			if manager == nil {
+				t.Fatalf("rendered %s has no manager container", tt.name)
+			}
+			podNamespace := findManifestEnv(manager.Env, "POD_NAMESPACE")
+			if podNamespace == nil || podNamespace.ValueFrom.FieldRef.FieldPath != "metadata.namespace" {
+				t.Fatalf("rendered %s POD_NAMESPACE = %#v, want metadata.namespace fieldRef", tt.name, podNamespace)
+			}
+
+			if tt.name == "namespaced" {
+				var receiverPodRole *manifestObject
+				var receiverPodBinding *manifestObject
+				for i := range objects {
+					obj := &objects[i]
+					if obj.Kind == "Role" && obj.Metadata.Name == "zfsreplication-controller-receiver-pod-reader" {
+						receiverPodRole = obj
+					}
+					if obj.Kind == "RoleBinding" && obj.Metadata.Name == "zfsreplication-controller-receiver-pod-reader" {
+						receiverPodBinding = obj
+					}
+				}
+				if receiverPodRole == nil {
+					t.Fatal("rendered namespaced install has no Receiver Pod reader Role")
+				}
+				if got := verbsForResource(receiverPodRole.Rules, "", "pods"); !slices.Equal(got, []string{"get"}) {
+					t.Fatalf("rendered Receiver Pod reader verbs = %v, want [get]", got)
+				}
+				assertRenderedRoleBinding(t, receiverPodBinding, "Role", receiverPodRole.Metadata.Name)
+			} else {
+				var binding *manifestObject
+				for i := range objects {
+					obj := &objects[i]
+					if obj.Kind == "ClusterRoleBinding" && obj.Metadata.Name == "zfsreplication-controller" {
+						binding = obj
+						break
+					}
+				}
+				assertRenderedRoleBinding(t, binding, "ClusterRole", role.Metadata.Name)
+			}
+		})
 	}
 }
 
@@ -281,11 +388,7 @@ func TestNamespacedRBACRestrictsWorkloadPermissionsToWatchedNamespace(t *testing
 		Metadata struct {
 			Namespace string `yaml:"namespace"`
 		} `yaml:"metadata"`
-		Rules []struct {
-			APIGroups []string `yaml:"apiGroups"`
-			Resources []string `yaml:"resources"`
-			Verbs     []string `yaml:"verbs"`
-		} `yaml:"rules"`
+		Rules []manifestPolicyRule `yaml:"rules"`
 	}
 	if err := yaml.Unmarshal(data, &role); err != nil {
 		t.Fatalf("parse %s: %v", rolePath, err)
@@ -336,11 +439,7 @@ func TestReceiverNamespacedRBACRestrictsTaskPermissionsToWatchedNamespace(t *tes
 		Metadata struct {
 			Namespace string `yaml:"namespace"`
 		} `yaml:"metadata"`
-		Rules []struct {
-			APIGroups []string `yaml:"apiGroups"`
-			Resources []string `yaml:"resources"`
-			Verbs     []string `yaml:"verbs"`
-		} `yaml:"rules"`
+		Rules []manifestPolicyRule `yaml:"rules"`
 	}
 	if err := yaml.Unmarshal(data, &role); err != nil {
 		t.Fatalf("parse %s: %v", rolePath, err)
@@ -390,6 +489,8 @@ func TestNamespacedOverlayUsesNamespacedRBACAndWatchNamespace(t *testing.T) {
 		"config/crd/zfsreplication.ringhof.io_zfsreceivetasks.yaml",
 		"config/rbac/namespaced_role.yaml",
 		"config/rbac/namespaced_role_binding.yaml",
+		"config/rbac/receiver_pod_reader_role.yaml",
+		"config/rbac/receiver_pod_reader_role_binding.yaml",
 		"config/rbac/receiver_namespaced_role.yaml",
 		"config/rbac/receiver_namespaced_role_binding.yaml",
 		"config/receiver/daemonset.yaml",
@@ -669,8 +770,11 @@ func TestReceiveTaskCRDSchemaExposesMVP1Fields(t *testing.T) {
 	if status.Properties["ssh"].Properties["hostKey"].Type != "string" {
 		t.Fatalf("ssh.hostKey schema = %#v", status.Properties["ssh"].Properties["hostKey"])
 	}
-	if !hasValidationRule(spec.XKubernetesValidations, "self == oldSelf", "spec is immutable") {
-		t.Fatalf("receive task spec validations = %#v, want immutable spec rule", spec.XKubernetesValidations)
+	if !hasValidationRule(spec.XKubernetesValidations, "self.runRef == oldSelf.runRef && self.nodeName == oldSelf.nodeName && self.destination == oldSelf.destination && self.policy == oldSelf.policy && self.ssh.authorizedPublicKey == oldSelf.ssh.authorizedPublicKey", "only spec.ssh.expiresAt may change") {
+		t.Fatalf("receive task spec validations = %#v, want all fields except expiresAt immutable", spec.XKubernetesValidations)
+	}
+	if !hasValidationRule(spec.XKubernetesValidations, "timestamp(self.ssh.expiresAt) >= timestamp(oldSelf.ssh.expiresAt)", "spec.ssh.expiresAt may only move forward") {
+		t.Fatalf("receive task spec validations = %#v, want monotonic expiresAt rule", spec.XKubernetesValidations)
 	}
 }
 
@@ -710,11 +814,7 @@ func TestScheduleCRDSchemaExposesSyncoidDeleteTargetSnapshots(t *testing.T) {
 	}
 }
 
-func verbsForResource(rules []struct {
-	APIGroups []string `yaml:"apiGroups"`
-	Resources []string `yaml:"resources"`
-	Verbs     []string `yaml:"verbs"`
-}, apiGroup, resource string) []string {
+func verbsForResource(rules []manifestPolicyRule, apiGroup, resource string) []string {
 	for _, rule := range rules {
 		if contains(rule.APIGroups, apiGroup) && contains(rule.Resources, resource) {
 			return rule.Verbs
@@ -739,6 +839,29 @@ func manifestEnvValue(env []manifestEnvVar, name string) string {
 		}
 	}
 	return ""
+}
+
+func findManifestEnv(env []manifestEnvVar, name string) *manifestEnvVar {
+	for i := range env {
+		if env[i].Name == name {
+			return &env[i]
+		}
+	}
+	return nil
+}
+
+func assertRenderedRoleBinding(t *testing.T, binding *manifestObject, roleKind, roleName string) {
+	t.Helper()
+	if binding == nil {
+		t.Fatalf("rendered manifests have no binding for %s %s", roleKind, roleName)
+	}
+	if binding.RoleRef.Kind != roleKind || binding.RoleRef.Name != roleName {
+		t.Fatalf("rendered binding roleRef = %#v, want %s %s", binding.RoleRef, roleKind, roleName)
+	}
+	want := manifestSubject{Kind: "ServiceAccount", Name: "zfsreplication-controller", Namespace: "zfsreplication-system"}
+	if !slices.Contains(binding.Subjects, want) {
+		t.Fatalf("rendered binding subjects = %#v, missing %#v", binding.Subjects, want)
+	}
 }
 
 func renderKustomize(t *testing.T, path string) []manifestObject {

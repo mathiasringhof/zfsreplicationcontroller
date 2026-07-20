@@ -33,8 +33,10 @@ spec:
             spec:
               type: object
               x-kubernetes-validations:
-                - rule: "self == oldSelf"
-                  message: "spec is immutable"
+                - rule: "self.runRef == oldSelf.runRef && self.nodeName == oldSelf.nodeName && self.destination == oldSelf.destination && self.policy == oldSelf.policy && self.ssh.authorizedPublicKey == oldSelf.ssh.authorizedPublicKey"
+                  message: "only spec.ssh.expiresAt may change"
+                - rule: "timestamp(self.ssh.expiresAt) >= timestamp(oldSelf.ssh.expiresAt)"
+                  message: "spec.ssh.expiresAt may only move forward"
               required:
                 - runRef
                 - nodeName

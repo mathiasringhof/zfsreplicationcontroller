@@ -33,7 +33,10 @@ func TestRunReconcileSenderJobUsesSyncoidOptions(t *testing.T) {
 	run := replicationRun("manual-1")
 	run.Spec.Syncoid.DeleteTargetSnapshots = ptr(true)
 	names := objectNamesForRun(run.Name)
-	r := newRunReconciler(t, run, readyReceiveTask(run, names, "10.0.0.42", testReceiverHostKey))
+	task := readyReceiveTask(run, names, "10.0.0.42", testReceiverHostKey)
+	pod := readyReceiverPodForTask(task)
+	r := newRunReconciler(t, run, task, pod)
+	r.APIReader = newRunAPIReader(t, run, task, pod)
 	if _, err := r.Reconcile(context.Background(), request("manual-1")); err != nil {
 		t.Fatal(err)
 	}
@@ -135,10 +138,12 @@ func TestKnownHostsLineRejectsInvalidHostKey(t *testing.T) {
 }
 
 func TestRunReconcileCreatesReceiveTaskBeforeSenderJob(t *testing.T) {
+	now := time.Date(2026, 7, 20, 12, 0, 0, 0, time.UTC)
 	run := replicationRun("manual-1")
 	run.Spec.Syncoid.DeleteTargetSnapshots = ptr(true)
 	names := objectNamesForRun(run.Name)
 	r := newRunReconciler(t, run)
+	r.now = func() time.Time { return now }
 
 	result, err := r.Reconcile(context.Background(), request("manual-1"))
 	if err != nil {
@@ -164,6 +169,9 @@ func TestRunReconcileCreatesReceiveTaskBeforeSenderJob(t *testing.T) {
 	if task.Spec.SSH.AuthorizedPublicKey == "" {
 		t.Fatal("task authorized public key is empty")
 	}
+	if want := now.Add(30 * time.Minute); !task.Spec.SSH.ExpiresAt.Time.Equal(want) {
+		t.Fatalf("task expiresAt = %s, want controller time plus 30 minutes %s", task.Spec.SSH.ExpiresAt.Time, want)
+	}
 	if task.Spec.Policy.AllowRollback {
 		t.Fatal("task allows rollback by default")
 	}
@@ -186,12 +194,422 @@ func TestRunReconcileCreatesReceiveTaskBeforeSenderJob(t *testing.T) {
 		t.Fatalf("task sync snapshot identifier = %q, want non-empty shell-safe identifier", task.Spec.Policy.SyncSnapshotIdentifier)
 	}
 	assertObjectDeleted(t, r.Client, &batchv1.Job{}, names.SenderName)
+	assertRunPhase(t, r.Client, run.Name, zfsv1.PhaseStartingReceiver)
+}
+
+func TestReceiveTaskLeaseSchedulesAndRenewsAtPolicyDeadline(t *testing.T) {
+	now := time.Date(2026, 7, 20, 12, 0, 0, 0, time.UTC)
+	for _, tt := range []struct {
+		name        string
+		remaining   time.Duration
+		wantExpiry  time.Time
+		wantRequeue time.Duration
+	}{
+		{
+			name:        "schedule before renewal window",
+			remaining:   11 * time.Minute,
+			wantExpiry:  now.Add(11 * time.Minute),
+			wantRequeue: time.Minute,
+		},
+		{
+			name:        "renew at ten minutes remaining",
+			remaining:   10 * time.Minute,
+			wantExpiry:  now.Add(30 * time.Minute),
+			wantRequeue: 20 * time.Minute,
+		},
+		{
+			name:        "renew inside renewal window",
+			remaining:   9 * time.Minute,
+			wantExpiry:  now.Add(30 * time.Minute),
+			wantRequeue: 20 * time.Minute,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			run := replicationRun("lease-" + strings.ReplaceAll(tt.name, " ", "-"))
+			names := objectNamesForRun(run.Name)
+			task := readyReceiveTask(run, names, "10.0.0.42", testReceiverHostKey)
+			task.Spec.SSH.ExpiresAt = metav1.NewTime(now.Add(tt.remaining))
+			r := newRunReconciler(t, run, task)
+			r.now = func() time.Time { return now }
+
+			requeueAfter, msg, err := r.reconcileRunReceiveTaskLease(context.Background(), run, names)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if msg != "" {
+				t.Fatalf("lease message = %q, want empty", msg)
+			}
+			if requeueAfter != tt.wantRequeue {
+				t.Fatalf("lease RequeueAfter = %v, want %v", requeueAfter, tt.wantRequeue)
+			}
+			var got zfsv1.ZFSReceiveTask
+			if err := r.Get(context.Background(), client.ObjectKeyFromObject(task), &got); err != nil {
+				t.Fatal(err)
+			}
+			if !got.Spec.SSH.ExpiresAt.Time.Equal(tt.wantExpiry) {
+				t.Fatalf("expiresAt = %s, want %s", got.Spec.SSH.ExpiresAt.Time, tt.wantExpiry)
+			}
+		})
+	}
+}
+
+func TestReceiveTaskLeaseRefusesLapsedAndTerminalTasks(t *testing.T) {
+	now := time.Date(2026, 7, 20, 12, 0, 0, 0, time.UTC)
+	for _, tt := range []struct {
+		name   string
+		phase  zfsv1.ReceiveTaskPhase
+		expiry time.Time
+	}{
+		{name: "lapsed", phase: zfsv1.ReceiveTaskPhaseReady, expiry: now},
+		{name: "failed", phase: zfsv1.ReceiveTaskPhaseFailed, expiry: now.Add(5 * time.Minute)},
+		{name: "completed", phase: zfsv1.ReceiveTaskPhaseCompleted, expiry: now.Add(5 * time.Minute)},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			run := replicationRun("refuse-" + tt.name)
+			names := objectNamesForRun(run.Name)
+			task := readyReceiveTask(run, names, "10.0.0.42", testReceiverHostKey)
+			task.Status.Phase = tt.phase
+			task.Spec.SSH.ExpiresAt = metav1.NewTime(tt.expiry)
+			r := newRunReconciler(t, run, task)
+			r.now = func() time.Time { return now }
+
+			_, msg, err := r.reconcileRunReceiveTaskLease(context.Background(), run, names)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if msg == "" {
+				t.Fatal("lease message is empty, want renewal refusal")
+			}
+			var got zfsv1.ZFSReceiveTask
+			if err := r.Get(context.Background(), client.ObjectKeyFromObject(task), &got); err != nil {
+				t.Fatal(err)
+			}
+			if !got.Spec.SSH.ExpiresAt.Time.Equal(tt.expiry) {
+				t.Fatalf("refused task expiresAt = %s, want unchanged %s", got.Spec.SSH.ExpiresAt.Time, tt.expiry)
+			}
+		})
+	}
+}
+
+func TestRunReconcileDoesNotRenewTaskForTerminalRun(t *testing.T) {
+	now := time.Date(2026, 7, 20, 12, 0, 0, 0, time.UTC)
+	run := replicationRun("terminal-lease")
+	run.Status.Phase = zfsv1.PhaseSucceeded
+	names := objectNamesForRun(run.Name)
+	task := readyReceiveTask(run, names, "10.0.0.42", testReceiverHostKey)
+	task.Spec.SSH.ExpiresAt = metav1.NewTime(now.Add(5 * time.Minute))
+	r := newRunReconciler(t, run, task)
+	r.now = func() time.Time { return now }
+
+	if _, err := r.Reconcile(context.Background(), request(run.Name)); err != nil {
+		t.Fatal(err)
+	}
+	var got zfsv1.ZFSReceiveTask
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(task), &got); err != nil {
+		t.Fatal(err)
+	}
+	if !got.Spec.SSH.ExpiresAt.Time.Equal(task.Spec.SSH.ExpiresAt.Time) {
+		t.Fatalf("terminal run renewed task to %s, want unchanged %s", got.Spec.SSH.ExpiresAt.Time, task.Spec.SSH.ExpiresAt.Time)
+	}
+}
+
+func TestReceiveTaskLeaseUsesFreshRunStateToRefuseTerminalRun(t *testing.T) {
+	now := time.Date(2026, 7, 20, 12, 0, 0, 0, time.UTC)
+	cachedRun := replicationRun("fresh-terminal-lease")
+	names := objectNamesForRun(cachedRun.Name)
+	task := readyReceiveTask(cachedRun, names, "10.0.0.42", testReceiverHostKey)
+	task.Spec.SSH.ExpiresAt = metav1.NewTime(now.Add(5 * time.Minute))
+	freshRun := cachedRun.DeepCopy()
+	freshRun.Status.Phase = zfsv1.PhaseSucceeded
+	r := newRunReconciler(t, cachedRun, task)
+	r.APIReader = newRunAPIReader(t, freshRun, task)
+	r.now = func() time.Time { return now }
+
+	requeueAfter, msg, err := r.reconcileRunReceiveTaskLease(context.Background(), cachedRun, names)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if requeueAfter != 0 || msg != "" {
+		t.Fatalf("terminal fresh run lease result = (%v, %q), want no renewal schedule", requeueAfter, msg)
+	}
+	var got zfsv1.ZFSReceiveTask
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(task), &got); err != nil {
+		t.Fatal(err)
+	}
+	if !got.Spec.SSH.ExpiresAt.Time.Equal(task.Spec.SSH.ExpiresAt.Time) {
+		t.Fatalf("fresh terminal run renewed task to %s, want unchanged %s", got.Spec.SSH.ExpiresAt.Time, task.Spec.SSH.ExpiresAt.Time)
+	}
+}
+
+func TestRunningRunRequeuesAtExplicitLeaseRenewalDeadline(t *testing.T) {
+	now := time.Date(2026, 7, 20, 12, 0, 0, 0, time.UTC)
+	run := replicationRun("scheduled-renewal")
+	run.Status.Phase = zfsv1.PhaseRunning
+	names := objectNamesForRun(run.Name)
+	task := readyReceiveTask(run, names, "10.0.0.42", testReceiverHostKey)
+	task.Spec.SSH.ExpiresAt = metav1.NewTime(now.Add(15 * time.Minute))
+	sender := runSenderJob(run, names, "datamover:test", task.Status.Endpoint.Host)
+	r := newRunReconciler(t, run, task, sender)
+	r.now = func() time.Time { return now }
+
+	result, err := r.Reconcile(context.Background(), request(run.Name))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.RequeueAfter != 5*time.Minute {
+		t.Fatalf("RequeueAfter = %v, want explicit renewal deadline in 5m", result.RequeueAfter)
+	}
+}
+
+func TestRunReconcileRechecksLeaseImmediatelyBeforeSenderCreation(t *testing.T) {
+	now := time.Date(2026, 7, 20, 12, 0, 0, 0, time.UTC)
+	run := replicationRun("sender-lease-recheck")
+	names := objectNamesForRun(run.Name)
+	task := readyReceiveTask(run, names, "10.0.0.42", testReceiverHostKey)
+	task.Spec.SSH.ExpiresAt = metav1.NewTime(now.Add(15 * time.Minute))
+	pod := readyReceiverPodForTask(task)
+	r := newRunReconciler(t, run, task, pod)
+	r.now = func() time.Time { return now }
+	freshReads := 0
+	r.APIReader = fake.NewClientBuilder().
+		WithScheme(newTestScheme(t)).
+		WithStatusSubresource(&zfsv1.ZFSReplicationRun{}, &zfsv1.ZFSReceiveTask{}).
+		WithObjects(run, task, pod).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+				if got, ok := obj.(*zfsv1.ZFSReceiveTask); ok {
+					freshReads++
+					if freshReads == 3 {
+						copy := task.DeepCopy()
+						copy.Spec.SSH.ExpiresAt = metav1.NewTime(now)
+						*got = *copy
+						return nil
+					}
+				}
+				return c.Get(ctx, key, obj, opts...)
+			},
+		}).Build()
+
+	if _, err := r.Reconcile(context.Background(), request(run.Name)); err != nil {
+		t.Fatal(err)
+	}
+	if freshReads < 3 {
+		t.Fatalf("fresh receive task reads = %d, want final pre-sender check", freshReads)
+	}
+	assertObjectDeleted(t, r.Client, &batchv1.Job{}, names.SenderName)
+	assertRunPhase(t, r.Client, run.Name, zfsv1.PhaseFailed)
+}
+
+func TestRunReconcileGatesSenderCreationOnFreshExactReadyReceiverPod(t *testing.T) {
+	for _, tt := range []struct {
+		name       string
+		mutateTask func(*zfsv1.ZFSReceiveTask)
+		pod        func(*zfsv1.ZFSReceiveTask) *corev1.Pod
+		wantPhase  zfsv1.Phase
+	}{
+		{
+			name:      "missing Pod",
+			wantPhase: zfsv1.PhaseStartingReceiver,
+		},
+		{
+			name: "missing task UID",
+			mutateTask: func(task *zfsv1.ZFSReceiveTask) {
+				task.UID = ""
+			},
+			wantPhase: zfsv1.PhaseFailed,
+		},
+		{
+			name: "Pod UID mismatch",
+			pod: func(task *zfsv1.ZFSReceiveTask) *corev1.Pod {
+				pod := readyReceiverPodForTask(task)
+				pod.UID = "replacement-pod-uid"
+				return pod
+			},
+			wantPhase: zfsv1.PhaseStartingReceiver,
+		},
+		{
+			name: "Pod unready after container restart",
+			pod: func(task *zfsv1.ZFSReceiveTask) *corev1.Pod {
+				pod := readyReceiverPodForTask(task)
+				pod.Status.Conditions[0].Status = corev1.ConditionFalse
+				return pod
+			},
+			wantPhase: zfsv1.PhaseStartingReceiver,
+		},
+		{
+			name: "Pod Ready condition missing",
+			pod: func(task *zfsv1.ZFSReceiveTask) *corev1.Pod {
+				pod := readyReceiverPodForTask(task)
+				pod.Status.Conditions = nil
+				return pod
+			},
+			wantPhase: zfsv1.PhaseStartingReceiver,
+		},
+		{
+			name: "expired task lease",
+			mutateTask: func(task *zfsv1.ZFSReceiveTask) {
+				task.Spec.SSH.ExpiresAt = metav1.NewTime(time.Now().Add(-time.Second))
+			},
+			pod:       readyReceiverPodForTask,
+			wantPhase: zfsv1.PhaseFailed,
+		},
+		{
+			name: "missing endpoint host",
+			mutateTask: func(task *zfsv1.ZFSReceiveTask) {
+				task.Status.Endpoint.Host = ""
+			},
+			wantPhase: zfsv1.PhaseFailed,
+		},
+		{
+			name: "missing endpoint port",
+			mutateTask: func(task *zfsv1.ZFSReceiveTask) {
+				task.Status.Endpoint.Port = 0
+			},
+			wantPhase: zfsv1.PhaseFailed,
+		},
+		{
+			name: "missing host key",
+			mutateTask: func(task *zfsv1.ZFSReceiveTask) {
+				task.Status.SSH.HostKey = ""
+			},
+			wantPhase: zfsv1.PhaseFailed,
+		},
+		{
+			name: "missing receiver Pod name",
+			mutateTask: func(task *zfsv1.ZFSReceiveTask) {
+				task.Status.ReceiverPod.Name = ""
+			},
+			wantPhase: zfsv1.PhaseFailed,
+		},
+		{
+			name: "missing receiver Pod UID",
+			mutateTask: func(task *zfsv1.ZFSReceiveTask) {
+				task.Status.ReceiverPod.UID = ""
+			},
+			wantPhase: zfsv1.PhaseFailed,
+		},
+		{
+			name: "terminating Pod",
+			pod: func(task *zfsv1.ZFSReceiveTask) *corev1.Pod {
+				pod := readyReceiverPodForTask(task)
+				now := metav1.Now()
+				pod.DeletionTimestamp = &now
+				pod.Finalizers = []string{"test.example/finalizer"}
+				return pod
+			},
+			wantPhase: zfsv1.PhaseStartingReceiver,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			run := replicationRun("manual-gate-" + strings.ReplaceAll(tt.name, " ", "-"))
+			names := objectNamesForRun(run.Name)
+			task := readyReceiveTask(run, names, "10.0.0.42", testReceiverHostKey)
+			if tt.mutateTask != nil {
+				tt.mutateTask(task)
+			}
+			objects := []client.Object{run, task}
+			if tt.pod != nil {
+				objects = append(objects, tt.pod(task))
+			}
+			r := newRunReconciler(t, objects...)
+
+			if _, err := r.Reconcile(context.Background(), request(run.Name)); err != nil {
+				t.Fatal(err)
+			}
+
+			assertObjectDeleted(t, r.Client, &batchv1.Job{}, names.SenderName)
+			var got zfsv1.ZFSReplicationRun
+			if err := r.Get(context.Background(), request(run.Name).NamespacedName, &got); err != nil {
+				t.Fatal(err)
+			}
+			if got.Status.Phase != tt.wantPhase {
+				t.Fatalf("run phase = %q, want safe path %q", got.Status.Phase, tt.wantPhase)
+			}
+		})
+	}
+}
+
+func TestRunReconcileRejectsStaleReadyTaskIncarnation(t *testing.T) {
+	run := replicationRun("manual-stale-task")
+	names := objectNamesForRun(run.Name)
+	stale := readyReceiveTask(run, names, "10.0.0.42", testReceiverHostKey)
+	live := stale.DeepCopy()
+	live.UID = "replacement-task-uid"
+	live.Status = zfsv1.ZFSReceiveTaskStatus{Phase: zfsv1.ReceiveTaskPhasePending}
+	pod := readyReceiverPodForTask(stale)
+	r := newRunReconciler(t, run, stale, pod)
+	r.APIReader = newRunAPIReader(t, run, live, pod)
+
+	if _, err := r.Reconcile(context.Background(), request(run.Name)); err != nil {
+		t.Fatal(err)
+	}
+
+	assertObjectDeleted(t, r.Client, &batchv1.Job{}, names.SenderName)
+	assertRunPhase(t, r.Client, run.Name, zfsv1.PhaseStartingReceiver)
+}
+
+func TestRunReconcileUsesFreshReceiverPodRead(t *testing.T) {
+	run := replicationRun("manual-fresh-pod")
+	names := objectNamesForRun(run.Name)
+	task := readyReceiveTask(run, names, "10.0.0.42", testReceiverHostKey)
+	cachedReadyPod := readyReceiverPodForTask(task)
+	liveUnreadyPod := cachedReadyPod.DeepCopy()
+	liveUnreadyPod.Status.Conditions[0].Status = corev1.ConditionFalse
+	r := newRunReconciler(t, run, task, cachedReadyPod)
+	r.APIReader = newRunAPIReader(t, run, task, liveUnreadyPod)
+
+	if _, err := r.Reconcile(context.Background(), request(run.Name)); err != nil {
+		t.Fatal(err)
+	}
+
+	assertObjectDeleted(t, r.Client, &batchv1.Job{}, names.SenderName)
+	assertRunPhase(t, r.Client, run.Name, zfsv1.PhaseStartingReceiver)
+}
+
+func TestRunReconcileGetsExactReceiverPodByNamespace(t *testing.T) {
+	run := replicationRun("manual-exact-pod-get")
+	names := objectNamesForRun(run.Name)
+	task := readyReceiveTask(run, names, "10.0.0.42", testReceiverHostKey)
+	pod := readyReceiverPodForTask(task)
+	r := newRunReconciler(t, run, task, pod)
+	r.APIReader = fake.NewClientBuilder().
+		WithScheme(newTestScheme(t)).
+		WithStatusSubresource(&zfsv1.ZFSReplicationRun{}, &zfsv1.ZFSReceiveTask{}).
+		WithObjects(run, task, pod).
+		WithInterceptorFuncs(interceptor.Funcs{
+			List: func(context.Context, client.WithWatch, client.ObjectList, ...client.ListOption) error {
+				return errors.New("cluster-wide Pod list is not authorized")
+			},
+		}).
+		Build()
+
+	if _, err := r.Reconcile(context.Background(), request(run.Name)); err != nil {
+		t.Fatal(err)
+	}
+
+	assertObjectExists(t, r.Client, &batchv1.Job{}, names.SenderName)
+}
+
+func TestRunReconcileFailsClosedWithoutFreshReader(t *testing.T) {
+	run := replicationRun("manual-no-fresh-reader")
+	names := objectNamesForRun(run.Name)
+	task := readyReceiveTask(run, names, "10.0.0.42", testReceiverHostKey)
+	pod := readyReceiverPodForTask(task)
+	r := newRunReconciler(t, run, task, pod)
+	r.APIReader = nil
+
+	if _, err := r.Reconcile(context.Background(), request(run.Name)); err == nil || !strings.Contains(err.Error(), "fresh API reader") {
+		t.Fatalf("Reconcile() error = %v, want missing fresh API reader", err)
+	}
+
+	assertObjectDeleted(t, r.Client, &batchv1.Job{}, names.SenderName)
 }
 
 func TestRunReconcileLogsReceiverAndSenderLifecycle(t *testing.T) {
 	run := replicationRun("manual-logs")
 	names := objectNamesForRun(run.Name)
-	r := newRunReconciler(t, run, readyReceiveTask(run, names, "10.0.0.42", testReceiverHostKey))
+	task := readyReceiveTask(run, names, "10.0.0.42", testReceiverHostKey)
+	r := newRunReconciler(t, run, task, readyReceiverPodForTask(task))
 	ctx, logs := captureRunLogger()
 
 	if _, err := r.Reconcile(ctx, request(run.Name)); err != nil {
@@ -221,6 +639,7 @@ func TestRunReconcileDoesNotRecheckSenderJobImmediatelyAfterCreate(t *testing.T)
 	names := objectNamesForRun(run.Name)
 	jobCreated := false
 	hideCreatedJobGets := 1
+	task := readyReceiveTask(run, names, "10.0.0.42", testReceiverHostKey)
 	r := newRunReconcilerWithInterceptors(t, interceptor.Funcs{
 		Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
 			if obj.GetName() == names.SenderName {
@@ -235,7 +654,7 @@ func TestRunReconcileDoesNotRecheckSenderJobImmediatelyAfterCreate(t *testing.T)
 			}
 			return c.Get(ctx, key, obj, opts...)
 		},
-	}, run, readyReceiveTask(run, names, "10.0.0.42", testReceiverHostKey))
+	}, run, task, readyReceiverPodForTask(task))
 	ctx, logs := captureRunLogger()
 
 	result, err := r.Reconcile(ctx, request(run.Name))
@@ -274,6 +693,7 @@ func TestRunReconcileTreatsSenderJobCreateAlreadyExistsAsSuccess(t *testing.T) {
 	run := replicationRun("manual-create-exists")
 	names := objectNamesForRun(run.Name)
 	returnAlreadyExists := true
+	task := readyReceiveTask(run, names, "10.0.0.42", testReceiverHostKey)
 	r := newRunReconcilerWithInterceptors(t, interceptor.Funcs{
 		Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
 			if obj.GetName() == names.SenderName && returnAlreadyExists {
@@ -285,7 +705,7 @@ func TestRunReconcileTreatsSenderJobCreateAlreadyExistsAsSuccess(t *testing.T) {
 			}
 			return c.Create(ctx, obj, opts...)
 		},
-	}, run, readyReceiveTask(run, names, "10.0.0.42", testReceiverHostKey))
+	}, run, task, readyReceiverPodForTask(task))
 
 	if _, err := r.Reconcile(context.Background(), request(run.Name)); err != nil {
 		t.Fatalf("Reconcile() error = %v, want nil after AlreadyExists sender job create", err)
@@ -482,6 +902,14 @@ func TestRunReconcileLogsReceiverWait(t *testing.T) {
 		"senderJob":     names.SenderName,
 		"receiveTask":   names.ReceiveTaskName,
 	})
+	var task zfsv1.ZFSReceiveTask
+	if err := r.Get(context.Background(), types.NamespacedName{Name: names.ReceiveTaskName, Namespace: run.Namespace}, &task); err != nil {
+		t.Fatal(err)
+	}
+	task.UID = "task-uid"
+	if err := r.Update(context.Background(), &task); err != nil {
+		t.Fatal(err)
+	}
 
 	ctx, logs = captureRunLogger()
 	result, err = r.Reconcile(ctx, request(run.Name))
@@ -1025,6 +1453,7 @@ func readyReceiveTask(run *zfsv1.ZFSReplicationRun, names runObjects, host, host
 			Name:      names.ReceiveTaskName,
 			Namespace: run.Namespace,
 			Labels:    cloneLabels(names.Labels),
+			UID:       "task-uid",
 		},
 		Spec: zfsv1.ZFSReceiveTaskSpec{
 			RunRef:      zfsv1.LocalObjectReference{Name: run.Name},
@@ -1048,6 +1477,23 @@ func readyReceiveTask(run *zfsv1.ZFSReplicationRun, names runObjects, host, host
 			ReceiverPod: zfsv1.ReceiveTaskPodStatus{
 				Name: "zfs-receiver-worker-b",
 				UID:  "pod-uid",
+			},
+		},
+	}
+}
+
+func readyReceiverPodForTask(task *zfsv1.ZFSReceiveTask) *corev1.Pod {
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      task.Status.ReceiverPod.Name,
+			Namespace: "zfsreplication-system",
+			UID:       types.UID(task.Status.ReceiverPod.UID),
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+			PodIP: task.Status.Endpoint.Host,
+			Conditions: []corev1.PodCondition{
+				{Type: corev1.PodReady, Status: corev1.ConditionTrue},
 			},
 		},
 	}
@@ -1095,7 +1541,22 @@ func newRunReconciler(t *testing.T, objs ...client.Object) *ZFSReplicationRunRec
 	t.Helper()
 	scheme := newTestScheme(t)
 	c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&zfsv1.ZFSReplicationRun{}, &zfsv1.ZFSReceiveTask{}).WithObjects(objs...).Build()
-	return &ZFSReplicationRunReconciler{Client: c, Scheme: scheme, ReleaseImage: "datamover:test"}
+	return &ZFSReplicationRunReconciler{
+		Client:            c,
+		APIReader:         c,
+		Scheme:            scheme,
+		ReleaseImage:      "datamover:test",
+		ReceiverNamespace: "zfsreplication-system",
+	}
+}
+
+func newRunAPIReader(t *testing.T, objs ...client.Object) client.Reader {
+	t.Helper()
+	return fake.NewClientBuilder().
+		WithScheme(newTestScheme(t)).
+		WithStatusSubresource(&zfsv1.ZFSReplicationRun{}, &zfsv1.ZFSReceiveTask{}).
+		WithObjects(objs...).
+		Build()
 }
 
 func newRunReconcilerWithInterceptors(t *testing.T, funcs interceptor.Funcs, objs ...client.Object) *ZFSReplicationRunReconciler {
@@ -1107,7 +1568,13 @@ func newRunReconcilerWithInterceptors(t *testing.T, funcs interceptor.Funcs, obj
 		WithObjects(objs...).
 		WithInterceptorFuncs(funcs).
 		Build()
-	return &ZFSReplicationRunReconciler{Client: c, Scheme: scheme, ReleaseImage: "datamover:test"}
+	return &ZFSReplicationRunReconciler{
+		Client:            c,
+		APIReader:         c,
+		Scheme:            scheme,
+		ReleaseImage:      "datamover:test",
+		ReceiverNamespace: "zfsreplication-system",
+	}
 }
 
 func newScheduleReconciler(t *testing.T, now time.Time, objs ...client.Object) *ZFSReplicationScheduleReconciler {
@@ -1223,6 +1690,17 @@ func assertReceiveTaskPhase(t *testing.T, c client.Client, name string, phase zf
 	}
 	if task.Status.Phase != phase {
 		t.Fatalf("task phase = %q, want %q", task.Status.Phase, phase)
+	}
+}
+
+func assertRunPhase(t *testing.T, c client.Client, name string, phase zfsv1.Phase) {
+	t.Helper()
+	var run zfsv1.ZFSReplicationRun
+	if err := c.Get(context.Background(), types.NamespacedName{Name: name, Namespace: "storage"}, &run); err != nil {
+		t.Fatal(err)
+	}
+	if run.Status.Phase != phase {
+		t.Fatalf("run phase = %q, want %q", run.Status.Phase, phase)
 	}
 }
 

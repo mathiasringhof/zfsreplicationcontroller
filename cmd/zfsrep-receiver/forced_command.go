@@ -8,8 +8,6 @@ import (
 	"github.com/mathias/zfsreplicationcontroller/internal/receiverauthorization"
 )
 
-const receiverCommandPath = "/usr/local/bin/zfsrep-receiver"
-
 type forcedCommandConfig struct {
 	Authorization   receiverauthorization.Module
 	Reference       receiverauthorization.Reference
@@ -24,9 +22,9 @@ func runForcedCommandFromArgs(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	policyDir := receiverPolicyDir(configFromEnv())
+	authorizedKeysFile := configFromEnv().AuthorizedKeysFile
 	return runForcedCommand(ctx, forcedCommandConfig{
-		Authorization:   receiverauthorization.New(policyDir),
+		Authorization:   receiverauthorization.New(authorizedKeysFile),
 		Reference:       reference,
 		OriginalCommand: os.Getenv("SSH_ORIGINAL_COMMAND"),
 		Stdin:           os.Stdin,

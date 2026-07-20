@@ -47,6 +47,17 @@ module, and creates a file-backed `tank` pool on each worker under
 `/var/lib/zfs-real`. Override those defaults with `E2E_REAL_ZFS_POOL`,
 `E2E_REAL_ZFS_ROOT`, or `E2E_REAL_ZFS_SIZE`.
 
+The focused Receiver authorization lifecycle uses real OpenSSH clients against
+the DaemonSet endpoint. It covers activation readiness, native key expiry while
+status writes are unavailable, unrelated-grant continuity, terminal revocation,
+the canonical empty snapshot, and a fresh exact-Pod readiness check before
+sender creation:
+
+```sh
+KUBECONFIG=test/e2e/.artifacts/kubeconfig \
+  go test ./test/e2e -run '^TestE2EReceiverAuthorizationLifecycle$' -count=1 -v
+```
+
 ## Individual Steps
 
 Use these for local debugging when you intentionally want to keep a cluster

@@ -257,11 +257,29 @@ pruning scope.
 Each run gets its own SSH `Secret` and `ZFSReceiveTask`. The sender connects to
 the receiver pod address from task status, verifies the receiver host key with a
 controller-written `known_hosts` file, and the receiver accepts only active,
-unexpired per-run keys.
+unexpired per-run keys. A Receiver publishes the complete node-local grant set
+as one immutable authorization snapshot; each update atomically replaces the
+whole active snapshot, including replacement by the canonical empty snapshot
+when no grants remain.
+
+`ZFSReceiveTask.status.phase: Ready` is an eventually consistent observation
+that the exact task incarnation was active on the reported ready Receiver Pod.
+Live SSH authentication and forced-command admission remain authoritative. The
+run controller rechecks the reported Pod identity and current Kubernetes
+readiness immediately before creating a sender Job, so operators should not use
+a stale Ready status as a standalone access or health guarantee.
+
+`spec.ssh.expiresAt` is a renewable authorization lease, not a run-duration
+limit. While a run is nonterminal, the controller renews the lease before its
+deadline. If renewal stops, OpenSSH rejects new authentication at expiry and
+forced-command admission independently rejects expired grants; a command
+admitted before expiry may finish. A lapsed task is not reopened within the
+observing Receiver process, and terminal status revokes only that task's grant.
 
 After a run succeeds or fails, the controller marks the receive task Completed or
 Failed and deletes the SSH Secret. The receiver DaemonSet stops authorizing
-terminal or expired tasks. The sender Job has `ttlSecondsAfterFinished: 86400`
+terminal or expired tasks while keeping unrelated grants active and the
+node-level Receiver ready. The sender Job has `ttlSecondsAfterFinished: 86400`
 so Kubernetes can keep it briefly for inspection before TTL cleanup.
 
 Sender Jobs pin pods with `spec.template.spec.nodeName` and use a stable pod

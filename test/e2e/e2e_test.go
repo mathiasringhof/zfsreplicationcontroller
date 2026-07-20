@@ -25,6 +25,7 @@ const (
 	e2eControllerNamespace      = "zfsreplication-system"
 	e2eControllerDeploymentName = "zfsreplication-controller"
 	e2eControllerServiceAccount = "system:serviceaccount:zfsreplication-system:zfsreplication-controller"
+	e2eReceiverServiceAccount   = "system:serviceaccount:zfsreplication-system:zfs-receiver"
 
 	e2eSourceNode = "worker-a"
 	e2eTargetNode = "worker-b"
@@ -33,6 +34,7 @@ const (
 
 	e2eReceiveTaskPhaseCompleted = "Completed"
 	e2eReceiveTaskPhaseFailed    = "Failed"
+	e2eReceiveTaskPhaseReady     = "Ready"
 )
 
 func TestE2EFullAndIncrementalReplication(t *testing.T) {
@@ -78,6 +80,58 @@ func TestE2EFullAndIncrementalReplication(t *testing.T) {
 	k.assertRealZFSSyncoidSnapshots(second.SourceNode, "zfs-src-sync-snaps-"+suffix, pool, second.SourceDataset, 1)
 	k.assertRealZFSSyncoidSnapshots(second.TargetNode, "zfs-dst-sync-snaps-"+suffix, pool, second.TargetDataset, 1)
 	k.assertRunEphemeralCleanup(second.Name)
+}
+
+func TestE2EReceiverAuthorizationLifecycle(t *testing.T) {
+	k := newKubectlRunner(t)
+	suffix := uniqueSuffix()
+	firstKey := newE2ESSHKey(t, "first-"+suffix)
+	secondKey := newE2ESSHKey(t, "second-"+suffix)
+	first := receiverAuthorizationCase{
+		Name:       "e2e-auth-first-" + suffix,
+		NodeName:   e2eTargetNode,
+		Dataset:    realZFSPool() + "/auth-first-" + suffix,
+		PublicKey:  firstKey.Public,
+		PrivateKey: firstKey.Private,
+		ExpiresAt:  time.Now().Add(55 * time.Second),
+	}
+	second := receiverAuthorizationCase{
+		Name:       "e2e-auth-second-" + suffix,
+		NodeName:   e2eTargetNode,
+		Dataset:    realZFSPool() + "/auth-second-" + suffix,
+		PublicKey:  secondKey.Public,
+		PrivateKey: secondKey.Private,
+		ExpiresAt:  time.Now().Add(30 * time.Minute),
+	}
+	k.cleanupReceiverAuthorizationOnExit(first, second)
+	k.disableReceiverOnNode(e2eTargetNode)
+	t.Cleanup(func() { k.enableReceiverOnNode(e2eTargetNode) })
+	k.applyReceiverAuthorization(first)
+	k.applyReceiverAuthorization(second)
+	k.assertReceiveTaskNotReady(first.Name, 5*time.Second)
+	k.assertReceiveTaskNotReady(second.Name, 5*time.Second)
+
+	k.enableReceiverOnNode(e2eTargetNode)
+	firstReady := k.waitForReceiveTaskPhase(first.Name, e2eReceiveTaskPhaseReady, 30*time.Second)
+	secondReady := k.waitForReceiveTaskPhase(second.Name, e2eReceiveTaskPhaseReady, 30*time.Second)
+	k.assertOpenSSHAllowed(first, firstReady)
+	k.assertOpenSSHAllowed(second, secondReady)
+	secondControlPod := k.startOpenSSHControlMaster(second, secondReady)
+
+	k.suspendReceiverStatusUpdates()
+	t.Cleanup(k.restoreReceiverStatusUpdates)
+	k.waitForNativeOpenSSHRejection(first, firstReady, first.ExpiresAt.Add(20*time.Second))
+	k.assertReceiveTaskPhaseNow(first.Name, e2eReceiveTaskPhaseReady)
+	k.assertOpenSSHAllowed(second, secondReady)
+	k.assertReceiverDaemonSetAvailable()
+
+	k.patchReceiveTaskPhase(second.Name, e2eReceiveTaskPhaseCompleted)
+	k.waitForNativeOpenSSHRejection(second, secondReady, time.Now().Add(30*time.Second))
+	k.assertControlMasterAdmissionRejected(second, secondReady, secondControlPod)
+	k.assertReceiverDaemonSetAvailable()
+
+	k.restoreReceiverStatusUpdates()
+	k.verifySenderWaitsForExactReceiverPodReadiness(suffix)
 }
 
 func TestE2EExternalSnapshotsWithoutCommonBaseFails(t *testing.T) {
@@ -339,6 +393,74 @@ type replicationCase struct {
 	Annotations   map[string]string
 }
 
+type e2eSSHKey struct {
+	Private string
+	Public  string
+}
+
+type receiverAuthorizationCase struct {
+	Name       string
+	NodeName   string
+	Dataset    string
+	PublicKey  string
+	PrivateKey string
+	ExpiresAt  time.Time
+}
+
+func newE2ESSHKey(t *testing.T, comment string) e2eSSHKey {
+	t.Helper()
+	sshKeygen, err := exec.LookPath("ssh-keygen")
+	if err != nil {
+		t.Fatalf("ssh-keygen is required for the OpenSSH lifecycle test: %v", err)
+	}
+	path := filepath.Join(t.TempDir(), "id_ed25519")
+	cmd := exec.Command(sshKeygen, "-q", "-t", "ed25519", "-N", "", "-C", comment, "-f", path)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("generate OpenSSH test key: %v\n%s", err, out)
+	}
+	privateKey, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	publicKey, err := os.ReadFile(path + ".pub")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return e2eSSHKey{Private: string(privateKey), Public: strings.TrimSpace(string(publicKey))}
+}
+
+func (c receiverAuthorizationCase) manifestJSON(t *testing.T) []byte {
+	t.Helper()
+	doc := map[string]any{
+		"apiVersion": "zfsreplication.ringhof.io/v1alpha1",
+		"kind":       "ZFSReceiveTask",
+		"metadata": map[string]any{
+			"name":      c.Name,
+			"namespace": e2eNamespace,
+			"labels": map[string]any{
+				e2eLabelPrefix + "/authorization-test": c.Name,
+			},
+		},
+		"spec": map[string]any{
+			"runRef":   map[string]any{"name": c.Name},
+			"nodeName": c.NodeName,
+			"destination": map[string]any{
+				"dataset": c.Dataset,
+			},
+			"ssh": map[string]any{
+				"authorizedPublicKey": c.PublicKey,
+				"expiresAt":           c.ExpiresAt.UTC().Format(time.RFC3339Nano),
+			},
+			"policy": map[string]any{
+				"receiveUnmounted": true,
+				"receiveResumable": true,
+				"compression":      "none",
+			},
+		},
+	}
+	return manifestBytes(t, doc)
+}
+
 func (c replicationCase) snapshotName() string {
 	return c.SnapshotName
 }
@@ -448,6 +570,355 @@ func (k kubectlRunner) cleanupReplicationOnExitInNamespace(namespace, name strin
 		return
 	}
 	k.t.Cleanup(func() { k.cleanupReplicationInNamespace(namespace, name) })
+}
+
+func (k kubectlRunner) cleanupReceiverAuthorizationOnExit(cases ...receiverAuthorizationCase) {
+	k.t.Helper()
+	if os.Getenv("E2E_KEEP_RESOURCES") == "1" {
+		return
+	}
+	k.t.Cleanup(func() {
+		for _, sc := range cases {
+			k.run(45*time.Second, "delete", "zfsreceivetask", sc.Name, "-n", e2eNamespace, "--ignore-not-found=true", "--wait=true", "--timeout=30s")
+			selector := e2eLabelPrefix + "/authorization-test=" + sc.Name
+			k.run(45*time.Second, "delete", "jobs,secrets", "-n", e2eNamespace, "-l", selector, "--ignore-not-found=true", "--wait=true", "--timeout=30s")
+			k.run(45*time.Second, "delete", "pods", "-n", e2eNamespace, "-l", selector, "--ignore-not-found=true", "--wait=true", "--timeout=30s")
+		}
+	})
+}
+
+func (k kubectlRunner) applyReceiverAuthorization(sc receiverAuthorizationCase) {
+	k.t.Helper()
+	manifest := sc.manifestJSON(k.t)
+	if _, err := k.runInput(30*time.Second, manifest, "apply", "-f", "-"); err != nil {
+		k.t.Fatalf("apply receiver authorization %s: %v", sc.Name, err)
+	}
+}
+
+func (k kubectlRunner) assertReceiveTaskNotReady(name string, duration time.Duration) {
+	k.t.Helper()
+	deadline := time.Now().Add(duration)
+	for time.Now().Before(deadline) {
+		status, err := k.getReceiveTaskStatus(e2eNamespace, name)
+		if err != nil {
+			k.t.Fatalf("get receive task %s while checking pre-activation readiness: %v", name, err)
+		}
+		if status.Phase == e2eReceiveTaskPhaseCompleted || status.Phase == e2eReceiveTaskPhaseFailed {
+			k.t.Fatalf("receive task %s became terminal before activation: %#v", name, status)
+		}
+		if status.Phase == e2eReceiveTaskPhaseReady {
+			k.t.Fatalf("receive task %s reported Ready before its exact grant was node-local: %#v", name, status)
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+}
+
+func (k kubectlRunner) waitForReceiveTaskPhase(name, phase string, timeout time.Duration) receiveTaskStatus {
+	k.t.Helper()
+	deadline := time.Now().Add(timeout)
+	var last receiveTaskStatus
+	var lastErr error
+	for time.Now().Before(deadline) {
+		status, err := k.getReceiveTaskStatus(e2eNamespace, name)
+		if err != nil {
+			lastErr = err
+		} else {
+			last = status
+			if status.Phase == phase {
+				return status
+			}
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	k.collectDiagnosticsInNamespace(e2eNamespace, name)
+	k.t.Fatalf("timed out waiting for receive task %s to reach %s; last status=%#v last error=%v", name, phase, last, lastErr)
+	return receiveTaskStatus{}
+}
+
+func (k kubectlRunner) assertReceiveTaskPhaseNow(name, want string) {
+	k.t.Helper()
+	status, err := k.getReceiveTaskStatus(e2eNamespace, name)
+	if err != nil {
+		k.t.Fatal(err)
+	}
+	if status.Phase != want {
+		k.t.Fatalf("receive task %s phase = %q, want %q; status=%#v", name, status.Phase, want, status)
+	}
+}
+
+func (k kubectlRunner) patchReceiveTaskPhase(name, phase string) {
+	k.t.Helper()
+	payload := fmt.Sprintf(`{"status":{"phase":%q}}`, phase)
+	k.run(30*time.Second, "patch", "zfsreceivetask", name, "-n", e2eNamespace, "--subresource=status", "--type=merge", "-p", payload)
+}
+
+func (k kubectlRunner) suspendReceiverStatusUpdates() {
+	k.t.Helper()
+	k.run(30*time.Second, "delete", "clusterrolebinding", "zfs-receiver", "--ignore-not-found=true")
+	out, err := k.runOutput(20*time.Second, "auth", "can-i", "patch", "zfsreceivetasks.zfsreplication.ringhof.io", "--subresource=status", "--as="+e2eReceiverServiceAccount, "-n", e2eNamespace)
+	if err != nil && strings.TrimSpace(out) != "no" {
+		k.t.Fatalf("verify suspended Receiver status writes: %v", err)
+	}
+	if strings.TrimSpace(out) != "no" {
+		k.t.Fatalf("Receiver service account can still patch task status after authorization suspension: %q", out)
+	}
+}
+
+func (k kubectlRunner) restoreReceiverStatusUpdates() {
+	k.t.Helper()
+	k.run(30*time.Second, "apply", "-f", filepath.Join(e2eRepoRoot(k.t), "config/rbac/receiver_role_binding.yaml"))
+}
+
+func (k kubectlRunner) disableReceiverOnNode(node string) {
+	k.t.Helper()
+	pod, err := k.runOutput(20*time.Second,
+		"get", "pods", "-n", e2eControllerNamespace,
+		"-l", "app.kubernetes.io/name=zfs-receiver",
+		"--field-selector", "spec.nodeName="+node,
+		"-o", "jsonpath={.items[0].metadata.name}",
+	)
+	if err != nil {
+		k.t.Fatal(err)
+	}
+	pod = strings.TrimSpace(pod)
+	if pod == "" {
+		k.t.Fatalf("no Receiver Pod found on %s", node)
+	}
+	k.run(30*time.Second, "label", "node", node, e2eLabelPrefix+"/enabled-")
+	k.run(45*time.Second, "wait", "--for=delete", "pod/"+pod, "-n", e2eControllerNamespace, "--timeout=30s")
+}
+
+func (k kubectlRunner) enableReceiverOnNode(node string) {
+	k.t.Helper()
+	k.run(30*time.Second, "label", "node", node, e2eLabelPrefix+"/enabled=true", "--overwrite")
+	k.assertReceiverDaemonSetAvailable()
+}
+
+func (k kubectlRunner) assertOpenSSHAllowed(sc receiverAuthorizationCase, status receiveTaskStatus) {
+	k.t.Helper()
+	if !time.Now().Before(sc.ExpiresAt) {
+		k.t.Fatalf("authorization %s expired before its success probe", sc.Name)
+	}
+	logs, succeeded := k.runOpenSSHProbe(sc, status)
+	if !succeeded {
+		k.t.Fatalf("OpenSSH command for %s failed before deadline %s:\n%s", sc.Name, sc.ExpiresAt, logs)
+	}
+	if !strings.Contains(logs, "mbuffer") {
+		k.t.Fatalf("OpenSSH command for %s output = %q, want resolved mbuffer path", sc.Name, logs)
+	}
+}
+
+func (k kubectlRunner) waitForNativeOpenSSHRejection(sc receiverAuthorizationCase, status receiveTaskStatus, deadline time.Time) {
+	k.t.Helper()
+	if delay := time.Until(sc.ExpiresAt.Add(time.Second)); sc.ExpiresAt.Before(deadline) && delay > 0 {
+		time.Sleep(delay)
+	}
+	var lastLogs string
+	for time.Now().Before(deadline) {
+		logs, succeeded := k.runOpenSSHProbe(sc, status)
+		lastLogs = logs
+		if !succeeded && strings.Contains(logs, "Permission denied (publickey)") {
+			return
+		}
+		time.Sleep(time.Second)
+	}
+	k.collectDiagnosticsInNamespace(e2eNamespace, sc.Name)
+	k.t.Fatalf("OpenSSH did not reject %s at native public-key authentication before %s; last output:\n%s", sc.Name, deadline, lastLogs)
+}
+
+func (k kubectlRunner) startOpenSSHControlMaster(sc receiverAuthorizationCase, status receiveTaskStatus) string {
+	k.t.Helper()
+	k.ensureSSHProbeSecret(sc)
+	podName := sc.Name + "-control"
+	manifest := openSSHControlPodManifest(k.t, sc, podName)
+	if _, err := k.runInput(30*time.Second, manifest, "apply", "-f", "-"); err != nil {
+		k.t.Fatalf("create OpenSSH control Pod for %s: %v", sc.Name, err)
+	}
+	k.run(45*time.Second, "wait", "--for=condition=Ready=true", "pod/"+podName, "-n", e2eNamespace, "--timeout=30s")
+	command := fmt.Sprintf(
+		`ssh -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ControlMaster=yes -o ControlPath=/tmp/control -o ControlPersist=300 -i /ssh/id_ed25519 -p %d zfs-recv@%s "command -v mbuffer"`,
+		status.Endpoint.Port,
+		shellQuote(status.Endpoint.Host),
+	)
+	out, err := k.runOutput(30*time.Second, "exec", "-n", e2eNamespace, podName, "--", "/bin/sh", "-ec", command)
+	if err != nil {
+		k.t.Fatalf("establish OpenSSH control master for %s: %v", sc.Name, err)
+	}
+	if !strings.Contains(out, "mbuffer") {
+		k.t.Fatalf("OpenSSH control master command output = %q, want resolved mbuffer path", out)
+	}
+	return podName
+}
+
+func (k kubectlRunner) assertControlMasterAdmissionRejected(sc receiverAuthorizationCase, status receiveTaskStatus, podName string) {
+	k.t.Helper()
+	check := fmt.Sprintf(`ssh -S /tmp/control -O check -p %d zfs-recv@%s`, status.Endpoint.Port, shellQuote(status.Endpoint.Host))
+	if _, err := k.runOutput(20*time.Second, "exec", "-n", e2eNamespace, podName, "--", "/bin/sh", "-ec", check); err != nil {
+		k.t.Fatalf("pre-terminal OpenSSH control master is not active for %s: %v", sc.Name, err)
+	}
+	command := fmt.Sprintf(`ssh -S /tmp/control -p %d zfs-recv@%s "command -v mbuffer"`, status.Endpoint.Port, shellQuote(status.Endpoint.Host))
+	out, err := k.runOutput(20*time.Second, "exec", "-n", e2eNamespace, podName, "--", "/bin/sh", "-c", command)
+	if err == nil {
+		k.t.Fatalf("terminal receive task %s admitted another forced command over its authenticated connection: %q", sc.Name, out)
+	}
+}
+
+func (k kubectlRunner) runOpenSSHProbe(sc receiverAuthorizationCase, status receiveTaskStatus) (string, bool) {
+	k.t.Helper()
+	if status.Endpoint.Host == "" || status.Endpoint.Port == 0 {
+		k.t.Fatalf("receive task %s has no SSH endpoint: %#v", sc.Name, status)
+	}
+	k.ensureSSHProbeSecret(sc)
+	jobName := sc.Name + "-" + uniqueSuffix()
+	manifest := openSSHProbeJobManifest(k.t, sc, status, jobName)
+	k.deleteJob(jobName)
+	defer k.deleteJob(jobName)
+	if _, err := k.runInput(30*time.Second, manifest, "apply", "-f", "-"); err != nil {
+		k.t.Fatalf("create OpenSSH probe job for %s: %v", sc.Name, err)
+	}
+	deadline := time.Now().Add(45 * time.Second)
+	for time.Now().Before(deadline) {
+		job, err := k.getJob(jobName)
+		if err == nil && (job.Status.Succeeded > 0 || job.Status.Failed > 0) {
+			logs, logErr := k.runOutput(20*time.Second, "logs", "-n", e2eNamespace, "job/"+jobName, "--all-containers=true")
+			if logErr != nil {
+				k.t.Fatalf("collect OpenSSH probe logs for %s: %v", sc.Name, logErr)
+			}
+			return logs, job.Status.Succeeded > 0
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	k.t.Fatalf("timed out waiting for OpenSSH probe job %s", jobName)
+	return "", false
+}
+
+func (k kubectlRunner) ensureSSHProbeSecret(sc receiverAuthorizationCase) {
+	k.t.Helper()
+	doc := map[string]any{
+		"apiVersion": "v1",
+		"kind":       "Secret",
+		"metadata": map[string]any{
+			"name":      sc.Name + "-ssh",
+			"namespace": e2eNamespace,
+			"labels": map[string]any{
+				e2eLabelPrefix + "/authorization-test": sc.Name,
+			},
+		},
+		"type": "Opaque",
+		"stringData": map[string]any{
+			"id_ed25519": sc.PrivateKey,
+		},
+	}
+	if _, err := k.runInput(30*time.Second, manifestBytes(k.t, doc), "apply", "-f", "-"); err != nil {
+		k.t.Fatalf("apply OpenSSH key secret for %s: %v", sc.Name, err)
+	}
+}
+
+func (k kubectlRunner) verifySenderWaitsForExactReceiverPodReadiness(suffix string) {
+	k.t.Helper()
+	pool := realZFSPool()
+	key := newE2ESSHKey(k.t, "sender-gate-"+suffix)
+	sc := replicationCase{
+		Name:          "e2e-sender-gate-" + suffix,
+		SourceNode:    e2eSourceNode,
+		TargetNode:    e2eTargetNode,
+		SourceDataset: pool + "/src-sender-gate-" + suffix,
+		TargetDataset: pool + "/dst-sender-gate-" + suffix,
+		SnapshotName:  "snap-" + suffix,
+		NoSyncSnap:    true,
+		IncludeSnaps:  []string{"^snap-" + suffix + "$"},
+	}
+	task := receiverAuthorizationCase{
+		Name:       runObjectName(sc.Name, "receiver"),
+		NodeName:   sc.TargetNode,
+		Dataset:    sc.TargetDataset,
+		PublicKey:  key.Public,
+		PrivateKey: key.Private,
+		ExpiresAt:  time.Now().Add(30 * time.Minute),
+	}
+	k.cleanupReplicationOnExit(sc.Name)
+	k.cleanupReceiverAuthorizationOnExit(task)
+	k.cleanupReplication(sc.Name)
+	k.cleanupRealZFSDatasetOnExit(sc.SourceNode, "zfs-cln-gate-src-"+suffix, sc.SourceDataset)
+	k.cleanupRealZFSDatasetOnExit(sc.TargetNode, "zfs-cln-gate-dst-"+suffix, sc.TargetDataset)
+	k.runRealZFS(sc.SourceNode, "zfs-src-gate-"+suffix, realZFSSetupSourceScript(pool, sc.SourceDataset, "sender-gate-"+suffix))
+	k.runRealZFS(sc.SourceNode, "zfs-snap-gate-"+suffix, "zfs snapshot "+sc.sourceSnapshot())
+
+	k.scaleController(0)
+	k.t.Cleanup(func() { k.scaleController(1) })
+	k.applyReplication(sc)
+	k.applyRunSSHSecret(sc.Name, key)
+	k.applyReceiverAuthorization(task)
+	staleReady := k.waitForReceiveTaskPhase(task.Name, e2eReceiveTaskPhaseReady, 30*time.Second)
+	if staleReady.ReceiverPod.Name == "" || staleReady.ReceiverPod.UID == "" {
+		k.t.Fatalf("receive task %s Ready without exact Receiver Pod: %#v", task.Name, staleReady)
+	}
+
+	restored := false
+	k.setReceiverPodReadiness(staleReady.ReceiverPod.Name, false)
+	k.t.Cleanup(func() {
+		if !restored {
+			k.restoreReceiverPodReadiness(staleReady.ReceiverPod.Name)
+		}
+	})
+	k.assertReceiveTaskPhaseNow(task.Name, e2eReceiveTaskPhaseReady)
+	k.scaleController(1)
+	k.assertNoSenderJobFor(sc.Name, 8*time.Second)
+
+	k.setReceiverPodReadiness(staleReady.ReceiverPod.Name, true)
+	restored = true
+	status := k.waitForSuccess(sc, 4*time.Minute)
+	assertSucceededStatus(k.t, sc, status)
+	k.assertRealZFSMarker(sc.TargetNode, "zfs-dst-gate-"+suffix, pool, sc.TargetDataset, "sender-gate-"+suffix)
+}
+
+func (k kubectlRunner) applyRunSSHSecret(runName string, key e2eSSHKey) {
+	k.t.Helper()
+	doc := map[string]any{
+		"apiVersion": "v1",
+		"kind":       "Secret",
+		"metadata": map[string]any{
+			"name":      runObjectName(runName, "ssh"),
+			"namespace": e2eNamespace,
+			"labels":    runLabels(runName, "ssh"),
+		},
+		"type": "Opaque",
+		"stringData": map[string]any{
+			"id_rsa":          key.Private,
+			"id_rsa.pub":      key.Public,
+			"authorized_keys": key.Public + "\n",
+		},
+	}
+	if _, err := k.runInput(30*time.Second, manifestBytes(k.t, doc), "apply", "-f", "-"); err != nil {
+		k.t.Fatalf("apply SSH secret for run %s: %v", runName, err)
+	}
+}
+
+func (k kubectlRunner) assertNoSenderJobFor(name string, duration time.Duration) {
+	k.t.Helper()
+	deadline := time.Now().Add(duration)
+	for time.Now().Before(deadline) {
+		k.assertNoSenderJob(name)
+		time.Sleep(time.Second)
+	}
+}
+
+func (k kubectlRunner) setReceiverPodReadiness(name string, ready bool) {
+	k.t.Helper()
+	from := "/run/zfs-receiver/sshd_config"
+	to := from + ".e2e-unready"
+	if ready {
+		from, to = to, from
+	}
+	k.run(20*time.Second, "exec", "-n", e2eControllerNamespace, name, "--", "mv", from, to)
+	k.run(45*time.Second, "wait", "--for=condition=Ready="+strconv.FormatBool(ready), "pod/"+name, "-n", e2eControllerNamespace, "--timeout=30s")
+}
+
+func (k kubectlRunner) restoreReceiverPodReadiness(name string) {
+	k.t.Helper()
+	if _, err := k.runOutput(20*time.Second, "exec", "-n", e2eControllerNamespace, name, "--", "mv", "/run/zfs-receiver/sshd_config.e2e-unready", "/run/zfs-receiver/sshd_config"); err != nil {
+		k.t.Logf("restore Receiver Pod %s readiness: %v", name, err)
+	}
 }
 
 func (k kubectlRunner) applyReplication(sc replicationCase) {
@@ -1289,6 +1760,100 @@ func manifestBytes(t *testing.T, doc map[string]any) []byte {
 		t.Fatal(err)
 	}
 	return out
+}
+
+func openSSHProbeJobManifest(t *testing.T, sc receiverAuthorizationCase, status receiveTaskStatus, name string) []byte {
+	t.Helper()
+	doc := map[string]any{
+		"apiVersion": "batch/v1",
+		"kind":       "Job",
+		"metadata": map[string]any{
+			"name":      name,
+			"namespace": e2eNamespace,
+			"labels": map[string]any{
+				e2eLabelPrefix + "/authorization-test": sc.Name,
+			},
+		},
+		"spec": map[string]any{
+			"backoffLimit":            0,
+			"ttlSecondsAfterFinished": 300,
+			"template": map[string]any{
+				"metadata": map[string]any{
+					"labels": map[string]any{
+						e2eLabelPrefix + "/authorization-test": sc.Name,
+					},
+				},
+				"spec": map[string]any{
+					"restartPolicy":                "Never",
+					"automountServiceAccountToken": false,
+					"containers": []any{map[string]any{
+						"name":            "ssh",
+						"image":           e2eImageTag(),
+						"imagePullPolicy": "IfNotPresent",
+						"command":         []string{"/bin/sh", "-ec"},
+						"args": []string{fmt.Sprintf(
+							`exec ssh -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -i /ssh/id_ed25519 -p %d zfs-recv@%s "command -v mbuffer"`,
+							status.Endpoint.Port,
+							shellQuote(status.Endpoint.Host),
+						)},
+						"volumeMounts": []any{map[string]any{
+							"name":      "ssh-key",
+							"mountPath": "/ssh",
+							"readOnly":  true,
+						}},
+					}},
+					"volumes": []any{map[string]any{
+						"name": "ssh-key",
+						"secret": map[string]any{
+							"secretName":  sc.Name + "-ssh",
+							"defaultMode": 256,
+						},
+					}},
+				},
+			},
+		},
+	}
+	return manifestBytes(t, doc)
+}
+
+func openSSHControlPodManifest(t *testing.T, sc receiverAuthorizationCase, name string) []byte {
+	t.Helper()
+	doc := map[string]any{
+		"apiVersion": "v1",
+		"kind":       "Pod",
+		"metadata": map[string]any{
+			"name":      name,
+			"namespace": e2eNamespace,
+			"labels": map[string]any{
+				e2eLabelPrefix + "/authorization-test": sc.Name,
+			},
+		},
+		"spec": map[string]any{
+			"restartPolicy":                 "Never",
+			"terminationGracePeriodSeconds": 0,
+			"automountServiceAccountToken":  false,
+			"containers": []any{map[string]any{
+				"name":            "ssh",
+				"image":           e2eImageTag(),
+				"imagePullPolicy": "IfNotPresent",
+				"command":         []string{"/bin/sh", "-ec"},
+				"args":            []string{"sleep 600"},
+				"volumeMounts": []any{map[string]any{
+					"name":      "ssh-key",
+					"mountPath": "/ssh",
+					"readOnly":  true,
+				}},
+			}},
+			"volumes": []any{map[string]any{
+				"name": "ssh-key",
+				"secret": map[string]any{
+					"secretName":  sc.Name + "-ssh",
+					"defaultMode": 256,
+				},
+			}},
+		},
+	}
+	return manifestBytes(t, doc)
 }
 
 func realZFSJobManifest(t *testing.T, node, name, script string) []byte {
