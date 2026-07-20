@@ -28,19 +28,15 @@ func executeReceiverCommandPlan(ctx context.Context, streams commandStreams, pla
 	case receiverCommandExit:
 		return nil
 	case receiverCommandEcho:
-		if _, err := fmt.Fprint(stdout, strings.Join(plan.echoArgs, " ")); err != nil {
-			return fmt.Errorf("write echo output: %w", err)
-		}
-		return nil
+		_, err := fmt.Fprint(stdout, strings.Join(plan.echoArgs, " "))
+		return err
 	case receiverCommandLookup:
 		path, err := resolveAllowedCommand(plan.lookupCommand)
 		if err != nil {
 			return exitError{code: 1}
 		}
-		if _, err := fmt.Fprintln(stdout, path); err != nil {
-			return fmt.Errorf("write command path: %w", err)
-		}
-		return nil
+		_, err = fmt.Fprintln(stdout, path)
+		return err
 	case receiverCommandPS:
 		return nil
 	case receiverCommandPipeline:

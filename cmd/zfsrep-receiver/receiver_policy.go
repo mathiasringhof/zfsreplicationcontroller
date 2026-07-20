@@ -16,6 +16,18 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
+type receiverTaskAuthorization struct {
+	AuthorizedKey string
+	PolicyID      string
+	PolicyPath    string
+	Policy        receiverCommandPolicy
+}
+
+type receiverCommandPolicy struct {
+	TargetDataset string `json:"targetDataset"`
+	zfsv1.ReceiveTaskPolicy
+}
+
 func receiveTaskAuthorization(cfg receiverConfig, task *zfsv1.ZFSReceiveTask) (receiverTaskAuthorization, error) {
 	publicKey, err := canonicalAuthorizedPublicKey(task.Spec.SSH.AuthorizedPublicKey)
 	if err != nil {

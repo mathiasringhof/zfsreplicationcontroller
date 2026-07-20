@@ -3,6 +3,7 @@ package receiverauthorization
 import (
 	"context"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"os"
@@ -23,6 +24,28 @@ type Module struct {
 	policyDir string
 }
 
+// Reference is an opaque receiver authorization reference parsed from a
+// forced-command invocation.
+type Reference struct {
+	policyID string
+}
+
+// ReferenceFromArgs parses the authorization reference carried by a
+// forced-command invocation.
+func ReferenceFromArgs(args []string) (Reference, error) {
+	fs := flag.NewFlagSet("exec", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	var policyID string
+	fs.StringVar(&policyID, "policy-id", "", "receiver policy ID")
+	if err := fs.Parse(args); err != nil {
+		return Reference{}, err
+	}
+	if policyID == "" {
+		return Reference{}, fmt.Errorf("receiver policy ID is required")
+	}
+	return Reference{policyID: policyID}, nil
+}
+
 // New constructs a Receiver Authorization module backed by the current
 // receiver policy directory.
 func New(policyDir string) Module {
@@ -31,17 +54,17 @@ func New(policyDir string) Module {
 
 // Admit resolves the referenced policy and authorizes the original SSH
 // command into an opaque executable plan.
-func (m Module) Admit(policyID, originalCommand string) (Plan, error) {
-	if strings.TrimSpace(originalCommand) == "" {
-		return Plan{}, fmt.Errorf("missing SSH_ORIGINAL_COMMAND")
-	}
-	policyPath, err := policyPathForID(m.policyDir, policyID)
+func (m Module) Admit(reference Reference, originalCommand string) (Plan, error) {
+	policyPath, err := policyPathForID(m.policyDir, reference.policyID)
 	if err != nil {
 		return Plan{}, err
 	}
 	policy, err := readPolicy(policyPath)
 	if err != nil {
 		return Plan{}, err
+	}
+	if strings.TrimSpace(originalCommand) == "" {
+		return Plan{}, fmt.Errorf("missing SSH_ORIGINAL_COMMAND")
 	}
 	command, err := authorizeReceiverCommand(originalCommand, policy)
 	if err != nil {

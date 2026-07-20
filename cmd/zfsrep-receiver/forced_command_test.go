@@ -415,13 +415,40 @@ func TestPlanExecuteEmulatesProcessList(t *testing.T) {
 }
 
 func TestRunForcedCommandRejectsMissingOriginalCommand(t *testing.T) {
+	dir := t.TempDir()
+	policy := testReceiverPolicy("tank/dst", zfsv1.ReceiveTaskPolicy{Compression: "none"})
+	if err := writeReceiverPolicies(dir, map[string]receiverCommandPolicy{testReceiverPolicyID: policy}); err != nil {
+		t.Fatal(err)
+	}
 	err := runForcedCommand(context.Background(), forcedCommandConfig{
-		Authorization:   receiverauthorization.New(t.TempDir()),
-		PolicyID:        testReceiverPolicyID,
+		Authorization:   receiverauthorization.New(dir),
+		Reference:       testAuthorizationReference(t),
 		OriginalCommand: "",
 	})
 	if err == nil {
 		t.Fatal("runForcedCommand() error = nil, want missing command rejection")
+	}
+}
+
+func TestRunForcedCommandUsesOpaqueAuthorizationReference(t *testing.T) {
+	dir := t.TempDir()
+	policy := testReceiverPolicy("tank/dst", zfsv1.ReceiveTaskPolicy{Compression: "none"})
+	if err := writeReceiverPolicies(dir, map[string]receiverCommandPolicy{testReceiverPolicyID: policy}); err != nil {
+		t.Fatal(err)
+	}
+	var stdout bytes.Buffer
+
+	err := runForcedCommand(context.Background(), forcedCommandConfig{
+		Authorization:   receiverauthorization.New(dir),
+		Reference:       testAuthorizationReference(t),
+		OriginalCommand: "echo -n hello",
+		Stdout:          &stdout,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stdout.String() != "hello" {
+		t.Fatalf("stdout = %q, want %q", stdout.String(), "hello")
 	}
 }
 
@@ -454,5 +481,14 @@ func admitReceiverCommand(t *testing.T, raw string, policy receiverCommandPolicy
 	if err := os.WriteFile(filepath.Join(dir, testReceiverPolicyID+".json"), data, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	return receiverauthorization.New(dir).Admit(testReceiverPolicyID, raw)
+	return receiverauthorization.New(dir).Admit(testAuthorizationReference(t), raw)
+}
+
+func testAuthorizationReference(t *testing.T) receiverauthorization.Reference {
+	t.Helper()
+	reference, err := receiverauthorization.ReferenceFromArgs([]string{"--policy-id", testReceiverPolicyID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return reference
 }

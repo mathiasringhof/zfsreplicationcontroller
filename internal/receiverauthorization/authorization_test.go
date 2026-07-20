@@ -25,8 +25,15 @@ func TestModuleAdmitsAllowedCommand(t *testing.T) {
 		"compression":"none"
 	}`)
 
-	if _, err := New(dir).Admit(testPolicyID, "zfs receive -u -s tank/dst"); err != nil {
+	if _, err := New(dir).Admit(testReference(t), "zfs receive -u -s tank/dst"); err != nil {
 		t.Fatalf("Admit() error = %v, want nil", err)
+	}
+}
+
+func TestModuleAdmissionLoadsPolicyBeforeCheckingOriginalCommand(t *testing.T) {
+	_, err := New(t.TempDir()).Admit(testReference(t), "")
+	if !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("Admit() error = %v, want missing policy error", err)
 	}
 }
 
@@ -40,7 +47,7 @@ func TestModuleAdmissionRejectsSymlinkedPolicy(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := New(dir).Admit(testPolicyID, "zfs receive -u tank/dst"); err == nil {
+	if _, err := New(dir).Admit(testReference(t), "zfs receive -u tank/dst"); err == nil {
 		t.Fatal("Admit() error = nil, want symlink rejection")
 	}
 }
@@ -54,7 +61,7 @@ func TestModuleAdmissionPreservesLegacyMountedReceiveBehavior(t *testing.T) {
 		"compression":"none"
 	}`)
 
-	if _, err := New(dir).Admit(testPolicyID, "zfs receive -s tank/dst"); err != nil {
+	if _, err := New(dir).Admit(testReference(t), "zfs receive -s tank/dst"); err != nil {
 		t.Fatalf("Admit() error = %v, want legacy mounted receive allowed", err)
 	}
 }
@@ -69,7 +76,7 @@ func TestModuleAdmissionPreservesExplicitMountedReceiveDenial(t *testing.T) {
 		"compression":"none"
 	}`)
 
-	if _, err := New(dir).Admit(testPolicyID, "zfs receive -s tank/dst"); err == nil {
+	if _, err := New(dir).Admit(testReference(t), "zfs receive -s tank/dst"); err == nil {
 		t.Fatal("Admit() error = nil, want mounted receive rejected")
 	}
 }
@@ -97,6 +104,31 @@ func TestPlanExecuteSuppliesStandardStreams(t *testing.T) {
 	if stderr.String() != "err:payload" {
 		t.Fatalf("stderr = %q, want %q", stderr.String(), "err:payload")
 	}
+}
+
+func TestPlanExecuteReturnsWriterErrorUnchanged(t *testing.T) {
+	plan := admitTestPlan(t, "echo -n hello", `{
+		"targetDataset":"tank/dst",
+		"receiveUnmounted":true,
+		"compression":"none"
+	}`)
+	writeErr := &testWriterError{}
+
+	err := plan.Execute(context.Background(), nil, errorWriter{err: writeErr}, nil)
+	assertWriterErrorUnchanged(t, err, writeErr)
+}
+
+func TestPlanExecuteReturnsLookupWriterErrorUnchanged(t *testing.T) {
+	replaceAllowedCommandResolver(t, map[string]string{"mbuffer": "/usr/bin/mbuffer"})
+	plan := admitTestPlan(t, "command -v mbuffer", `{
+		"targetDataset":"tank/dst",
+		"receiveUnmounted":true,
+		"compression":"none"
+	}`)
+	writeErr := &testWriterError{}
+
+	err := plan.Execute(context.Background(), nil, errorWriter{err: writeErr}, nil)
+	assertWriterErrorUnchanged(t, err, writeErr)
 }
 
 func TestPlanExecuteUsesMinimalChildEnvironment(t *testing.T) {
@@ -265,11 +297,20 @@ func writeTestPolicy(t *testing.T, dir, policy string) {
 	}
 }
 
+func testReference(t *testing.T) Reference {
+	t.Helper()
+	reference, err := ReferenceFromArgs([]string{"--policy-id", testPolicyID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return reference
+}
+
 func admitTestPlan(t *testing.T, command, policy string) Plan {
 	t.Helper()
 	dir := t.TempDir()
 	writeTestPolicy(t, dir, policy)
-	plan, err := New(dir).Admit(testPolicyID, command)
+	plan, err := New(dir).Admit(testReference(t), command)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -312,4 +353,26 @@ func waitForFile(t *testing.T, path string) {
 func processExists(pid int) bool {
 	err := syscall.Kill(pid, 0)
 	return err == nil || errors.Is(err, syscall.EPERM)
+}
+
+type errorWriter struct {
+	err error
+}
+
+func (w errorWriter) Write([]byte) (int, error) {
+	return 0, w.err
+}
+
+func assertWriterErrorUnchanged(t *testing.T, got error, want *testWriterError) {
+	t.Helper()
+	var writerErr *testWriterError
+	if !errors.As(got, &writerErr) || writerErr != want || errors.Unwrap(got) != nil {
+		t.Fatalf("Execute() error = %T %v, want original writer error", got, got)
+	}
+}
+
+type testWriterError struct{}
+
+func (*testWriterError) Error() string {
+	return "write failed"
 }
