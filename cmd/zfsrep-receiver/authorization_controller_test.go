@@ -144,7 +144,7 @@ func TestQueuedInitialReconciliationDistinguishesActivationFromLaterReporting(t 
 		wantRunErr     error
 	}{
 		{name: "post-commit warning does not block readiness", activation: receiverauthorization.Activation{Changed: true, Warning: warning}, wantRunErr: warning},
-		{name: "pre-commit error blocks readiness", publicationErr: publicationErr, wantStartErr: publicationErr, wantRunErr: publicationErr},
+		{name: "pre-commit error blocks readiness", publicationErr: publicationErr, wantStartErr: publicationErr},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -537,15 +537,17 @@ func TestReceiverAuthorizationReconcilerDistinguishesDegradedFromUntrustedAuthor
 			}
 			r.apiReader = r.client
 			_, err := r.Reconcile(context.Background(), reconcile.Request{})
-			if !errors.Is(err, publicationErr) {
-				t.Fatalf("Reconcile() error = %v, want publication failure", err)
-			}
 			if tt.activeUsable {
+				if !errors.Is(err, publicationErr) {
+					t.Fatalf("Reconcile() error = %v, want publication failure", err)
+				}
 				for _, want := range []string{"receiver authorization degraded", "retaining last complete snapshot"} {
 					if !strings.Contains(err.Error(), want) {
 						t.Fatalf("Reconcile() error = %q, want %q", err, want)
 					}
 				}
+			} else if err != nil {
+				t.Fatalf("Reconcile() error = %v, want process boundary to own fatal failure", err)
 			}
 			select {
 			case err := <-fatal:

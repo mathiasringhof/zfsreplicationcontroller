@@ -83,14 +83,15 @@ func (r *receiverAuthorizationReconciler) Reconcile(ctx context.Context, _ recon
 	candidates, candidateTasks, err := listReceiveTaskCandidates(ctx, r.client, r.cfg)
 	if err != nil {
 		err = fmt.Errorf("list complete node-local receive task view: %w", err)
-		r.reportInitial(err)
-		return ctrl.Result{}, err
+		return ctrl.Result{}, r.reconcileError(err)
 	}
 	activation, err := r.authorization.Replace(candidates)
 	if err != nil {
-		err = r.classifyPublicationFailure(err)
-		r.reportInitial(err)
-		return ctrl.Result{}, err
+		err = r.handlePublicationFailure(err)
+		if err == nil {
+			return ctrl.Result{}, nil
+		}
+		return ctrl.Result{}, r.reconcileError(err)
 	}
 	result := deadlineResult(r.now(), activation.NextDeadline)
 	r.reportInitial(nil)
@@ -114,22 +115,33 @@ func (r *receiverAuthorizationReconciler) Reconcile(ctx context.Context, _ recon
 	return result, errors.Join(reconcileErrs...)
 }
 
-func (r *receiverAuthorizationReconciler) reportInitial(err error) {
+func (r *receiverAuthorizationReconciler) reportInitial(err error) bool {
 	if !r.initialPending.CompareAndSwap(true, false) {
-		return
+		return false
 	}
 	r.initialResult <- err
+	return true
 }
 
-func (r *receiverAuthorizationReconciler) classifyPublicationFailure(publicationErr error) error {
+func (r *receiverAuthorizationReconciler) reconcileError(err error) error {
+	if r.reportInitial(err) {
+		return nil
+	}
+	return err
+}
+
+func (r *receiverAuthorizationReconciler) handlePublicationFailure(publicationErr error) error {
 	var classified interface {
 		ActiveAuthorityUsable() bool
 	}
 	if errors.As(publicationErr, &classified) && classified.ActiveAuthorityUsable() {
 		return fmt.Errorf("receiver authorization degraded; retaining last complete snapshot: %w", publicationErr)
 	}
-	r.reportFatal(fmt.Errorf("active receiver authorization is unusable after reconciliation failure: %w", publicationErr))
-	return fmt.Errorf("publish complete receiver authorization snapshot: %w", publicationErr)
+	fatalErr := fmt.Errorf("active receiver authorization is unusable after reconciliation failure: %w", publicationErr)
+	if !r.reportInitial(fatalErr) {
+		r.reportFatal(fatalErr)
+	}
+	return nil
 }
 
 func deadlineResult(now, next time.Time) ctrl.Result {
