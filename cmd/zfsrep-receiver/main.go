@@ -23,6 +23,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/event"
+	ctrllog "sigs.k8s.io/controller-runtime/pkg/log"
+	logzap "sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 )
 
@@ -59,6 +61,7 @@ func main() {
 		return
 	}
 
+	ctrl.SetLogger(logzap.New())
 	if err := run(ctx, configFromEnv()); err != nil {
 		log.Fatal(err)
 	}
@@ -123,7 +126,11 @@ func run(ctx context.Context, cfg receiverConfig) error {
 	if cfg.WatchNamespace != "" {
 		managerOptions.Cache.DefaultNamespaces = map[string]cache.Config{cfg.WatchNamespace: {}}
 	}
-	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), managerOptions)
+	restConfig, err := ctrl.GetConfig()
+	if err != nil {
+		return fmt.Errorf("get Kubernetes configuration: %w", err)
+	}
+	mgr, err := ctrl.NewManager(restConfig, managerOptions)
 	if err != nil {
 		return fmt.Errorf("create receiver authorization manager: %w", err)
 	}
@@ -203,7 +210,12 @@ func startAuthorizedSSHD(
 	if err := activateInitial(ctx); err != nil {
 		return nil, fmt.Errorf("activate initial receiver authorization snapshot: %w", err)
 	}
-	return start(ctx, cfg)
+	done, err := start(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+	ctrllog.FromContext(ctx).Info("receiver serving")
+	return done, nil
 }
 
 func startSSHD(ctx context.Context, cfg receiverConfig) (<-chan error, error) {

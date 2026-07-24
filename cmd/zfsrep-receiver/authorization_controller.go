@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -89,8 +88,7 @@ func (r *receiverAuthorizationReconciler) Reconcile(ctx context.Context, _ recon
 	}
 	activation, err := r.authorization.Replace(candidates)
 	if err != nil {
-		r.handlePublicationFailure(err)
-		err = fmt.Errorf("publish complete receiver authorization snapshot: %w", err)
+		err = r.classifyPublicationFailure(err)
 		r.reportInitial(err)
 		return ctrl.Result{}, err
 	}
@@ -123,15 +121,15 @@ func (r *receiverAuthorizationReconciler) reportInitial(err error) {
 	r.initialResult <- err
 }
 
-func (r *receiverAuthorizationReconciler) handlePublicationFailure(publicationErr error) {
+func (r *receiverAuthorizationReconciler) classifyPublicationFailure(publicationErr error) error {
 	var classified interface {
 		ActiveAuthorityUsable() bool
 	}
 	if errors.As(publicationErr, &classified) && classified.ActiveAuthorityUsable() {
-		log.Printf("receiver authorization is degraded; retaining last complete snapshot: %v", publicationErr)
-		return
+		return fmt.Errorf("receiver authorization degraded; retaining last complete snapshot: %w", publicationErr)
 	}
 	r.reportFatal(fmt.Errorf("active receiver authorization is unusable after reconciliation failure: %w", publicationErr))
+	return fmt.Errorf("publish complete receiver authorization snapshot: %w", publicationErr)
 }
 
 func deadlineResult(now, next time.Time) ctrl.Result {

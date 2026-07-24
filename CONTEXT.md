@@ -4,6 +4,14 @@ This context describes one-shot and scheduled replication of ZFS datasets betwee
 
 ## Language
 
+**Replication Source**:
+The node and dataset from which a Replication Run sends snapshots.
+_Avoid_: Src, origin
+
+**Replication Target**:
+The node and dataset to which a Replication Run sends snapshots.
+_Avoid_: Dst, destination when referring to a Replication Run
+
 **Receiver**:
 A long-lived node-level replication endpoint that enforces the active Receiver Authorization Snapshot for one or more Replication Runs. Its lifecycle is independent of any individual run.
 

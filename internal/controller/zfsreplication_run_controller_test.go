@@ -617,21 +617,24 @@ func TestRunReconcileLogsReceiverAndSenderLifecycle(t *testing.T) {
 	}
 
 	baseFields := map[string]string{
-		"namespace":         run.Namespace,
-		"run":               run.Name,
-		"sourceDataset":     run.Spec.Source.Dataset,
-		"targetDataset":     run.Spec.Target.Dataset,
-		"senderJob":         names.SenderName,
-		"receiveTask":       names.ReceiveTaskName,
-		"syncoidIdentifier": syncSnapshotIdentifierForRun(run),
+		"namespace":     run.Namespace,
+		"run":           run.Name,
+		"sourceNode":    run.Spec.Source.NodeName,
+		"sourceDataset": run.Spec.Source.Dataset,
+		"targetNode":    run.Spec.Target.NodeName,
+		"targetDataset": run.Spec.Target.Dataset,
 	}
 	assertNoLogEntry(t, logs, "reconciling replication run")
 	assertLogEntry(t, logs, "accepted replication run", baseFields)
+	assertLogEntryExcludesFields(t, logs, "accepted replication run", "senderJob", "receiveTask", "sshSecret", "syncoidIdentifier", "receiverPod")
 	receiverFields := cloneStringMap(baseFields)
+	receiverFields["receiveTask"] = names.ReceiveTaskName
 	receiverFields["receiverPod"] = "zfs-receiver-worker-b"
-	receiverFields["receiverPodIP"] = "10.0.0.42"
 	assertLogEntry(t, logs, "replication receiver is ready", receiverFields)
-	assertLogEntry(t, logs, "created sender job", receiverFields)
+	senderFields := cloneStringMap(baseFields)
+	senderFields["senderJob"] = names.SenderName
+	senderFields["receiverPod"] = "zfs-receiver-worker-b"
+	assertLogEntry(t, logs, "created sender job", senderFields)
 }
 
 func TestRunReconcileDoesNotRecheckSenderJobImmediatelyAfterCreate(t *testing.T) {
@@ -665,20 +668,16 @@ func TestRunReconcileDoesNotRecheckSenderJobImmediatelyAfterCreate(t *testing.T)
 		t.Fatalf("RequeueAfter = %v, want cache-visible sender job recheck", result.RequeueAfter)
 	}
 	assertLogEntry(t, logs, "replication receiver is ready", map[string]string{
-		"namespace":     run.Namespace,
-		"run":           run.Name,
-		"senderJob":     names.SenderName,
-		"receiveTask":   names.ReceiveTaskName,
-		"receiverPod":   "zfs-receiver-worker-b",
-		"receiverPodIP": "10.0.0.42",
+		"namespace":   run.Namespace,
+		"run":         run.Name,
+		"receiveTask": names.ReceiveTaskName,
+		"receiverPod": "zfs-receiver-worker-b",
 	})
 	assertLogEntry(t, logs, "created sender job", map[string]string{
-		"namespace":     run.Namespace,
-		"run":           run.Name,
-		"senderJob":     names.SenderName,
-		"receiveTask":   names.ReceiveTaskName,
-		"receiverPod":   "zfs-receiver-worker-b",
-		"receiverPodIP": "10.0.0.42",
+		"namespace":   run.Namespace,
+		"run":         run.Name,
+		"senderJob":   names.SenderName,
+		"receiverPod": "zfs-receiver-worker-b",
 	})
 
 	ctx, logs = captureRunLogger()
@@ -891,7 +890,6 @@ func TestRunReconcileLogsReceiverWait(t *testing.T) {
 		"run":           run.Name,
 		"sourceDataset": run.Spec.Source.Dataset,
 		"targetDataset": run.Spec.Target.Dataset,
-		"senderJob":     names.SenderName,
 		"receiveTask":   names.ReceiveTaskName,
 	})
 	assertLogEntry(t, logs, "accepted replication run", map[string]string{
@@ -899,8 +897,6 @@ func TestRunReconcileLogsReceiverWait(t *testing.T) {
 		"run":           run.Name,
 		"sourceDataset": run.Spec.Source.Dataset,
 		"targetDataset": run.Spec.Target.Dataset,
-		"senderJob":     names.SenderName,
-		"receiveTask":   names.ReceiveTaskName,
 	})
 	var task zfsv1.ZFSReceiveTask
 	if err := r.Get(context.Background(), types.NamespacedName{Name: names.ReceiveTaskName, Namespace: run.Namespace}, &task); err != nil {
@@ -938,13 +934,11 @@ func TestRunReconcileLogsSenderSuccess(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	assertLogEntry(t, logs, "sender job succeeded", map[string]string{
-		"namespace":     run.Namespace,
-		"run":           run.Name,
-		"senderJob":     names.SenderName,
-		"receiveTask":   names.ReceiveTaskName,
-		"receiverPod":   "zfs-receiver-worker-b",
-		"receiverPodIP": "10.0.0.42",
+	assertLogEntry(t, logs, "replication succeeded", map[string]string{
+		"namespace":   run.Namespace,
+		"run":         run.Name,
+		"senderJob":   names.SenderName,
+		"receiverPod": "zfs-receiver-worker-b",
 	})
 }
 
@@ -983,11 +977,14 @@ func TestRunReconcileLogsSenderFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	assertLogEntry(t, logs, "sender job failed", map[string]string{
-		"namespace": run.Namespace,
-		"run":       run.Name,
-		"reason":    "syncoid exited with status 1",
+	assertLogEntry(t, logs, "replication failed", map[string]string{
+		"namespace":   run.Namespace,
+		"run":         run.Name,
+		"senderJob":   names.SenderName,
+		"receiverPod": "zfs-receiver-worker-b",
+		"reason":      "syncoid exited with status 1",
 	})
+	assertNoLogEntry(t, logs, "sender job failed")
 }
 
 func TestRunReconcileUsesSanitizedTerminationMessageFromExactSenderJob(t *testing.T) {
@@ -1141,7 +1138,7 @@ func TestRunReconcileRedactsQuotedJobFailedConditionWithoutPodLogs(t *testing.T)
 	if got.Status.LastError != `syncoid exited with status 1 --sshkey=<redacted>` {
 		t.Fatalf("lastError = %q", got.Status.LastError)
 	}
-	assertLogEntry(t, logs, "sender job failed", map[string]string{
+	assertLogEntry(t, logs, "replication failed", map[string]string{
 		"namespace": run.Namespace,
 		"run":       run.Name,
 		"reason":    `syncoid exited with status 1 --sshkey=<redacted>`,
@@ -1169,8 +1166,6 @@ func TestRunReconcileLogsDestinationWaitOnlyOnTransition(t *testing.T) {
 		"run":           run.Name,
 		"sourceDataset": run.Spec.Source.Dataset,
 		"targetDataset": run.Spec.Target.Dataset,
-		"senderJob":     names.SenderName,
-		"receiveTask":   names.ReceiveTaskName,
 		"reason":        wantReason,
 	})
 
@@ -1634,6 +1629,22 @@ func assertNoLogEntry(t *testing.T, logs *capturedLogs, msg string) {
 			t.Fatalf("logs contained %q: %#v", msg, logs.entries)
 		}
 	}
+}
+
+func assertLogEntryExcludesFields(t *testing.T, logs *capturedLogs, msg string, fields ...string) {
+	t.Helper()
+	for _, entry := range logs.entries {
+		if entry["msg"] != msg {
+			continue
+		}
+		for _, field := range fields {
+			if _, ok := entry[field]; ok {
+				t.Fatalf("log %q unexpectedly contained field %q: %#v", msg, field, entry)
+			}
+		}
+		return
+	}
+	t.Fatalf("logs did not contain %q: %#v", msg, logs.entries)
 }
 
 func logEntryHasFields(entry map[string]any, fields map[string]string) bool {

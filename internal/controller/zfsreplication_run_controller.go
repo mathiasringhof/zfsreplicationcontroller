@@ -54,7 +54,7 @@ func (r *ZFSReplicationRunReconciler) Reconcile(ctx context.Context, req ctrl.Re
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 	names := objectNamesForRun(run.Name)
-	logger := log.FromContext(ctx).WithValues(runLogValues(&run, names)...)
+	logger := log.FromContext(ctx).WithValues(runLogValues(&run)...)
 	ctx = log.IntoContext(ctx, logger)
 	logger.V(1).Info("reconciling replication run")
 	if run.Status.Phase.Terminal() {
@@ -99,7 +99,7 @@ func (r *ZFSReplicationRunReconciler) Reconcile(ctx context.Context, req ctrl.Re
 		return ctrl.Result{}, err
 	}
 	if senderExists {
-		logger.WithValues("receiverPod", receiver.podName, "receiverPodIP", receiver.podIP).V(1).Info("sender job already present")
+		logger.WithValues("senderJob", names.SenderName, "receiverPod", receiver.podName).V(1).Info("sender job already present")
 		if result, done, err := r.finishFromSenderJob(ctx, &run, names, receiver); err != nil || done {
 			return result, err
 		}
@@ -172,7 +172,7 @@ func (r *ZFSReplicationRunReconciler) ensureSenderStarted(ctx context.Context, r
 		podName: task.Status.ReceiverPod.Name,
 		podIP:   task.Status.Endpoint.Host,
 	}
-	receiverLogger := log.FromContext(ctx).WithValues("receiverPod", receiver.podName, "receiverPodIP", receiver.podIP)
+	receiverLogger := log.FromContext(ctx).WithValues("receiveTask", names.ReceiveTaskName, "receiverPod", receiver.podName)
 	observedStatus := r.observedRunStatus(ctx, run)
 	if observedStatus.Phase == zfsv1.PhaseReceiverReady || observedStatus.Phase == zfsv1.PhaseRunning {
 		receiverLogger.V(1).Info("replication receiver is ready")
@@ -210,7 +210,7 @@ func (r *ZFSReplicationRunReconciler) ensureSenderStarted(ctx context.Context, r
 		return runReceiverStatus{}, ctrl.Result{}, false, err
 	}
 	if created {
-		log.FromContext(ctx).WithValues("receiverPod", receiver.podName, "receiverPodIP", receiver.podIP).Info("created sender job")
+		log.FromContext(ctx).WithValues("senderJob", names.SenderName, "receiverPod", receiver.podName).Info("created sender job")
 	}
 	if recheck {
 		return receiver, ctrl.Result{RequeueAfter: time.Second}, true, nil
@@ -244,8 +244,9 @@ func (r *ZFSReplicationRunReconciler) finishFromSenderJob(ctx context.Context, r
 		if err != nil {
 			return ctrl.Result{}, false, err
 		}
-		log.FromContext(ctx).WithValues("receiverPod", receiver.podName, "receiverPodIP", receiver.podIP, "reason", msg).Info("sender job failed")
-		return ctrl.Result{}, true, r.failRunObject(ctx, run, names, msg)
+		failureLogger := log.FromContext(ctx).WithValues("senderJob", names.SenderName, "receiverPod", receiver.podName)
+		failureCtx := log.IntoContext(ctx, failureLogger)
+		return ctrl.Result{}, true, r.failRunObject(failureCtx, run, names, msg)
 	}
 
 	senderDone, err := r.jobSucceeded(ctx, run.Namespace, names.SenderName)
@@ -253,7 +254,6 @@ func (r *ZFSReplicationRunReconciler) finishFromSenderJob(ctx context.Context, r
 		return ctrl.Result{}, false, err
 	}
 	if senderDone {
-		log.FromContext(ctx).WithValues("receiverPod", receiver.podName, "receiverPodIP", receiver.podIP).Info("sender job succeeded")
 		now := metav1.Now()
 		if err := r.patchRunStatus(ctx, run, func(st *zfsv1.ZFSReplicationRunStatus) {
 			st.Phase = zfsv1.PhaseSucceeded
@@ -265,6 +265,7 @@ func (r *ZFSReplicationRunReconciler) finishFromSenderJob(ctx context.Context, r
 		}); err != nil {
 			return ctrl.Result{}, false, err
 		}
+		log.FromContext(ctx).WithValues("senderJob", names.SenderName, "receiverPod", receiver.podName).Info("replication succeeded")
 		return ctrl.Result{}, true, errors.Join(
 			r.markReceiveTaskTerminal(ctx, run, names, zfsv1.ReceiveTaskPhaseCompleted, ""),
 			r.cleanupRunEphemeralObjects(ctx, run, names),
@@ -284,7 +285,7 @@ func (r *ZFSReplicationRunReconciler) SetupWithManager(mgr ctrl.Manager) error {
 }
 
 func (r *ZFSReplicationRunReconciler) waitForReplicationReceiver(ctx context.Context, run *zfsv1.ZFSReplicationRun, names runObjects) (ctrl.Result, error) {
-	logger := log.FromContext(ctx)
+	logger := log.FromContext(ctx).WithValues("receiveTask", names.ReceiveTaskName)
 	observedStatus := r.observedRunStatus(ctx, run)
 	if observedStatus.Phase != zfsv1.PhaseStartingReceiver {
 		logger.Info("waiting for replication receiver")
@@ -705,6 +706,7 @@ func (r *ZFSReplicationRunReconciler) podReader() client.Reader {
 }
 
 func (r *ZFSReplicationRunReconciler) failRunObject(ctx context.Context, run *zfsv1.ZFSReplicationRun, names runObjects, msg string) error {
+	wasFailed := r.observedRunStatus(ctx, run).Phase == zfsv1.PhaseFailed
 	now := metav1.Now()
 	if err := r.patchRunStatus(ctx, run, func(st *zfsv1.ZFSReplicationRunStatus) {
 		st.Phase = zfsv1.PhaseFailed
@@ -714,6 +716,9 @@ func (r *ZFSReplicationRunReconciler) failRunObject(ctx context.Context, run *zf
 	}); err != nil {
 		return err
 	}
+	if !wasFailed {
+		log.FromContext(ctx).WithValues("reason", diagnosis.Sanitize(msg).String()).Info("replication failed")
+	}
 	return errors.Join(
 		r.markReceiveTaskTerminal(ctx, run, names, zfsv1.ReceiveTaskPhaseFailed, msg),
 		r.cleanupRunEphemeralObjects(ctx, run, names),
@@ -721,15 +726,22 @@ func (r *ZFSReplicationRunReconciler) failRunObject(ctx context.Context, run *zf
 }
 
 func (r *ZFSReplicationRunReconciler) failRunValidation(ctx context.Context, run *zfsv1.ZFSReplicationRun, msg string) error {
+	wasFailed := r.observedRunStatus(ctx, run).Phase == zfsv1.PhaseFailed
 	now := metav1.Now()
-	return r.patchRunStatus(ctx, run, func(st *zfsv1.ZFSReplicationRunStatus) {
+	if err := r.patchRunStatus(ctx, run, func(st *zfsv1.ZFSReplicationRunStatus) {
 		st.Phase = zfsv1.PhaseFailed
 		st.CompletedAt = &now
 		st.LastError = msg
 		if st.StartedAt == nil {
 			st.StartedAt = &now
 		}
-	})
+	}); err != nil {
+		return err
+	}
+	if !wasFailed {
+		log.FromContext(ctx).WithValues("reason", diagnosis.Sanitize(msg).String()).Info("replication failed")
+	}
+	return nil
 }
 
 func (r *ZFSReplicationRunReconciler) markReceiveTaskTerminal(ctx context.Context, run *zfsv1.ZFSReplicationRun, names runObjects, phase zfsv1.ReceiveTaskPhase, msg string) error {
@@ -848,7 +860,7 @@ func fillRunStatusNames(st *zfsv1.ZFSReplicationRunStatus, names runObjects) {
 	st.SSHSecretName = names.SecretName
 }
 
-func runLogValues(run *zfsv1.ZFSReplicationRun, names runObjects) []any {
+func runLogValues(run *zfsv1.ZFSReplicationRun) []any {
 	return []any{
 		"namespace", run.Namespace,
 		"run", run.Name,
@@ -856,10 +868,6 @@ func runLogValues(run *zfsv1.ZFSReplicationRun, names runObjects) []any {
 		"sourceDataset", run.Spec.Source.Dataset,
 		"targetNode", run.Spec.Target.NodeName,
 		"targetDataset", run.Spec.Target.Dataset,
-		"senderJob", names.SenderName,
-		"receiveTask", names.ReceiveTaskName,
-		"sshSecret", names.SecretName,
-		"syncoidIdentifier", syncSnapshotIdentifierForRun(run),
 	}
 }
 

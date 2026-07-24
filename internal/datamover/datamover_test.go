@@ -147,9 +147,9 @@ func TestSenderLogsSuccessfulSyncoidRun(t *testing.T) {
 	out := logs.String()
 	for _, want := range []string{
 		"sender starting",
-		"srcDataset=tank/src",
-		"dstDataset=tank/dst",
-		"dstHost=root@10.0.0.42",
+		"sourceDataset=tank/src",
+		"targetDataset=tank/dst",
+		"targetHost=root@10.0.0.42",
 		"syncoidIdentifier=zrc-123",
 		"deleteTargetSnapshots=false",
 		"syncoid command",
@@ -167,6 +167,11 @@ func TestSenderLogsSuccessfulSyncoidRun(t *testing.T) {
 	} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("logs missing %q:\n%s", want, out)
+		}
+	}
+	for _, field := range []string{"srcDataset=", "dstDataset=", "dstHost="} {
+		if strings.Contains(out, field) {
+			t.Fatalf("logs contain abbreviated field %q:\n%s", field, out)
 		}
 	}
 	if strings.Contains(out, "finalSnapshot=") {

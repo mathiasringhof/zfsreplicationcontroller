@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -9,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-logr/logr/funcr"
 	zfsv1 "github.com/mathias/zfsreplicationcontroller/api/v1alpha1"
 	"github.com/mathias/zfsreplicationcontroller/internal/receiverauthorization"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -17,6 +19,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
@@ -67,8 +70,9 @@ func TestSynchronizedAuthorizedSSHDStartup(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			order := []string{}
+			ctx, logs := captureReceiverLogger()
 			_, err := startSynchronizedAuthorizedSSHD(
-				context.Background(), receiverConfig{},
+				ctx, receiverConfig{},
 				func(context.Context) bool {
 					order = append(order, "cache")
 					return tt.cacheSynced
@@ -78,6 +82,9 @@ func TestSynchronizedAuthorizedSSHDStartup(t *testing.T) {
 					return tt.activationErr
 				},
 				func(context.Context, receiverConfig) (<-chan error, error) {
+					if countReceiverLogEntries(logs, "receiver serving") != 0 {
+						t.Fatal("receiver serving was logged before sshd started")
+					}
 					order = append(order, "sshd")
 					return make(chan error), nil
 				},
@@ -94,8 +101,36 @@ func TestSynchronizedAuthorizedSSHDStartup(t *testing.T) {
 			if got := strings.Join(order, ","); got != tt.wantOrder {
 				t.Fatalf("startup order = %q, want %q", got, tt.wantOrder)
 			}
+			wantServing := 0
+			if tt.name == "success" {
+				wantServing = 1
+			}
+			if got := countReceiverLogEntries(logs, "receiver serving"); got != wantServing {
+				t.Fatalf("receiver serving log count = %d, want %d; logs = %#v", got, wantServing, logs)
+			}
 		})
 	}
+}
+
+func captureReceiverLogger() (context.Context, *[]map[string]any) {
+	var entries []map[string]any
+	logger := funcr.NewJSON(func(obj string) {
+		entry := map[string]any{}
+		if err := json.Unmarshal([]byte(obj), &entry); err == nil {
+			entries = append(entries, entry)
+		}
+	}, funcr.Options{})
+	return log.IntoContext(context.Background(), logger), &entries
+}
+
+func countReceiverLogEntries(entries *[]map[string]any, msg string) int {
+	count := 0
+	for _, entry := range *entries {
+		if entry["msg"] == msg {
+			count++
+		}
+	}
+	return count
 }
 
 func TestQueuedInitialReconciliationDistinguishesActivationFromLaterReporting(t *testing.T) {
@@ -501,8 +536,16 @@ func TestReceiverAuthorizationReconcilerDistinguishesDegradedFromUntrustedAuthor
 				startupGate:   closedStartupGate(),
 			}
 			r.apiReader = r.client
-			if _, err := r.Reconcile(context.Background(), reconcile.Request{}); !errors.Is(err, publicationErr) {
+			_, err := r.Reconcile(context.Background(), reconcile.Request{})
+			if !errors.Is(err, publicationErr) {
 				t.Fatalf("Reconcile() error = %v, want publication failure", err)
+			}
+			if tt.activeUsable {
+				for _, want := range []string{"receiver authorization degraded", "retaining last complete snapshot"} {
+					if !strings.Contains(err.Error(), want) {
+						t.Fatalf("Reconcile() error = %q, want %q", err, want)
+					}
+				}
 			}
 			select {
 			case err := <-fatal:

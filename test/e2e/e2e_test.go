@@ -379,6 +379,30 @@ func TestE2ENamespacedDeploymentSmoke(t *testing.T) {
 	k.assertRunUnreconciled(e2eNamespace, ignored.Name, 20*time.Second)
 }
 
+func TestE2EReceiverLoggingSmoke(t *testing.T) {
+	k := newKubectlRunner(t)
+
+	time.Sleep(35 * time.Second)
+	logs, err := k.runOutput(
+		30*time.Second,
+		"logs",
+		"-n", e2eControllerNamespace,
+		"-l", "app.kubernetes.io/name=zfs-receiver",
+		"-c", "receiver",
+		"--prefix=true",
+		"--tail=-1",
+	)
+	if err != nil {
+		t.Fatalf("collect Receiver logs: %v", err)
+	}
+	if !strings.Contains(logs, "receiver serving") {
+		t.Fatalf("Receiver logs do not contain serving event:\n%s", logs)
+	}
+	if strings.Contains(logs, "log.SetLogger(...) was never called") {
+		t.Fatalf("Receiver logs contain controller-runtime missing-logger warning:\n%s", logs)
+	}
+}
+
 type replicationCase struct {
 	Name          string
 	SourceNode    string

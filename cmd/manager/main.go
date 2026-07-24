@@ -3,6 +3,7 @@ package main
 import (
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 
@@ -30,6 +31,20 @@ func requiredReleaseImage(lookup func(string) string) (string, error) {
 }
 
 func main() {
+	os.Exit(managerMain(os.Stderr, runManager))
+}
+
+func managerMain(stderr io.Writer, run func() error) int {
+	if err := run(); err != nil {
+		if _, writeErr := fmt.Fprintln(stderr, err); writeErr != nil {
+			return 1
+		}
+		return 1
+	}
+	return 0
+}
+
+func runManager() error {
 	var metricsAddr, probeAddr, watchNamespace string
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "metrics bind address")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "probe bind address")
@@ -37,7 +52,7 @@ func main() {
 	flag.Parse()
 	releaseImage, err := requiredReleaseImage(os.Getenv)
 	if err != nil {
-		panic(err)
+		return err
 	}
 
 	ctrl.SetLogger(logzap.New())
@@ -49,10 +64,13 @@ func main() {
 	utilruntime.Must(coordinationv1.AddToScheme(scheme))
 	utilruntime.Must(zfsv1.AddToScheme(scheme))
 
-	config := ctrl.GetConfigOrDie()
+	config, err := ctrl.GetConfig()
+	if err != nil {
+		return fmt.Errorf("get Kubernetes configuration: %w", err)
+	}
 	mgr, err := ctrl.NewManager(config, managerOptions(scheme, metricsAddr, probeAddr, watchNamespace))
 	if err != nil {
-		panic(err)
+		return fmt.Errorf("create manager: %w", err)
 	}
 	runReconciler := &controller.ZFSReplicationRunReconciler{
 		Client:            mgr.GetClient(),
@@ -62,24 +80,25 @@ func main() {
 		ReceiverNamespace: os.Getenv("POD_NAMESPACE"),
 	}
 	if err := runReconciler.SetupWithManager(mgr); err != nil {
-		panic(err)
+		return fmt.Errorf("set up replication run controller: %w", err)
 	}
 	scheduleReconciler := &controller.ZFSReplicationScheduleReconciler{
 		Client: mgr.GetClient(),
 		Scheme: scheme,
 	}
 	if err := scheduleReconciler.SetupWithManager(mgr); err != nil {
-		panic(err)
+		return fmt.Errorf("set up replication schedule controller: %w", err)
 	}
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
-		panic(err)
+		return fmt.Errorf("add manager health check: %w", err)
 	}
 	if err := mgr.AddReadyzCheck("readyz", healthz.Ping); err != nil {
-		panic(err)
+		return fmt.Errorf("add manager readiness check: %w", err)
 	}
 	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
-		panic(err)
+		return fmt.Errorf("run manager: %w", err)
 	}
+	return nil
 }
 
 func managerOptions(scheme *runtime.Scheme, metricsAddr, probeAddr, watchNamespace string) ctrl.Options {

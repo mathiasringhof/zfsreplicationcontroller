@@ -296,6 +296,10 @@ Sender Jobs use `backoffLimit: 0`, `restartPolicy: Never`, and
 
 The target dataset must be passive and suitable for `syncoid` to receive into.
 
+The component boundaries, event policy, field conventions, redaction
+constraints, and testing approach for operational logs are documented in
+[`docs/logging.md`](docs/logging.md).
+
 `forceDelete` is destructive. When enabled, the sender passes `--force-delete`
 to Syncoid so it may destroy conflicting target datasets.
 
