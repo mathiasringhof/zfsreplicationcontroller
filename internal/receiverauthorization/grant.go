@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/mathias/zfsreplicationcontroller/internal/replication"
+	"github.com/mathias/zfsreplicationcontroller/internal/syncoid"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -138,7 +139,7 @@ func compileCandidate(now time.Time, candidate Candidate, publicKey string) (gra
 		AllowSyncSnapshotDestroy:   candidate.AllowSyncSnapshotDestroy,
 		AllowTargetSnapshotDestroy: candidate.AllowTargetSnapshotDestroy,
 		SyncSnapshotIdentifier:     candidate.SyncSnapshotIdentifier,
-		Compression:                replication.CompressionDefault(candidate.Compression),
+		Compression:                syncoid.CompressionDefault(candidate.Compression),
 	}
 	if err := validateCandidateRules(candidate); err != nil {
 		return grant{}, err
@@ -176,10 +177,10 @@ func validateGrant(now time.Time, compiledGrant grant) error {
 	if !replication.ValidDatasetName(compiledGrant.TargetDataset) {
 		return fmt.Errorf("invalid destination dataset %q", compiledGrant.TargetDataset)
 	}
-	if compiledGrant.Compression == "" || !replication.CompressionSupported(compiledGrant.Compression) {
+	if compiledGrant.Compression == "" || !syncoid.CompressionSupported(compiledGrant.Compression) {
 		return fmt.Errorf("unsupported compression %q", compiledGrant.Compression)
 	}
-	if compiledGrant.SyncSnapshotIdentifier != "" && !replication.ValidSyncoidIdentifier(compiledGrant.SyncSnapshotIdentifier) {
+	if compiledGrant.SyncSnapshotIdentifier != "" && !syncoid.ValidIdentifier(compiledGrant.SyncSnapshotIdentifier) {
 		return fmt.Errorf("invalid sync snapshot identifier %q", compiledGrant.SyncSnapshotIdentifier)
 	}
 	if compiledGrant.AllowSyncSnapshotDestroy && compiledGrant.SyncSnapshotIdentifier == "" {

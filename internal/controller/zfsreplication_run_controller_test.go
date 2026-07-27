@@ -10,7 +10,7 @@ import (
 
 	"github.com/go-logr/logr/funcr"
 	zfsv1 "github.com/mathias/zfsreplicationcontroller/api/v1alpha1"
-	"github.com/mathias/zfsreplicationcontroller/internal/datamover"
+	"github.com/mathias/zfsreplicationcontroller/internal/syncoid"
 	"golang.org/x/crypto/ssh"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -29,7 +29,7 @@ import (
 
 const testReceiverHostKey = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOOBMEh4NBNCYArCdegKrXOfyIVEEhfvFoOYNYjsBP41 receiver"
 
-func TestRunReconcileSenderJobUsesSyncoidOptions(t *testing.T) {
+func TestRunReconcileSenderJobEmbedsSyncoidTranslation(t *testing.T) {
 	run := replicationRun("manual-1")
 	run.Spec.Syncoid.DeleteTargetSnapshots = ptr(true)
 	names := objectNamesForRun(run.Name)
@@ -54,56 +54,20 @@ func TestRunReconcileSenderJobUsesSyncoidOptions(t *testing.T) {
 	if container.TerminationMessagePolicy != corev1.TerminationMessageReadFile {
 		t.Fatalf("termination message policy = %q, want File", container.TerminationMessagePolicy)
 	}
-	if got := envValue(sender, "SRC_DATASET"); got != "tank/src" {
-		t.Fatalf("SRC_DATASET = %q", got)
-	}
 	if got := envValue(sender, "DST_HOST"); got != "zfs-recv@10.0.0.42" {
 		t.Fatalf("DST_HOST = %q", got)
 	}
 	if got := envValue(sender, "KNOWN_HOSTS_FILE"); got != "/var/run/zfsrep/ssh/known_hosts" {
 		t.Fatalf("KNOWN_HOSTS_FILE = %q", got)
 	}
-	if got := envValue(sender, "SYNCOID_NO_SYNC_SNAP"); got != "true" {
-		t.Fatalf("SYNCOID_NO_SYNC_SNAP = %q", got)
+	contract, err := syncoid.Translate(run)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if got := envValue(sender, "SYNCOID_DELETE_TARGET_SNAPSHOTS"); got != "true" {
-		t.Fatalf("SYNCOID_DELETE_TARGET_SNAPSHOTS = %q", got)
-	}
-	if got := envValue(sender, "SYNCOID_COMPRESS"); got != "zstd" {
-		t.Fatalf("SYNCOID_COMPRESS = %q", got)
-	}
-	if got := envValue(sender, "SYNCOID_IDENTIFIER"); got == "" || strings.ContainsAny(got, " \t\r\n;|&`$()<>\\") {
-		t.Fatalf("SYNCOID_IDENTIFIER = %q, want non-empty shell-safe identifier", got)
-	}
-	if got := envValue(sender, "SYNCOID_INCLUDE_SNAPS"); got != "^snap-.*\n^manual$" {
-		t.Fatalf("SYNCOID_INCLUDE_SNAPS = %q", got)
-	}
-	if got := envValue(sender, "SYNCOID_EXCLUDE_SNAPS"); got != ".*-tmp$" {
-		t.Fatalf("SYNCOID_EXCLUDE_SNAPS = %q", got)
-	}
-	cfg := datamover.SenderConfigFromLookup(func(name string) string {
-		return envValue(sender, name)
-	})
-	if cfg.SrcDataset != run.Spec.Source.Dataset {
-		t.Fatalf("round-tripped SrcDataset = %q, want %q", cfg.SrcDataset, run.Spec.Source.Dataset)
-	}
-	if cfg.DstDataset != run.Spec.Target.Dataset {
-		t.Fatalf("round-tripped DstDataset = %q, want %q", cfg.DstDataset, run.Spec.Target.Dataset)
-	}
-	if cfg.DstHost != "zfs-recv@10.0.0.42" {
-		t.Fatalf("round-tripped DstHost = %q", cfg.DstHost)
-	}
-	if !cfg.NoSyncSnap || !cfg.NoRollback || cfg.ForceDelete || !cfg.DeleteTargetSnapshots || cfg.Compress != "zstd" {
-		t.Fatalf("round-tripped Syncoid config = %#v", cfg)
-	}
-	if cfg.ReceiveUnmounted || cfg.ReceiveResumable {
-		t.Fatalf("round-tripped receive flags = %#v, want both false", cfg)
-	}
-	if strings.Join(cfg.IncludeSnaps, "\n") != strings.Join(run.Spec.Syncoid.IncludeSnaps, "\n") {
-		t.Fatalf("round-tripped IncludeSnaps = %#v", cfg.IncludeSnaps)
-	}
-	if strings.Join(cfg.ExcludeSnaps, "\n") != strings.Join(run.Spec.Syncoid.ExcludeSnaps, "\n") {
-		t.Fatalf("round-tripped ExcludeSnaps = %#v", cfg.ExcludeSnaps)
+	for _, entry := range contract.SenderEnvironment {
+		if got := envValue(sender, entry.Name); got != entry.Value {
+			t.Fatalf("sender environment %s = %q, want translated value %q", entry.Name, got, entry.Value)
+		}
 	}
 	var secret corev1.Secret
 	if err := r.Get(context.Background(), types.NamespacedName{Name: names.SecretName, Namespace: run.Namespace}, &secret); err != nil {
@@ -172,26 +136,12 @@ func TestRunReconcileCreatesReceiveTaskBeforeSenderJob(t *testing.T) {
 	if want := now.Add(30 * time.Minute); !task.Spec.SSH.ExpiresAt.Time.Equal(want) {
 		t.Fatalf("task expiresAt = %s, want controller time plus 30 minutes %s", task.Spec.SSH.ExpiresAt.Time, want)
 	}
-	if task.Spec.Policy.AllowRollback {
-		t.Fatal("task allows rollback by default")
+	contract, err := syncoid.Translate(run)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if task.Spec.Policy.ReceiveResumable {
-		t.Fatal("task allows resumable receive when the run disabled it")
-	}
-	if !task.Spec.Policy.AllowMount {
-		t.Fatal("task does not allow mounted receive when the run disabled receiveUnmounted")
-	}
-	if task.Spec.Policy.AllowSyncSnapshotDestroy {
-		t.Fatal("task allows Syncoid snapshot pruning when noSyncSnap is true")
-	}
-	if !task.Spec.Policy.AllowTargetSnapshotDestroy {
-		t.Fatal("task does not allow target snapshot destroy when deleteTargetSnapshots is true")
-	}
-	if task.Spec.Policy.Compression != "zstd" {
-		t.Fatalf("task compression = %q, want zstd", task.Spec.Policy.Compression)
-	}
-	if task.Spec.Policy.SyncSnapshotIdentifier == "" || strings.ContainsAny(task.Spec.Policy.SyncSnapshotIdentifier, " \t\r\n;|&`$()<>\\") {
-		t.Fatalf("task sync snapshot identifier = %q, want non-empty shell-safe identifier", task.Spec.Policy.SyncSnapshotIdentifier)
+	if task.Spec.Policy != contract.ReceiverPolicy {
+		t.Fatalf("task policy = %#v, want translated policy %#v", task.Spec.Policy, contract.ReceiverPolicy)
 	}
 	assertObjectDeleted(t, r.Client, &batchv1.Job{}, names.SenderName)
 	assertRunPhase(t, r.Client, run.Name, zfsv1.PhaseStartingReceiver)
@@ -348,7 +298,7 @@ func TestRunningRunRequeuesAtExplicitLeaseRenewalDeadline(t *testing.T) {
 	names := objectNamesForRun(run.Name)
 	task := readyReceiveTask(run, names, "10.0.0.42", testReceiverHostKey)
 	task.Spec.SSH.ExpiresAt = metav1.NewTime(now.Add(15 * time.Minute))
-	sender := runSenderJob(run, names, "datamover:test", task.Status.Endpoint.Host)
+	sender := mustRunSenderJob(t, run, names, "datamover:test", task.Status.Endpoint.Host)
 	r := newRunReconciler(t, run, task, sender)
 	r.now = func() time.Time { return now }
 
@@ -925,7 +875,7 @@ func TestRunReconcileLogsSenderSuccess(t *testing.T) {
 	run.Status.ReceiverPodName = "zfs-receiver-worker-b"
 	run.Status.ReceiverPodIP = "10.0.0.42"
 	task := readyReceiveTask(run, names, "10.0.0.42", testReceiverHostKey)
-	sender := runSenderJob(run, names, "datamover:test", "10.0.0.42")
+	sender := mustRunSenderJob(t, run, names, "datamover:test", "10.0.0.42")
 	sender.Status.Succeeded = 1
 	r := newRunReconciler(t, run, task, sender)
 	ctx, logs := captureRunLogger()
@@ -948,7 +898,7 @@ func TestRunReconcileLogsSenderJobAlreadyPresent(t *testing.T) {
 	run.Status.ReceiverPodName = "zfs-receiver-worker-b"
 	run.Status.ReceiverPodIP = "10.0.0.42"
 	task := readyReceiveTask(run, names, "10.0.0.42", testReceiverHostKey)
-	sender := runSenderJob(run, names, "datamover:test", "10.0.0.42")
+	sender := mustRunSenderJob(t, run, names, "datamover:test", "10.0.0.42")
 	r := newRunReconciler(t, run, task, sender)
 	ctx, logs := captureRunLogger()
 
@@ -965,7 +915,7 @@ func TestRunReconcileLogsSenderFailure(t *testing.T) {
 	run.Status.ReceiverPodName = "zfs-receiver-worker-b"
 	run.Status.ReceiverPodIP = "10.0.0.42"
 	task := readyReceiveTask(run, names, "10.0.0.42", testReceiverHostKey)
-	sender := runSenderJob(run, names, "datamover:test", "10.0.0.42")
+	sender := mustRunSenderJob(t, run, names, "datamover:test", "10.0.0.42")
 	sender.Status.Failed = 1
 	sender.Status.Conditions = []batchv1.JobCondition{
 		{Type: batchv1.JobFailed, Status: corev1.ConditionTrue, Message: "syncoid exited with status 1"},
@@ -992,7 +942,7 @@ func TestRunReconcileUsesSanitizedTerminationMessageFromExactSenderJob(t *testin
 	names := objectNamesForRun(run.Name)
 	run.Status.ReceiverPodName = "zfs-receiver-worker-b"
 	run.Status.ReceiverPodIP = "10.0.0.42"
-	sender := runSenderJob(run, names, "datamover:test", "10.0.0.42")
+	sender := mustRunSenderJob(t, run, names, "datamover:test", "10.0.0.42")
 	sender.UID = "sender-job-uid"
 	sender.Status.Failed = 1
 	finished := metav1.NewTime(time.Date(2026, 7, 19, 10, 0, 0, 0, time.UTC))
@@ -1061,7 +1011,7 @@ func TestRunReconcileSelectsNewestTerminatedSenderDeterministically(t *testing.T
 		t.Run(tt.name, func(t *testing.T) {
 			run := replicationRun("manual-newest-" + strings.ReplaceAll(tt.name, " ", "-"))
 			names := objectNamesForRun(run.Name)
-			sender := runSenderJob(run, names, "release:test", "10.0.0.42")
+			sender := mustRunSenderJob(t, run, names, "release:test", "10.0.0.42")
 			sender.UID = types.UID("sender-job-uid-" + tt.name)
 			sender.Status.Failed = 1
 			finished := metav1.NewTime(base)
@@ -1088,7 +1038,7 @@ func TestRunReconcileSelectsNewestTerminatedSenderDeterministically(t *testing.T
 func TestRunReconcileFallsBackToTerminationReasonAndExitCode(t *testing.T) {
 	run := replicationRun("manual-termination-reason")
 	names := objectNamesForRun(run.Name)
-	sender := runSenderJob(run, names, "release:test", "10.0.0.42")
+	sender := mustRunSenderJob(t, run, names, "release:test", "10.0.0.42")
 	sender.UID = "sender-job-uid"
 	sender.Status.Failed = 1
 	pod := terminatedSenderPod(run.Namespace, "sender-pod", sender, metav1.Now(), "")
@@ -1115,7 +1065,7 @@ func TestRunReconcileRedactsQuotedJobFailedConditionWithoutPodLogs(t *testing.T)
 	run.Status.ReceiverPodName = "zfs-receiver-worker-b"
 	run.Status.ReceiverPodIP = "10.0.0.42"
 	task := readyReceiveTask(run, names, "10.0.0.42", testReceiverHostKey)
-	sender := runSenderJob(run, names, "datamover:test", "10.0.0.42")
+	sender := mustRunSenderJob(t, run, names, "datamover:test", "10.0.0.42")
 	sender.Status.Failed = 1
 	sender.Status.Conditions = []batchv1.JobCondition{
 		{
@@ -1423,6 +1373,15 @@ func replicationRun(name string) *zfsv1.ZFSReplicationRun {
 			},
 		},
 	}
+}
+
+func mustRunSenderJob(t *testing.T, run *zfsv1.ZFSReplicationRun, names runObjects, image, receiverPodIP string) *batchv1.Job {
+	t.Helper()
+	job, err := runSenderJob(run, names, image, receiverPodIP)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return job
 }
 
 func runReceiverPod(run *zfsv1.ZFSReplicationRun, ip string) *corev1.Pod {

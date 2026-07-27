@@ -40,24 +40,10 @@ func TestValidDatasetName(t *testing.T) {
 	}
 }
 
-func TestSyncoidIdentifierAndSnapshotHelpers(t *testing.T) {
-	for _, identifier := range []string{"zrc-123", "rel_123", "rel.123", "rel:123"} {
-		if !ValidSyncoidIdentifier(identifier) {
-			t.Fatalf("ValidSyncoidIdentifier(%q) = false, want true", identifier)
-		}
-	}
-	for _, identifier := range []string{"", "bad/id", "bad id", "bad;id"} {
-		if ValidSyncoidIdentifier(identifier) {
-			t.Fatalf("ValidSyncoidIdentifier(%q) = true, want false", identifier)
-		}
-	}
-
+func TestDatasetAndSnapshotHelpers(t *testing.T) {
 	dataset, snapshot, ok := SplitSnapshotTarget("tank/app@syncoid_rel123_worker_2026")
 	if !ok || dataset != "tank/app" || snapshot != "syncoid_rel123_worker_2026" {
 		t.Fatalf("SplitSnapshotTarget() = %q, %q, %v", dataset, snapshot, ok)
-	}
-	if !SyncoidSnapshotTarget(snapshot, "rel123") {
-		t.Fatalf("SyncoidSnapshotTarget(%q, rel123) = false, want true", snapshot)
 	}
 	for _, value := range []string{"tank/app", "tank/app@snap@again", "tank/app@bad,snap"} {
 		if _, _, ok := SplitSnapshotTarget(value); ok {
@@ -74,92 +60,3 @@ func TestSyncoidIdentifierAndSnapshotHelpers(t *testing.T) {
 		t.Fatalf("TargetPool() = %q, want tank", got)
 	}
 }
-
-func TestCompressionMetadata(t *testing.T) {
-	for _, tt := range []struct {
-		compression string
-		syncoid     string
-		command     string
-		args        []string
-	}{
-		{compression: "", syncoid: "none"},
-		{compression: "none", syncoid: "none"},
-		{compression: "gzip", syncoid: "gzip", command: "zcat"},
-		{compression: "pigz", syncoid: "pigz-fast", command: "pigz", args: []string{"-dc"}},
-		{compression: "zstd", syncoid: "zstd-fast", command: "zstd", args: []string{"-dc"}},
-		{compression: "zstdmt", syncoid: "zstdmt-fast", command: "zstdmt", args: []string{"-dc"}},
-		{compression: "xz", syncoid: "xz", command: "xz", args: []string{"-d"}},
-		{compression: "lzop", syncoid: "lzo", command: "lzop", args: []string{"-dfc"}},
-		{compression: "lz4", syncoid: "lz4", command: "lz4", args: []string{"-dc"}},
-	} {
-		t.Run(tt.compression, func(t *testing.T) {
-			if !CompressionSupported(tt.compression) {
-				t.Fatalf("CompressionSupported(%q) = false, want true", tt.compression)
-			}
-			got, err := SyncoidCompression(tt.compression)
-			if err != nil {
-				t.Fatalf("SyncoidCompression(%q) error = %v", tt.compression, err)
-			}
-			if got != tt.syncoid {
-				t.Fatalf("SyncoidCompression(%q) = %q, want %q", tt.compression, got, tt.syncoid)
-			}
-			if tt.command != "" && !DecompressorAllowed(tt.command, tt.args, tt.compression) {
-				t.Fatalf("DecompressorAllowed(%q, %#v, %q) = false, want true", tt.command, tt.args, tt.compression)
-			}
-		})
-	}
-
-	if CompressionSupported("sh") {
-		t.Fatalf("CompressionSupported(sh) = true, want false")
-	}
-	if _, err := SyncoidCompression("sh"); err == nil {
-		t.Fatalf("SyncoidCompression(sh) error = nil, want error")
-	}
-	if DecompressorAllowed("gzip", []string{"-dc"}, "zstd") {
-		t.Fatalf("DecompressorAllowed(gzip, -dc, zstd) = true, want false")
-	}
-}
-
-func TestNormalizeSyncoidOptions(t *testing.T) {
-	include := []string{"^snap-.*"}
-	exclude := []string{".*-tmp$"}
-
-	opts := NormalizeSyncoidOptions(SyncoidOptionInput{
-		NoSyncSnap:            ptr(true),
-		NoRollback:            ptr(false),
-		ForceDelete:           ptr(true),
-		DeleteTargetSnapshots: ptr(true),
-		Compress:              "zstd",
-		ReceiveUnmounted:      ptr(false),
-		ReceiveResumable:      ptr(false),
-		IncludeSnaps:          include,
-		ExcludeSnaps:          exclude,
-	})
-
-	if !opts.NoSyncSnap || opts.NoRollback || !opts.ForceDelete || !opts.DeleteTargetSnapshots || opts.Compress != "zstd" {
-		t.Fatalf("normalized syncoid behavior = %#v", opts)
-	}
-	if opts.ReceiveUnmounted || opts.ReceiveResumable {
-		t.Fatalf("normalized receive flags = %#v, want both false", opts)
-	}
-	include[0] = "mutated"
-	exclude[0] = "mutated"
-	if opts.IncludeSnaps[0] != "^snap-.*" || opts.ExcludeSnaps[0] != ".*-tmp$" {
-		t.Fatalf("normalized slices share caller storage: %#v", opts)
-	}
-}
-
-func TestDefaultSyncoidOptions(t *testing.T) {
-	opts := NormalizeSyncoidOptions(SyncoidOptionInput{})
-	if opts.NoSyncSnap || !opts.NoRollback || opts.ForceDelete || opts.DeleteTargetSnapshots {
-		t.Fatalf("default syncoid behavior = %#v", opts)
-	}
-	if opts.Compress != CompressionNone {
-		t.Fatalf("default compression = %q, want none", opts.Compress)
-	}
-	if !opts.ReceiveUnmounted || !opts.ReceiveResumable {
-		t.Fatalf("default receive flags = %#v, want both true", opts)
-	}
-}
-
-func ptr[T any](v T) *T { return &v }

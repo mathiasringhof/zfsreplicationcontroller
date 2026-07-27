@@ -9,7 +9,10 @@ import (
 	"strings"
 	"testing"
 
+	zfsv1 "github.com/mathias/zfsreplicationcontroller/api/v1alpha1"
 	"github.com/mathias/zfsreplicationcontroller/internal/replication/diagnosis"
+	"github.com/mathias/zfsreplicationcontroller/internal/syncoid"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 type call struct {
@@ -81,18 +84,7 @@ func TestSenderStreamsSyncoidOutputBeforeCommandReturns(t *testing.T) {
 		},
 	}
 
-	err := runSender(context.Background(), SenderConfig{
-		SrcDataset:       "tank/src",
-		DstHost:          "root@10.0.0.42",
-		DstDataset:       "tank/dst",
-		SSHKeyFile:       "/var/run/zfsrep/ssh/id_rsa",
-		KnownHostsFile:   "/var/run/zfsrep/ssh/known_hosts",
-		SSHPort:          "2222",
-		NoRollback:       true,
-		Compress:         "none",
-		ReceiveUnmounted: true,
-		ReceiveResumable: true,
-	}, runner, &logs)
+	err := runSender(context.Background(), defaultSenderConfig(t), runner, &logs)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -127,19 +119,7 @@ func TestSenderLogsSuccessfulSyncoidRun(t *testing.T) {
 	}
 	var logs strings.Builder
 
-	err := runSender(context.Background(), SenderConfig{
-		SrcDataset:        "tank/src",
-		DstHost:           "root@10.0.0.42",
-		DstDataset:        "tank/dst",
-		SSHKeyFile:        "/var/run/zfsrep/ssh/id_rsa",
-		KnownHostsFile:    "/var/run/zfsrep/ssh/known_hosts",
-		SSHPort:           "2222",
-		NoRollback:        true,
-		Compress:          "none",
-		SyncoidIdentifier: "zrc-123",
-		ReceiveUnmounted:  true,
-		ReceiveResumable:  true,
-	}, runner, &logs)
+	err := runSender(context.Background(), defaultSenderConfig(t), runner, &logs)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -150,7 +130,7 @@ func TestSenderLogsSuccessfulSyncoidRun(t *testing.T) {
 		"sourceDataset=tank/src",
 		"targetDataset=tank/dst",
 		"targetHost=root@10.0.0.42",
-		"syncoidIdentifier=zrc-123",
+		"syncoidIdentifier=zrc-",
 		"deleteTargetSnapshots=false",
 		"syncoid command",
 		"--sshkey=<redacted>",
@@ -188,18 +168,7 @@ func TestSenderSuccessSummaryDoesNotReportMisleadingFinalSnapshotForIncremental(
 	}
 	var logs strings.Builder
 
-	err := runSender(context.Background(), SenderConfig{
-		SrcDataset:       "tank/src",
-		DstHost:          "root@10.0.0.42",
-		DstDataset:       "tank/dst",
-		SSHKeyFile:       "/var/run/zfsrep/ssh/id_rsa",
-		KnownHostsFile:   "/var/run/zfsrep/ssh/known_hosts",
-		SSHPort:          "2222",
-		NoRollback:       true,
-		Compress:         "none",
-		ReceiveUnmounted: true,
-		ReceiveResumable: true,
-	}, runner, &logs)
+	err := runSender(context.Background(), defaultSenderConfig(t), runner, &logs)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -234,18 +203,7 @@ func TestSenderLogsFailedSyncoidRunAndReturnsFailureDiagnosis(t *testing.T) {
 	}
 	var logs strings.Builder
 
-	err := runSender(context.Background(), SenderConfig{
-		SrcDataset:       "tank/src",
-		DstHost:          "root@10.0.0.42",
-		DstDataset:       "tank/dst",
-		SSHKeyFile:       "/var/run/zfsrep/ssh/id_rsa",
-		KnownHostsFile:   "/var/run/zfsrep/ssh/known_hosts",
-		SSHPort:          "2222",
-		NoRollback:       true,
-		Compress:         "none",
-		ReceiveUnmounted: true,
-		ReceiveResumable: true,
-	}, runner, &logs)
+	err := runSender(context.Background(), defaultSenderConfig(t), runner, &logs)
 	if err == nil {
 		t.Fatal("runSender() error = nil, want syncoid failure")
 	}
@@ -297,18 +255,7 @@ func TestSenderKeepsDetailedSanitizedLogsSeparateFromFailureDiagnosis(t *testing
 	}
 	var logs strings.Builder
 
-	err := runSender(context.Background(), SenderConfig{
-		SrcDataset:       "tank/src",
-		DstHost:          "root@10.0.0.42",
-		DstDataset:       "tank/dst",
-		SSHKeyFile:       "/var/run/zfsrep/ssh/id_rsa",
-		KnownHostsFile:   "/var/run/zfsrep/ssh/known_hosts",
-		SSHPort:          "2222",
-		NoRollback:       true,
-		Compress:         "none",
-		ReceiveUnmounted: true,
-		ReceiveResumable: true,
-	}, runner, &logs)
+	err := runSender(context.Background(), defaultSenderConfig(t), runner, &logs)
 	if err == nil {
 		t.Fatal("runSender() error = nil, want syncoid failure")
 	}
@@ -358,18 +305,7 @@ func TestSenderStreamingHugeLineLogsBoundedOmission(t *testing.T) {
 		},
 	}
 
-	err := runSender(context.Background(), SenderConfig{
-		SrcDataset:       "tank/src",
-		DstHost:          "root@10.0.0.42",
-		DstDataset:       "tank/dst",
-		SSHKeyFile:       "/var/run/zfsrep/ssh/id_rsa",
-		KnownHostsFile:   "/var/run/zfsrep/ssh/known_hosts",
-		SSHPort:          "2222",
-		NoRollback:       true,
-		Compress:         "none",
-		ReceiveUnmounted: true,
-		ReceiveResumable: true,
-	}, runner, &logs)
+	err := runSender(context.Background(), defaultSenderConfig(t), runner, &logs)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -399,68 +335,27 @@ func failureMessageFromSenderLogs(logs string) string {
 
 func TestSenderRunsSyncoidWithConfiguredSnapshotOptions(t *testing.T) {
 	runner := &fakeRunner{}
-	err := RunSender(context.Background(), SenderConfig{
-		SrcDataset:            "tank/src",
-		DstHost:               "root@10.0.0.42",
-		DstDataset:            "tank/dst",
-		SSHKeyFile:            "/var/run/zfsrep/ssh/id_rsa",
-		KnownHostsFile:        "/var/run/zfsrep/ssh/known_hosts",
-		SSHPort:               "2222",
-		NoSyncSnap:            true,
-		NoRollback:            true,
+	err := RunSender(context.Background(), senderConfig(t, zfsv1.SyncoidSpec{
+		NoSyncSnap:            pointer(true),
+		NoRollback:            pointer(true),
+		ForceDelete:           pointer(true),
 		Compress:              "zstd",
-		SyncoidIdentifier:     "zrc-123",
-		DeleteTargetSnapshots: true,
-		ReceiveUnmounted:      false,
-		ReceiveResumable:      false,
+		DeleteTargetSnapshots: pointer(true),
+		ReceiveUnmounted:      pointer(false),
+		ReceiveResumable:      pointer(false),
 		IncludeSnaps:          []string{"^snap-.*", "^manual$"},
 		ExcludeSnaps:          []string{".*-tmp$"},
-	}, runner)
+	}), runner)
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := "--no-sync-snap --no-rollback --no-privilege-elevation --compress=zstd-fast --identifier=zrc-123 --delete-target-snapshots --sshoption=UserKnownHostsFile=/var/run/zfsrep/ssh/known_hosts --sshoption=StrictHostKeyChecking=yes --sshoption=IdentitiesOnly=yes --sshkey=/var/run/zfsrep/ssh/id_rsa --sshport=2222 --no-resume --include-snaps=^snap-.* --include-snaps=^manual$ --exclude-snaps=.*-tmp$ tank/src root@10.0.0.42:tank/dst"
+	identifierArgument := argumentWithPrefix(t, runner.calls[0].args, "--identifier=")
+	want := "--no-sync-snap --no-rollback --no-privilege-elevation --compress=zstd-fast " + identifierArgument + " --delete-target-snapshots --sshoption=UserKnownHostsFile=/var/run/zfsrep/ssh/known_hosts --sshoption=StrictHostKeyChecking=yes --sshoption=IdentitiesOnly=yes --sshkey=/var/run/zfsrep/ssh/id_rsa --sshport=2222 --no-resume --include-snaps=^snap-.* --include-snaps=^manual$ --exclude-snaps=.*-tmp$ --force-delete tank/src root@10.0.0.42:tank/dst"
 	if !hasNamedCall(runner.calls, "syncoid", want) {
 		t.Fatalf("syncoid was not called with %q: %#v", want, runner.calls)
 	}
 	if hasNamedCall(runner.calls, "zfs", "snapshot tank/src@") {
 		t.Fatalf("zfs snapshot should not be called when syncoid owns snapshot selection: %#v", runner.calls)
-	}
-}
-
-func TestSenderConfigFromEnvDefaults(t *testing.T) {
-	t.Setenv("SYNCOID_NO_SYNC_SNAP", "")
-	t.Setenv("SYNCOID_NO_ROLLBACK", "")
-	t.Setenv("SYNCOID_FORCE_DELETE", "")
-	t.Setenv("SYNCOID_DELETE_TARGET_SNAPSHOTS", "")
-	t.Setenv("SYNCOID_COMPRESS", "")
-	t.Setenv("SYNCOID_IDENTIFIER", "")
-	t.Setenv("RECEIVE_UNMOUNTED", "")
-	t.Setenv("RECEIVE_RESUMABLE", "")
-	cfg := SenderConfigFromEnv()
-	if cfg.NoSyncSnap {
-		t.Fatalf("NoSyncSnap = true, want false")
-	}
-	if !cfg.NoRollback {
-		t.Fatalf("NoRollback = false, want true")
-	}
-	if cfg.ForceDelete {
-		t.Fatalf("ForceDelete = true, want false")
-	}
-	if cfg.DeleteTargetSnapshots {
-		t.Fatalf("DeleteTargetSnapshots = true, want false")
-	}
-	if cfg.Compress != "none" {
-		t.Fatalf("Compress = %q, want none", cfg.Compress)
-	}
-	if cfg.SyncoidIdentifier != "" {
-		t.Fatalf("SyncoidIdentifier = %q, want empty default", cfg.SyncoidIdentifier)
-	}
-	if !cfg.ReceiveUnmounted {
-		t.Fatalf("ReceiveUnmounted = false, want true")
-	}
-	if !cfg.ReceiveResumable {
-		t.Fatalf("ReceiveResumable = false, want true")
 	}
 }
 
@@ -502,100 +397,6 @@ func TestExecRunnerCapturesStderrWithoutMirroringRawOutput(t *testing.T) {
 	}
 }
 
-func TestSenderConfigFromEnvExplicitValuesOverrideDefaults(t *testing.T) {
-	t.Setenv("SYNCOID_NO_SYNC_SNAP", "true")
-	t.Setenv("SYNCOID_NO_ROLLBACK", "false")
-	t.Setenv("SYNCOID_FORCE_DELETE", "true")
-	t.Setenv("SYNCOID_DELETE_TARGET_SNAPSHOTS", "true")
-	t.Setenv("SYNCOID_COMPRESS", "zstd")
-	t.Setenv("SYNCOID_IDENTIFIER", "zrc-123")
-	t.Setenv("RECEIVE_UNMOUNTED", "false")
-	t.Setenv("RECEIVE_RESUMABLE", "false")
-	t.Setenv("SYNCOID_INCLUDE_SNAPS", "^snap-.*\n^manual$")
-	t.Setenv("SYNCOID_EXCLUDE_SNAPS", ".*-tmp$")
-
-	sender := SenderConfigFromEnv()
-	if !sender.NoSyncSnap {
-		t.Fatalf("sender NoSyncSnap = false, want true")
-	}
-	if sender.NoRollback {
-		t.Fatalf("sender NoRollback = true, want false")
-	}
-	if !sender.ForceDelete {
-		t.Fatalf("sender ForceDelete = false, want true")
-	}
-	if !sender.DeleteTargetSnapshots {
-		t.Fatalf("sender DeleteTargetSnapshots = false, want true")
-	}
-	if sender.Compress != "zstd" {
-		t.Fatalf("sender Compress = %q, want zstd", sender.Compress)
-	}
-	if sender.SyncoidIdentifier != "zrc-123" {
-		t.Fatalf("sender SyncoidIdentifier = %q, want zrc-123", sender.SyncoidIdentifier)
-	}
-	if sender.ReceiveUnmounted {
-		t.Fatalf("sender ReceiveUnmounted = true, want false")
-	}
-	if sender.ReceiveResumable {
-		t.Fatalf("sender ReceiveResumable = true, want false")
-	}
-	if strings.Join(sender.IncludeSnaps, " ") != "^snap-.* ^manual$" {
-		t.Fatalf("sender IncludeSnaps = %#v", sender.IncludeSnaps)
-	}
-	if strings.Join(sender.ExcludeSnaps, " ") != ".*-tmp$" {
-		t.Fatalf("sender ExcludeSnaps = %#v", sender.ExcludeSnaps)
-	}
-}
-
-func TestSenderConfigFromLookupParsesControllerEnvContract(t *testing.T) {
-	values := map[string]string{
-		EnvSrcDataset:            "tank/src",
-		EnvDstHost:               "zfs-recv@10.0.0.42",
-		EnvDstDataset:            "tank/dst",
-		EnvSSHKeyFile:            DefaultSSHKeyFile,
-		EnvKnownHostsFile:        DefaultKnownHostsFile,
-		EnvSSHPort:               DefaultSSHPort,
-		EnvNoSyncSnap:            "true",
-		EnvNoRollback:            "false",
-		EnvForceDelete:           "true",
-		EnvDeleteTargetSnapshots: "true",
-		EnvCompress:              "zstd",
-		EnvSyncoidIdentifier:     "zrc-123",
-		EnvReceiveUnmounted:      "false",
-		EnvReceiveResumable:      "false",
-		EnvIncludeSnaps:          "^snap-.*\n^manual$",
-		EnvExcludeSnaps:          ".*-tmp$",
-		EnvExpectedNodeName:      "worker-a",
-		EnvActualNodeName:        "worker-a",
-	}
-
-	cfg := SenderConfigFromLookup(func(key string) string {
-		return values[key]
-	})
-
-	if cfg.SrcDataset != "tank/src" || cfg.DstHost != "zfs-recv@10.0.0.42" || cfg.DstDataset != "tank/dst" {
-		t.Fatalf("dataset/host config = %#v", cfg)
-	}
-	if cfg.SSHKeyFile != DefaultSSHKeyFile || cfg.KnownHostsFile != DefaultKnownHostsFile || cfg.SSHPort != DefaultSSHPort {
-		t.Fatalf("ssh config = %#v", cfg)
-	}
-	if !cfg.NoSyncSnap || cfg.NoRollback || !cfg.ForceDelete || !cfg.DeleteTargetSnapshots || cfg.Compress != "zstd" || cfg.SyncoidIdentifier != "zrc-123" {
-		t.Fatalf("syncoid config = %#v", cfg)
-	}
-	if cfg.ReceiveUnmounted || cfg.ReceiveResumable {
-		t.Fatalf("receive flags = %#v, want both false", cfg)
-	}
-	if strings.Join(cfg.IncludeSnaps, " ") != "^snap-.* ^manual$" {
-		t.Fatalf("IncludeSnaps = %#v", cfg.IncludeSnaps)
-	}
-	if strings.Join(cfg.ExcludeSnaps, " ") != ".*-tmp$" {
-		t.Fatalf("ExcludeSnaps = %#v", cfg.ExcludeSnaps)
-	}
-	if cfg.ExpectedNode != "worker-a" || cfg.ActualNode != "worker-a" {
-		t.Fatalf("node config = %#v", cfg)
-	}
-}
-
 func TestSenderExitsBeforeWorkWhenNodeMismatch(t *testing.T) {
 	runner := &fakeRunner{}
 	err := RunSender(context.Background(), SenderConfig{
@@ -610,114 +411,6 @@ func TestSenderExitsBeforeWorkWhenNodeMismatch(t *testing.T) {
 	}
 }
 
-func TestSenderPassesForceDelete(t *testing.T) {
-	runner := &fakeRunner{}
-	err := RunSender(context.Background(), SenderConfig{
-		SrcDataset:       "tank/src",
-		DstHost:          "root@10.0.0.42",
-		DstDataset:       "tank/dst",
-		SSHKeyFile:       "/var/run/zfsrep/ssh/id_rsa",
-		KnownHostsFile:   "/var/run/zfsrep/ssh/known_hosts",
-		SSHPort:          "2222",
-		NoRollback:       true,
-		Compress:         "none",
-		ForceDelete:      true,
-		ReceiveUnmounted: true,
-		ReceiveResumable: true,
-	}, runner)
-	if err != nil {
-		t.Fatalf("error = %v", err)
-	}
-	want := "--no-rollback --no-privilege-elevation --compress=none --sshoption=UserKnownHostsFile=/var/run/zfsrep/ssh/known_hosts --sshoption=StrictHostKeyChecking=yes --sshoption=IdentitiesOnly=yes --sshkey=/var/run/zfsrep/ssh/id_rsa --sshport=2222 --recvoptions=u --force-delete tank/src root@10.0.0.42:tank/dst"
-	if !hasNamedCall(runner.calls, "syncoid", want) {
-		t.Fatalf("force-delete syncoid call missing %q: %#v", want, runner.calls)
-	}
-}
-
-func TestSenderRejectsUnsafeSyncoidIdentifier(t *testing.T) {
-	runner := &fakeRunner{}
-	err := RunSender(context.Background(), SenderConfig{
-		SrcDataset:        "tank/src",
-		DstHost:           "root@10.0.0.42",
-		DstDataset:        "tank/dst",
-		SSHKeyFile:        "/var/run/zfsrep/ssh/id_rsa",
-		KnownHostsFile:    "/var/run/zfsrep/ssh/known_hosts",
-		SSHPort:           "2222",
-		NoRollback:        true,
-		Compress:          "none",
-		SyncoidIdentifier: "bad;id",
-		ReceiveUnmounted:  true,
-		ReceiveResumable:  true,
-	}, runner)
-	if err == nil || !strings.Contains(err.Error(), "unsupported syncoid identifier") {
-		t.Fatalf("RunSender() error = %v, want unsupported identifier", err)
-	}
-	if len(runner.calls) != 0 {
-		t.Fatalf("syncoid calls = %#v, want none", runner.calls)
-	}
-}
-
-func TestSenderRejectsUnknownCompression(t *testing.T) {
-	runner := &fakeRunner{}
-	err := RunSender(context.Background(), SenderConfig{
-		SrcDataset:       "tank/src",
-		DstHost:          "root@10.0.0.42",
-		DstDataset:       "tank/dst",
-		SSHKeyFile:       "/var/run/zfsrep/ssh/id_rsa",
-		KnownHostsFile:   "/var/run/zfsrep/ssh/known_hosts",
-		SSHPort:          "2222",
-		NoRollback:       true,
-		Compress:         "sh",
-		ReceiveUnmounted: true,
-		ReceiveResumable: true,
-	}, runner)
-	if err == nil || !strings.Contains(err.Error(), "unsupported compression") {
-		t.Fatalf("RunSender() error = %v, want unsupported compression", err)
-	}
-	if len(runner.calls) != 0 {
-		t.Fatalf("syncoid calls = %#v, want none", runner.calls)
-	}
-}
-
-func TestSenderNormalizesCompressionAliasesForSyncoid(t *testing.T) {
-	for _, tt := range []struct {
-		name     string
-		compress string
-		want     string
-	}{
-		{name: "none", compress: "none", want: "--compress=none"},
-		{name: "pigz", compress: "pigz", want: "--compress=pigz-fast"},
-		{name: "zstd", compress: "zstd", want: "--compress=zstd-fast"},
-		{name: "zstdmt", compress: "zstdmt", want: "--compress=zstdmt-fast"},
-		{name: "lzop", compress: "lzop", want: "--compress=lzo"},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			runner := &fakeRunner{}
-			err := RunSender(context.Background(), SenderConfig{
-				SrcDataset:       "tank/src",
-				DstHost:          "root@10.0.0.42",
-				DstDataset:       "tank/dst",
-				SSHKeyFile:       "/var/run/zfsrep/ssh/id_rsa",
-				KnownHostsFile:   "/var/run/zfsrep/ssh/known_hosts",
-				SSHPort:          "2222",
-				NoRollback:       true,
-				Compress:         tt.compress,
-				ReceiveUnmounted: true,
-				ReceiveResumable: true,
-			}, runner)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if len(runner.calls) != 1 {
-				t.Fatalf("calls = %#v, want one syncoid call", runner.calls)
-			}
-			if !strings.Contains(strings.Join(runner.calls[0].args, " "), tt.want) {
-				t.Fatalf("syncoid args = %q, want %q", strings.Join(runner.calls[0].args, " "), tt.want)
-			}
-		})
-	}
-}
-
 func hasNamedCall(calls []call, name, args string) bool {
 	return callIndexNamed(calls, name, args) != -1
 }
@@ -729,4 +422,60 @@ func callIndexNamed(calls []call, name, args string) int {
 		}
 	}
 	return -1
+}
+
+func defaultSenderConfig(t *testing.T) SenderConfig {
+	t.Helper()
+	return senderConfig(t, zfsv1.SyncoidSpec{})
+}
+
+func senderConfig(t *testing.T, spec zfsv1.SyncoidSpec) SenderConfig {
+	t.Helper()
+	run := &zfsv1.ZFSReplicationRun{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "storage"},
+		Spec: zfsv1.ZFSReplicationRunSpec{
+			Source:  zfsv1.DatasetRef{NodeName: "worker-a", Dataset: "tank/src"},
+			Target:  zfsv1.DatasetRef{NodeName: "worker-b", Dataset: "tank/dst"},
+			Syncoid: spec,
+		},
+	}
+	contract, err := syncoid.Translate(run)
+	if err != nil {
+		t.Fatal(err)
+	}
+	values := make(map[string]string)
+	for _, entry := range contract.SenderEnvironment {
+		values[entry.Name] = entry.Value
+	}
+	for _, entry := range syncoid.ConnectionEnvironment(syncoid.Connection{
+		TargetHost:     "root@10.0.0.42",
+		SSHKeyFile:     "/var/run/zfsrep/ssh/id_rsa",
+		KnownHostsFile: "/var/run/zfsrep/ssh/known_hosts",
+		SSHPort:        "2222",
+	}) {
+		values[entry.Name] = entry.Value
+	}
+	invocation, err := syncoid.DecodeSenderEnvironment(func(name string) (string, bool) {
+		value, ok := values[name]
+		return value, ok
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return SenderConfig{Invocation: invocation}
+}
+
+func argumentWithPrefix(t *testing.T, arguments []string, prefix string) string {
+	t.Helper()
+	for _, argument := range arguments {
+		if strings.HasPrefix(argument, prefix) {
+			return argument
+		}
+	}
+	t.Fatalf("arguments %#v do not contain prefix %q", arguments, prefix)
+	return ""
+}
+
+func pointer[T any](value T) *T {
+	return &value
 }

@@ -10,30 +10,14 @@ import (
 	"sync"
 	"time"
 
-	"github.com/mathias/zfsreplicationcontroller/internal/replication"
 	"github.com/mathias/zfsreplicationcontroller/internal/replication/diagnosis"
+	"github.com/mathias/zfsreplicationcontroller/internal/syncoid"
 )
 
 const (
-	EnvRole                  = "ZFSREP_ROLE"
-	EnvSrcDataset            = "SRC_DATASET"
-	EnvDstHost               = "DST_HOST"
-	EnvDstDataset            = "DST_DATASET"
-	EnvSSHKeyFile            = "SSH_KEY_FILE"
-	EnvKnownHostsFile        = "KNOWN_HOSTS_FILE"
-	EnvSSHPort               = "SSH_PORT"
-	EnvNoSyncSnap            = "SYNCOID_NO_SYNC_SNAP"
-	EnvNoRollback            = "SYNCOID_NO_ROLLBACK"
-	EnvForceDelete           = "SYNCOID_FORCE_DELETE"
-	EnvDeleteTargetSnapshots = "SYNCOID_DELETE_TARGET_SNAPSHOTS"
-	EnvCompress              = "SYNCOID_COMPRESS"
-	EnvSyncoidIdentifier     = "SYNCOID_IDENTIFIER"
-	EnvReceiveUnmounted      = "RECEIVE_UNMOUNTED"
-	EnvReceiveResumable      = "RECEIVE_RESUMABLE"
-	EnvIncludeSnaps          = "SYNCOID_INCLUDE_SNAPS"
-	EnvExcludeSnaps          = "SYNCOID_EXCLUDE_SNAPS"
-	EnvExpectedNodeName      = "EXPECTED_NODE_NAME"
-	EnvActualNodeName        = "ACTUAL_NODE_NAME"
+	EnvRole             = "ZFSREP_ROLE"
+	EnvExpectedNodeName = "EXPECTED_NODE_NAME"
+	EnvActualNodeName   = "ACTUAL_NODE_NAME"
 
 	RoleSender            = "sender"
 	DefaultSSHKeyFile     = "/var/run/zfsrep/ssh/id_rsa"
@@ -42,52 +26,23 @@ const (
 )
 
 type SenderConfig struct {
-	SrcDataset            string
-	DstHost               string
-	DstDataset            string
-	SSHKeyFile            string
-	KnownHostsFile        string
-	SSHPort               string
-	NoSyncSnap            bool
-	NoRollback            bool
-	ForceDelete           bool
-	DeleteTargetSnapshots bool
-	Compress              string
-	SyncoidIdentifier     string
-	ReceiveUnmounted      bool
-	ReceiveResumable      bool
-	IncludeSnaps          []string
-	ExcludeSnaps          []string
-	ExpectedNode          string
-	ActualNode            string
+	Invocation   syncoid.Invocation
+	ExpectedNode string
+	ActualNode   string
 }
 
-func SenderConfigFromEnv() SenderConfig {
-	return SenderConfigFromLookup(os.Getenv)
+func SenderConfigFromEnv() (SenderConfig, error) {
+	return SenderConfigFromLookup(os.LookupEnv)
 }
 
-func SenderConfigFromLookup(lookup func(string) string) SenderConfig {
-	defaults := replication.DefaultSyncoidOptions()
-	return SenderConfig{
-		SrcDataset:            lookup(EnvSrcDataset),
-		DstHost:               lookup(EnvDstHost),
-		DstDataset:            lookup(EnvDstDataset),
-		SSHKeyFile:            lookup(EnvSSHKeyFile),
-		KnownHostsFile:        lookup(EnvKnownHostsFile),
-		SSHPort:               lookup(EnvSSHPort),
-		NoSyncSnap:            boolLookupDefault(lookup, EnvNoSyncSnap, defaults.NoSyncSnap),
-		NoRollback:            boolLookupDefault(lookup, EnvNoRollback, defaults.NoRollback),
-		ForceDelete:           boolLookupDefault(lookup, EnvForceDelete, defaults.ForceDelete),
-		DeleteTargetSnapshots: boolLookupDefault(lookup, EnvDeleteTargetSnapshots, defaults.DeleteTargetSnapshots),
-		Compress:              lookupDefault(lookup, EnvCompress, defaults.Compress),
-		SyncoidIdentifier:     lookup(EnvSyncoidIdentifier),
-		ReceiveUnmounted:      boolLookupDefault(lookup, EnvReceiveUnmounted, defaults.ReceiveUnmounted),
-		ReceiveResumable:      boolLookupDefault(lookup, EnvReceiveResumable, defaults.ReceiveResumable),
-		IncludeSnaps:          listLookup(lookup, EnvIncludeSnaps),
-		ExcludeSnaps:          listLookup(lookup, EnvExcludeSnaps),
-		ExpectedNode:          lookup(EnvExpectedNodeName),
-		ActualNode:            lookup(EnvActualNodeName),
+func SenderConfigFromLookup(lookup func(string) (string, bool)) (SenderConfig, error) {
+	invocation, err := syncoid.DecodeSenderEnvironment(lookup)
+	if err != nil {
+		return SenderConfig{}, fmt.Errorf("decode Syncoid sender environment: %w", err)
 	}
+	expectedNode, _ := lookup(EnvExpectedNodeName)
+	actualNode, _ := lookup(EnvActualNodeName)
+	return SenderConfig{Invocation: invocation, ExpectedNode: expectedNode, ActualNode: actualNode}, nil
 }
 
 func RunSender(ctx context.Context, cfg SenderConfig, r CommandRunner) error {
@@ -103,17 +58,7 @@ func runSender(ctx context.Context, cfg SenderConfig, r CommandRunner, logw io.W
 	if err := validateNode(cfg.ExpectedNode, cfg.ActualNode); err != nil {
 		return err
 	}
-	compress, err := replication.SyncoidCompression(cfg.Compress)
-	if err != nil {
-		return err
-	}
-	if cfg.SyncoidIdentifier != "" && !replication.ValidSyncoidIdentifier(cfg.SyncoidIdentifier) {
-		return fmt.Errorf("unsupported syncoid identifier %q", cfg.SyncoidIdentifier)
-	}
-	if cfg.DstHost != "" && cfg.KnownHostsFile == "" {
-		return fmt.Errorf("known hosts file is required for SSH replication")
-	}
-	args := syncoidArgs(cfg, compress)
+	args := cfg.Invocation.Arguments()
 	logSenderStart(logw, cfg)
 	logSenderLine(logw, "syncoid command command=%s", strings.Join(sanitizeSyncoidArgs(args), " "))
 	summarySuffix, err := runSyncoidCommand(ctx, r, logw, args...)
@@ -155,58 +100,8 @@ func runSyncoidCommand(ctx context.Context, r CommandRunner, logw io.Writer, arg
 	return summary.suffix(), nil
 }
 
-func syncoidArgs(cfg SenderConfig, compress string) []string {
-	var args []string
-	if cfg.NoSyncSnap {
-		args = append(args, "--no-sync-snap")
-	}
-	if cfg.NoRollback {
-		args = append(args, "--no-rollback")
-	}
-	args = append(args, "--no-privilege-elevation")
-	if compress != "" {
-		args = append(args, "--compress="+compress)
-	}
-	if cfg.SyncoidIdentifier != "" {
-		args = append(args, "--identifier="+cfg.SyncoidIdentifier)
-	}
-	if cfg.DeleteTargetSnapshots {
-		args = append(args, "--delete-target-snapshots")
-	}
-	if cfg.KnownHostsFile != "" {
-		args = append(args,
-			"--sshoption=UserKnownHostsFile="+cfg.KnownHostsFile,
-			"--sshoption=StrictHostKeyChecking=yes",
-			"--sshoption=IdentitiesOnly=yes",
-		)
-	}
-	if cfg.SSHKeyFile != "" {
-		args = append(args, "--sshkey="+cfg.SSHKeyFile)
-	}
-	if cfg.SSHPort != "" {
-		args = append(args, "--sshport="+cfg.SSHPort)
-	}
-	if cfg.ReceiveUnmounted {
-		args = append(args, "--recvoptions=u")
-	}
-	if !cfg.ReceiveResumable {
-		args = append(args, "--no-resume")
-	}
-	for _, include := range cfg.IncludeSnaps {
-		args = append(args, "--include-snaps="+include)
-	}
-	for _, exclude := range cfg.ExcludeSnaps {
-		args = append(args, "--exclude-snaps="+exclude)
-	}
-	if cfg.ForceDelete {
-		args = append(args, "--force-delete")
-	}
-	return append(args, cfg.SrcDataset, syncoidTarget(cfg.DstHost, cfg.DstDataset))
-}
-
 func logSenderStart(w io.Writer, cfg SenderConfig) {
-	logSenderLine(w, "sender starting sourceDataset=%s targetDataset=%s targetHost=%s sshPort=%s syncoidIdentifier=%s noSyncSnap=%t noRollback=%t forceDelete=%t deleteTargetSnapshots=%t compress=%s receiveUnmounted=%t receiveResumable=%t includeSnaps=%q excludeSnaps=%q",
-		cfg.SrcDataset, cfg.DstDataset, cfg.DstHost, cfg.SSHPort, cfg.SyncoidIdentifier, cfg.NoSyncSnap, cfg.NoRollback, cfg.ForceDelete, cfg.DeleteTargetSnapshots, cfg.Compress, cfg.ReceiveUnmounted, cfg.ReceiveResumable, strings.Join(cfg.IncludeSnaps, ","), strings.Join(cfg.ExcludeSnaps, ","))
+	logSenderLine(w, "sender starting %s", cfg.Invocation.Summary())
 }
 
 func logSenderLine(w io.Writer, format string, args ...any) {
@@ -301,39 +196,6 @@ func commandExitCode(err error) int {
 		return exitErr.ExitCode()
 	}
 	return -1
-}
-
-func syncoidTarget(host, dataset string) string {
-	if host == "" {
-		return dataset
-	}
-	return host + ":" + dataset
-}
-
-func lookupDefault(lookup func(string) string, key, def string) string {
-	if v := lookup(key); v != "" {
-		return v
-	}
-	return def
-}
-
-func boolLookupDefault(lookup func(string) string, key string, def bool) bool {
-	v := lookup(key)
-	if v == "" {
-		return def
-	}
-	return v == "true"
-}
-
-func listLookup(lookup func(string) string, key string) []string {
-	var out []string
-	for _, line := range strings.Split(lookup(key), "\n") {
-		line = strings.TrimSpace(line)
-		if line != "" {
-			out = append(out, line)
-		}
-	}
-	return out
 }
 
 func validateNode(expected, actual string) error {

@@ -2,8 +2,6 @@ package controller
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"net"
@@ -15,6 +13,7 @@ import (
 	"github.com/mathias/zfsreplicationcontroller/internal/datamover"
 	"github.com/mathias/zfsreplicationcontroller/internal/replication"
 	"github.com/mathias/zfsreplicationcontroller/internal/replication/diagnosis"
+	"github.com/mathias/zfsreplicationcontroller/internal/syncoid"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/knownhosts"
 	batchv1 "k8s.io/api/batch/v1"
@@ -348,7 +347,10 @@ func (r *ZFSReplicationRunReconciler) ensureRunReceiveTask(ctx context.Context, 
 		return false, err
 	}
 	expiresAt := metav1.NewTime(r.controllerNow().Add(authorizationLease))
-	task := runReceiveTask(run, names, publicKey, expiresAt)
+	task, err := runReceiveTask(run, names, publicKey, expiresAt)
+	if err != nil {
+		return false, err
+	}
 	if err := ctrl.SetControllerReference(run, task, r.Scheme); err != nil {
 		return false, err
 	}
@@ -434,7 +436,11 @@ func withEarlierRequeue(result ctrl.Result, leaseRequeueAfter time.Duration) ctr
 }
 
 func (r *ZFSReplicationRunReconciler) ensureRunSenderJob(ctx context.Context, run *zfsv1.ZFSReplicationRun, names runObjects, receiverPodIP string) (bool, bool, error) {
-	return r.ensureRunJob(ctx, run, runSenderJob(run, names, r.ReleaseImage, receiverPodIP))
+	job, err := runSenderJob(run, names, r.ReleaseImage, receiverPodIP)
+	if err != nil {
+		return false, false, err
+	}
+	return r.ensureRunJob(ctx, run, job)
 }
 
 func (r *ZFSReplicationRunReconciler) ensureRunJob(ctx context.Context, run *zfsv1.ZFSReplicationRun, job *batchv1.Job) (bool, bool, error) {
@@ -808,8 +814,8 @@ func validateRunSpec(spec zfsv1.ZFSReplicationRunSpec) error {
 	if spec.Source.NodeName == spec.Target.NodeName && spec.Source.Dataset == spec.Target.Dataset {
 		return fmt.Errorf("source and target must not reference the same dataset on the same node")
 	}
-	if !replication.CompressionSupported(spec.Syncoid.Compress) {
-		return fmt.Errorf("spec.syncoid.compress has unsupported value %q", spec.Syncoid.Compress)
+	if _, err := syncoid.Translate(&zfsv1.ZFSReplicationRun{Spec: spec}); err != nil {
+		return fmt.Errorf("spec.syncoid is invalid: %w", err)
 	}
 	return nil
 }
@@ -901,11 +907,13 @@ func runSSHSecret(run *zfsv1.ZFSReplicationRun, names runObjects, key sshKeyMate
 	}
 }
 
-func runReceiveTask(run *zfsv1.ZFSReplicationRun, names runObjects, publicKey string, expiresAt metav1.Time) *zfsv1.ZFSReceiveTask {
+func runReceiveTask(run *zfsv1.ZFSReplicationRun, names runObjects, publicKey string, expiresAt metav1.Time) (*zfsv1.ZFSReceiveTask, error) {
 	labels := cloneLabels(names.Labels)
 	labels[labelPrefix+"/role"] = "receiver"
-	syncSnapshotIdentifier := syncSnapshotIdentifierForRun(run)
-	options := normalizedSyncoidOptions(run.Spec.Syncoid)
+	contract, err := syncoid.Translate(run)
+	if err != nil {
+		return nil, fmt.Errorf("translate Syncoid Replication Contract: %w", err)
+	}
 	return &zfsv1.ZFSReceiveTask{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      names.ReceiveTaskName,
@@ -920,80 +928,33 @@ func runReceiveTask(run *zfsv1.ZFSReplicationRun, names runObjects, publicKey st
 				AuthorizedPublicKey: publicKey,
 				ExpiresAt:           expiresAt,
 			},
-			Policy: zfsv1.ReceiveTaskPolicy{
-				ReceiveUnmounted:           options.ReceiveUnmounted,
-				ReceiveResumable:           options.ReceiveResumable,
-				AllowRollback:              !options.NoRollback,
-				AllowDestroy:               options.ForceDelete,
-				AllowMount:                 !options.ReceiveUnmounted,
-				AllowSyncSnapshotDestroy:   !options.NoSyncSnap,
-				AllowTargetSnapshotDestroy: options.DeleteTargetSnapshots,
-				SyncSnapshotIdentifier:     syncSnapshotIdentifier,
-				Compression:                options.Compress,
-			},
+			Policy: contract.ReceiverPolicy,
 		},
-	}
+	}, nil
 }
 
-func runSenderJob(run *zfsv1.ZFSReplicationRun, names runObjects, image, receiverPodIP string) *batchv1.Job {
+func runSenderJob(run *zfsv1.ZFSReplicationRun, names runObjects, image, receiverPodIP string) (*batchv1.Job, error) {
 	labels := cloneLabels(names.Labels)
 	labels[labelPrefix+"/role"] = "sender"
+	contract, err := syncoid.Translate(run)
+	if err != nil {
+		return nil, fmt.Errorf("translate Syncoid Replication Contract: %w", err)
+	}
 	env := []corev1.EnvVar{
 		{Name: datamover.EnvRole, Value: datamover.RoleSender},
-		{Name: datamover.EnvSrcDataset, Value: run.Spec.Source.Dataset},
-		{Name: datamover.EnvDstHost, Value: fmt.Sprintf("zfs-recv@%s", receiverPodIP)},
-		{Name: datamover.EnvSSHKeyFile, Value: datamover.DefaultSSHKeyFile},
-		{Name: datamover.EnvKnownHostsFile, Value: datamover.DefaultKnownHostsFile},
-		{Name: datamover.EnvSSHPort, Value: datamover.DefaultSSHPort},
-		{Name: datamover.EnvDstDataset, Value: run.Spec.Target.Dataset},
-		{Name: datamover.EnvSyncoidIdentifier, Value: syncSnapshotIdentifierForRun(run)},
 	}
-	env = append(env, syncoidEnv(run.Spec.Syncoid)...)
+	env = append(env, contract.SenderEnvironment...)
+	env = append(env, syncoid.ConnectionEnvironment(syncoid.Connection{
+		TargetHost:     fmt.Sprintf("zfs-recv@%s", receiverPodIP),
+		SSHKeyFile:     datamover.DefaultSSHKeyFile,
+		KnownHostsFile: datamover.DefaultKnownHostsFile,
+		SSHPort:        datamover.DefaultSSHPort,
+	})...)
 	job := dataMoverJobForRun(run, names.SenderName, image, labels, run.Spec.Source.NodeName, "/usr/local/bin/zfsrep-sender", env, names.SecretName, false)
 	job.Spec.Template.Spec.Hostname = senderPodHostname
 	job.Spec.Template.Spec.Containers[0].TerminationMessagePath = "/dev/termination-log"
 	job.Spec.Template.Spec.Containers[0].TerminationMessagePolicy = corev1.TerminationMessageReadFile
-	return job
-}
-
-func syncSnapshotIdentifierForRun(run *zfsv1.ZFSReplicationRun) string {
-	sum := sha256.Sum256([]byte(strings.Join([]string{
-		run.Namespace,
-		run.Spec.Source.NodeName,
-		run.Spec.Source.Dataset,
-		run.Spec.Target.NodeName,
-		run.Spec.Target.Dataset,
-	}, "\x00")))
-	return "zrc-" + hex.EncodeToString(sum[:])[:24]
-}
-
-func syncoidEnv(spec zfsv1.SyncoidSpec) []corev1.EnvVar {
-	options := normalizedSyncoidOptions(spec)
-	return []corev1.EnvVar{
-		{Name: datamover.EnvNoSyncSnap, Value: strconv.FormatBool(options.NoSyncSnap)},
-		{Name: datamover.EnvNoRollback, Value: strconv.FormatBool(options.NoRollback)},
-		{Name: datamover.EnvForceDelete, Value: strconv.FormatBool(options.ForceDelete)},
-		{Name: datamover.EnvDeleteTargetSnapshots, Value: strconv.FormatBool(options.DeleteTargetSnapshots)},
-		{Name: datamover.EnvCompress, Value: options.Compress},
-		{Name: datamover.EnvReceiveUnmounted, Value: strconv.FormatBool(options.ReceiveUnmounted)},
-		{Name: datamover.EnvReceiveResumable, Value: strconv.FormatBool(options.ReceiveResumable)},
-		{Name: datamover.EnvIncludeSnaps, Value: strings.Join(options.IncludeSnaps, "\n")},
-		{Name: datamover.EnvExcludeSnaps, Value: strings.Join(options.ExcludeSnaps, "\n")},
-	}
-}
-
-func normalizedSyncoidOptions(spec zfsv1.SyncoidSpec) replication.SyncoidOptions {
-	return replication.NormalizeSyncoidOptions(replication.SyncoidOptionInput{
-		NoSyncSnap:            spec.NoSyncSnap,
-		NoRollback:            spec.NoRollback,
-		ForceDelete:           spec.ForceDelete,
-		DeleteTargetSnapshots: spec.DeleteTargetSnapshots,
-		Compress:              spec.Compress,
-		ReceiveUnmounted:      spec.ReceiveUnmounted,
-		ReceiveResumable:      spec.ReceiveResumable,
-		IncludeSnaps:          spec.IncludeSnaps,
-		ExcludeSnaps:          spec.ExcludeSnaps,
-	})
+	return job, nil
 }
 
 func dataMoverJobForRun(run *zfsv1.ZFSReplicationRun, name, image string, labels map[string]string, nodeName, command string, env []corev1.EnvVar, secretName string, readiness bool) *batchv1.Job {

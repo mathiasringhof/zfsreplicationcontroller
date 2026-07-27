@@ -15,6 +15,9 @@ _Avoid_: Dst, destination when referring to a Replication Run
 **Receiver**:
 A long-lived node-level replication endpoint that enforces the active Receiver Authorization Snapshot for one or more Replication Runs. Its lifecycle is independent of any individual run.
 
+**Syncoid Replication Contract**:
+The matched agreement between one immutable Replication Run's sender invocation and Receiver Authorization Grant. It is translated as one paired result so Syncoid behavior and receive permission cannot drift.
+
 **Failure Diagnosis**:
 A concise, sanitized, best-effort explanation of why a replication attempt failed. It is intended for operators, not as a stable classification or an input to automated behavior.
 

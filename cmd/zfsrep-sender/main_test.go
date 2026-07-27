@@ -7,8 +7,11 @@ import (
 	"strings"
 	"testing"
 
+	zfsv1 "github.com/mathias/zfsreplicationcontroller/api/v1alpha1"
 	"github.com/mathias/zfsreplicationcontroller/internal/datamover"
 	"github.com/mathias/zfsreplicationcontroller/internal/replication/diagnosis"
+	"github.com/mathias/zfsreplicationcontroller/internal/syncoid"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 type failingRunner struct{}
@@ -36,18 +39,7 @@ func TestRunDoesNotPrintReturnedSyncoidFailure(t *testing.T) {
 	var stderr bytes.Buffer
 	publisher := &recordingPublisher{}
 
-	code := run(context.Background(), datamover.SenderConfig{
-		SrcDataset:       "tank/src",
-		DstHost:          "root@10.0.0.42",
-		DstDataset:       "tank/dst",
-		SSHKeyFile:       "/var/run/zfsrep/ssh/id_rsa",
-		KnownHostsFile:   "/var/run/zfsrep/ssh/known_hosts",
-		SSHPort:          "2222",
-		NoRollback:       true,
-		Compress:         "none",
-		ReceiveUnmounted: true,
-		ReceiveResumable: true,
-	}, &stderr, failingRunner{}, publisher)
+	code := run(context.Background(), senderConfig(t), &stderr, failingRunner{}, publisher)
 	if code != 1 {
 		t.Fatalf("run() code = %d, want 1", code)
 	}
@@ -71,12 +63,7 @@ func TestRunPreservesFailureWhenTerminationPublicationFails(t *testing.T) {
 	var stderr bytes.Buffer
 	publisher := &recordingPublisher{err: errors.New("write failed --sshkey=unsafe-secret")}
 
-	code := run(context.Background(), datamover.SenderConfig{
-		SrcDataset:       "tank/src",
-		DstDataset:       "tank/dst",
-		Compress:         "none",
-		ReceiveResumable: true,
-	}, &stderr, failingRunner{}, publisher)
+	code := run(context.Background(), senderConfig(t), &stderr, failingRunner{}, publisher)
 
 	if code != 1 {
 		t.Fatalf("run() code = %d, want original failure code 1", code)
@@ -97,4 +84,36 @@ type recordingPublisher struct {
 func (p *recordingPublisher) Publish(value diagnosis.Diagnosis) error {
 	p.diagnosis = value
 	return p.err
+}
+
+func senderConfig(t *testing.T) datamover.SenderConfig {
+	t.Helper()
+	run := &zfsv1.ZFSReplicationRun{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "storage"},
+		Spec: zfsv1.ZFSReplicationRunSpec{
+			Source: zfsv1.DatasetRef{NodeName: "worker-a", Dataset: "tank/src"},
+			Target: zfsv1.DatasetRef{NodeName: "worker-b", Dataset: "tank/dst"},
+		},
+	}
+	contract, err := syncoid.Translate(run)
+	if err != nil {
+		t.Fatal(err)
+	}
+	values := make(map[string]string)
+	for _, entry := range append(contract.SenderEnvironment, syncoid.ConnectionEnvironment(syncoid.Connection{
+		TargetHost:     "root@10.0.0.42",
+		SSHKeyFile:     datamover.DefaultSSHKeyFile,
+		KnownHostsFile: datamover.DefaultKnownHostsFile,
+		SSHPort:        datamover.DefaultSSHPort,
+	})...) {
+		values[entry.Name] = entry.Value
+	}
+	invocation, err := syncoid.DecodeSenderEnvironment(func(name string) (string, bool) {
+		value, ok := values[name]
+		return value, ok
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return datamover.SenderConfig{Invocation: invocation}
 }

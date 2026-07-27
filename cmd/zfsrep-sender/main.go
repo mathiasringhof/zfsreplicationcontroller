@@ -14,9 +14,13 @@ import (
 const terminationMessagePath = "/dev/termination-log"
 
 func main() {
+	cfg, err := datamover.SenderConfigFromEnv()
+	if err != nil {
+		os.Exit(publishFailure(err, os.Stderr, filePublisher{path: terminationMessagePath}))
+	}
 	os.Exit(run(
 		context.Background(),
-		datamover.SenderConfigFromEnv(),
+		cfg,
 		os.Stderr,
 		datamover.ExecRunner{},
 		filePublisher{path: terminationMessagePath},
@@ -37,17 +41,21 @@ func (p filePublisher) Publish(value diagnosis.Diagnosis) error {
 
 func run(ctx context.Context, cfg datamover.SenderConfig, stderr io.Writer, runner datamover.CommandRunner, publisher diagnosisPublisher) int {
 	if err := datamover.RunSenderWithLog(ctx, cfg, runner, stderr); err != nil {
-		value := diagnosisFromError(err)
-		if publisher != nil {
-			if publishErr := publisher.Publish(value); publishErr != nil {
-				if _, logErr := fmt.Fprintf(stderr, "termination message publication failed error=%q\n", diagnosis.Sanitize(publishErr.Error()).String()); logErr != nil {
-					return 1
-				}
-			}
-		}
-		return 1
+		return publishFailure(err, stderr, publisher)
 	}
 	return 0
+}
+
+func publishFailure(err error, stderr io.Writer, publisher diagnosisPublisher) int {
+	value := diagnosisFromError(err)
+	if publisher != nil {
+		if publishErr := publisher.Publish(value); publishErr != nil {
+			if _, logErr := fmt.Fprintf(stderr, "termination message publication failed error=%q\n", diagnosis.Sanitize(publishErr.Error()).String()); logErr != nil {
+				return 1
+			}
+		}
+	}
+	return 1
 }
 
 func diagnosisFromError(err error) diagnosis.Diagnosis {

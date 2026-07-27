@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/mathias/zfsreplicationcontroller/internal/replication"
+	"github.com/mathias/zfsreplicationcontroller/internal/syncoid"
 )
 
 func authorizeReceiverCommand(raw string, policy commandPolicy) (receiverCommandPlan, error) {
@@ -16,14 +17,14 @@ func authorizeReceiverCommand(raw string, policy commandPolicy) (receiverCommand
 	if strings.Contains(raw, ";") {
 		return authorizeReceiverCommandBatch(raw, policy)
 	}
-	policy.Compression = replication.CompressionDefault(policy.Compression)
+	policy.Compression = syncoid.CompressionDefault(policy.Compression)
 	if policy.TargetDataset == "" {
 		return receiverCommandPlan{}, fmt.Errorf("target dataset is empty")
 	}
 	if !replication.ValidDatasetName(policy.TargetDataset) {
 		return receiverCommandPlan{}, fmt.Errorf("target dataset is invalid")
 	}
-	if policy.SyncSnapshotIdentifier != "" && !replication.ValidSyncoidIdentifier(policy.SyncSnapshotIdentifier) {
+	if policy.SyncSnapshotIdentifier != "" && !syncoid.ValidIdentifier(policy.SyncSnapshotIdentifier) {
 		return receiverCommandPlan{}, fmt.Errorf("sync snapshot identifier is invalid")
 	}
 	tokens, err := tokenizeReceiverCommand(raw)
@@ -111,7 +112,7 @@ func commandLookupAllowed(name string, policy commandPolicy) bool {
 	if name == "mbuffer" {
 		return true
 	}
-	return policy.Compression != replication.CompressionNone && name == policy.Compression && replication.CompressorAllowed(name)
+	return policy.Compression != syncoid.CompressionNone && name == policy.Compression && syncoid.CompressorAllowed(name)
 }
 
 func validateSingleReceiverStep(step receiverCommandStep, policy commandPolicy) error {
@@ -217,7 +218,7 @@ func validateReceivePipeline(steps []receiverCommandStep, policy commandPolicy) 
 			if err := validateMbufferStep(previous[0]); err != nil {
 				return err
 			}
-			if policy.Compression != replication.CompressionNone {
+			if policy.Compression != syncoid.CompressionNone {
 				return fmt.Errorf("receive pipeline is missing decompressor")
 			}
 			return validateZFSReceiveStep(last, policy)
@@ -279,13 +280,13 @@ func safeMbufferValue(value string) bool {
 }
 
 func validateDecompressorStep(step receiverCommandStep, policy commandPolicy) error {
-	if policy.Compression == replication.CompressionNone {
+	if policy.Compression == syncoid.CompressionNone {
 		return fmt.Errorf("decompressor is not allowed when compression is none")
 	}
 	if !receiverStepHasNoRedirects(step) {
 		return fmt.Errorf("unsupported decompressor command")
 	}
-	if replication.DecompressorAllowed(step.Name, step.Args, policy.Compression) {
+	if syncoid.DecompressorAllowed(step.Name, step.Args, policy.Compression) {
 		return nil
 	}
 	return fmt.Errorf("unsupported decompressor arguments")
@@ -361,7 +362,7 @@ func snapshotDestroyAllowed(target string, policy commandPolicy) bool {
 		}
 		if !policy.AllowTargetSnapshotDestroy &&
 			(!policy.AllowSyncSnapshotDestroy ||
-				!replication.SyncoidSnapshotTarget(snapshot, policy.SyncSnapshotIdentifier)) {
+				!syncoid.SnapshotOwnedByIdentifier(snapshot, policy.SyncSnapshotIdentifier)) {
 			return false
 		}
 	}
