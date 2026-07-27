@@ -3,6 +3,7 @@ module github.com/mathias/zfsreplicationcontroller
 go 1.26.0
 
 require (
+	github.com/go-logr/logr v1.4.3
 	github.com/robfig/cron/v3 v3.0.1
 	golang.org/x/crypto v0.53.0
 	gopkg.in/yaml.v3 v3.0.1
@@ -20,7 +21,6 @@ require (
 	github.com/evanphx/json-patch/v5 v5.9.11 // indirect
 	github.com/fsnotify/fsnotify v1.9.0 // indirect
 	github.com/fxamacker/cbor/v2 v2.9.0 // indirect
-	github.com/go-logr/logr v1.4.3 // indirect
 	github.com/go-logr/zapr v1.3.0 // indirect
 	github.com/go-openapi/jsonpointer v0.21.0 // indirect
 	github.com/go-openapi/jsonreference v0.20.2 // indirect
