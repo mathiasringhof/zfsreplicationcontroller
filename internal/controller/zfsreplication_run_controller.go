@@ -150,7 +150,7 @@ func (r *ZFSReplicationRunReconciler) Reconcile(ctx context.Context, req ctrl.Re
 func (r *ZFSReplicationRunReconciler) reconcileTerminalRun(ctx context.Context, run *zfsv1.ZFSReplicationRun, names runObjects) error {
 	return errors.Join(
 		r.markReceiveTaskTerminal(ctx, run, names, run.Status.Phase.ReceiveTaskTerminalPhase(), run.Status.LastError),
-		r.cleanupRunEphemeralObjects(ctx, run, names),
+		r.deleteRunSSHSecret(ctx, run, names),
 	)
 }
 
@@ -267,7 +267,7 @@ func (r *ZFSReplicationRunReconciler) finishFromSenderJob(ctx context.Context, r
 		log.FromContext(ctx).WithValues("senderJob", names.SenderName, "receiverPod", receiver.podName).Info("replication succeeded")
 		return ctrl.Result{}, true, errors.Join(
 			r.markReceiveTaskTerminal(ctx, run, names, zfsv1.ReceiveTaskPhaseCompleted, ""),
-			r.cleanupRunEphemeralObjects(ctx, run, names),
+			r.deleteRunSSHSecret(ctx, run, names),
 		)
 	}
 
@@ -672,36 +672,12 @@ func newerTerminatedSender(left, right terminatedSender) bool {
 	return left.podName > right.podName
 }
 
-func (r *ZFSReplicationRunReconciler) cleanupRunEphemeralObjects(ctx context.Context, run *zfsv1.ZFSReplicationRun, names runObjects) error {
-	var errs []error
-	for _, obj := range []client.Object{
-		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: names.SecretName, Namespace: run.Namespace}},
-	} {
-		if err := r.Delete(ctx, obj); client.IgnoreNotFound(err) != nil {
-			errs = append(errs, fmt.Errorf("delete %s/%s: %w", obj.GetNamespace(), obj.GetName(), err))
-		}
+func (r *ZFSReplicationRunReconciler) deleteRunSSHSecret(ctx context.Context, run *zfsv1.ZFSReplicationRun, names runObjects) error {
+	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: names.SecretName, Namespace: run.Namespace}}
+	if err := r.Delete(ctx, secret); client.IgnoreNotFound(err) != nil {
+		return fmt.Errorf("delete SSH Secret %s/%s: %w", secret.Namespace, secret.Name, err)
 	}
-	if err := r.deleteRunReceiverPods(ctx, run, names); err != nil {
-		errs = append(errs, err)
-	}
-	return errors.Join(errs...)
-}
-
-func (r *ZFSReplicationRunReconciler) deleteRunReceiverPods(ctx context.Context, run *zfsv1.ZFSReplicationRun, names runObjects) error {
-	var receiverPods corev1.PodList
-	receiverLabels := cloneLabels(names.Labels)
-	receiverLabels[labelPrefix+"/role"] = "receiver"
-	if err := r.podReader().List(ctx, &receiverPods, client.InNamespace(run.Namespace), client.MatchingLabels(receiverLabels)); err != nil {
-		return fmt.Errorf("list receiver Pods for %s/%s: %w", run.Namespace, run.Name, err)
-	}
-	var errs []error
-	for i := range receiverPods.Items {
-		pod := &receiverPods.Items[i]
-		if err := r.Delete(ctx, pod); client.IgnoreNotFound(err) != nil {
-			errs = append(errs, fmt.Errorf("delete receiver Pod %s/%s: %w", pod.Namespace, pod.Name, err))
-		}
-	}
-	return errors.Join(errs...)
+	return nil
 }
 
 func (r *ZFSReplicationRunReconciler) podReader() client.Reader {
@@ -727,7 +703,7 @@ func (r *ZFSReplicationRunReconciler) failRunObject(ctx context.Context, run *zf
 	}
 	return errors.Join(
 		r.markReceiveTaskTerminal(ctx, run, names, zfsv1.ReceiveTaskPhaseFailed, msg),
-		r.cleanupRunEphemeralObjects(ctx, run, names),
+		r.deleteRunSSHSecret(ctx, run, names),
 	)
 }
 

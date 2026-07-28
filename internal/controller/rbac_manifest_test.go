@@ -187,10 +187,8 @@ func TestControllerClusterRoleHasRequiredPermissions(t *testing.T) {
 	}
 
 	verbs = verbsForResource(role.Rules, "", "pods")
-	for _, verb := range []string{"get", "list", "watch", "delete"} {
-		if !contains(verbs, verb) {
-			t.Fatalf("pods RBAC verbs = %v, missing %q", verbs, verb)
-		}
+	if !slices.Equal(verbs, []string{"get", "list", "watch"}) {
+		t.Fatalf("pods RBAC verbs = %v, want read-only access", verbs)
 	}
 
 	verbs = verbsForResource(role.Rules, "", "secrets")
@@ -228,15 +226,8 @@ func TestRenderedControllerPodReadRBACIsLeastPrivilege(t *testing.T) {
 			}
 
 			podVerbs := verbsForResource(role.Rules, "", "pods")
-			for _, verb := range []string{"get", "list", "watch"} {
-				if !contains(podVerbs, verb) {
-					t.Fatalf("rendered %s Pod verbs = %v, missing read verb %q", tt.name, podVerbs, verb)
-				}
-			}
-			for _, verb := range []string{"create", "update", "patch"} {
-				if contains(podVerbs, verb) {
-					t.Fatalf("rendered %s Pod verbs = %v, includes unnecessary mutation verb %q", tt.name, podVerbs, verb)
-				}
+			if !slices.Equal(podVerbs, []string{"get", "list", "watch"}) {
+				t.Fatalf("rendered %s Pod verbs = %v, want read-only access", tt.name, podVerbs)
 			}
 			if logVerbs := verbsForResource(role.Rules, "", "pods/log"); len(logVerbs) != 0 {
 				t.Fatalf("rendered %s pods/log verbs = %v, want none", tt.name, logVerbs)
@@ -413,10 +404,16 @@ func TestNamespacedRBACRestrictsWorkloadPermissionsToWatchedNamespace(t *testing
 		{apiGroup: "zfsreplication.ringhof.io", resource: "zfsreplicationschedules/status", verbs: []string{"get", "update", "patch"}},
 		{apiGroup: "batch", resource: "jobs", verbs: []string{"create", "get", "list", "watch", "update", "patch", "delete"}},
 		{apiGroup: "", resource: "secrets", verbs: []string{"create", "get", "list", "watch", "update", "patch", "delete"}},
-		{apiGroup: "", resource: "pods", verbs: []string{"get", "list", "watch", "delete"}},
+		{apiGroup: "", resource: "pods", verbs: []string{"get", "list", "watch"}},
 		{apiGroup: "", resource: "events", verbs: []string{"create", "patch"}},
 	} {
 		verbs := verbsForResource(role.Rules, tt.apiGroup, tt.resource)
+		if tt.apiGroup == "" && tt.resource == "pods" {
+			if !slices.Equal(verbs, tt.verbs) {
+				t.Fatalf("namespaced Pod RBAC verbs = %v, want read-only access", verbs)
+			}
+			continue
+		}
 		for _, verb := range tt.verbs {
 			if !contains(verbs, verb) {
 				t.Fatalf("%s/%s namespaced RBAC verbs = %v, missing %q", tt.apiGroup, tt.resource, verbs, verb)
