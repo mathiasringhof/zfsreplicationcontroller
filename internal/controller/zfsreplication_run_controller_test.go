@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"maps"
 	"strings"
 	"testing"
 	"time"
@@ -34,6 +35,7 @@ func TestRunReconcileSenderJobEmbedsSyncoidTranslation(t *testing.T) {
 	run.Spec.Syncoid.DeleteTargetSnapshots = ptr(true)
 	names := objectNamesForRun(run.Name)
 	task := readyReceiveTask(run, names, "10.0.0.42", testReceiverHostKey)
+	task.Status.Endpoint.Port = 2205
 	pod := readyReceiverPodForTask(task)
 	r := newRunReconciler(t, run, task, pod)
 	r.APIReader = newRunAPIReader(t, run, task, pod)
@@ -45,6 +47,9 @@ func TestRunReconcileSenderJobEmbedsSyncoidTranslation(t *testing.T) {
 		t.Fatalf("sender pod hostname = %q, want zfsrep-sender", got)
 	}
 	container := sender.Spec.Template.Spec.Containers[0]
+	if container.Name != "sender" {
+		t.Fatalf("sender container name = %q, want sender", container.Name)
+	}
 	if container.Image != r.ReleaseImage {
 		t.Fatalf("sender image = %q, want release image %q", container.Image, r.ReleaseImage)
 	}
@@ -60,6 +65,9 @@ func TestRunReconcileSenderJobEmbedsSyncoidTranslation(t *testing.T) {
 	if got := envValue(sender, "KNOWN_HOSTS_FILE"); got != "/var/run/zfsrep/ssh/known_hosts" {
 		t.Fatalf("KNOWN_HOSTS_FILE = %q", got)
 	}
+	if got := envValue(sender, "SSH_PORT"); got != "2205" {
+		t.Fatalf("SSH_PORT = %q, want Receiver Endpoint port 2205", got)
+	}
 	contract, err := syncoid.Translate(run)
 	if err != nil {
 		t.Fatal(err)
@@ -74,14 +82,14 @@ func TestRunReconcileSenderJobEmbedsSyncoidTranslation(t *testing.T) {
 		t.Fatal(err)
 	}
 	gotKnownHosts := secret.Data["known_hosts"]
-	if got := string(gotKnownHosts); !strings.HasPrefix(got, "[10.0.0.42]:2222 ssh-ed25519 ") {
+	if got := string(gotKnownHosts); !strings.HasPrefix(got, "[10.0.0.42]:2205 ssh-ed25519 ") {
 		t.Fatalf("known_hosts = %q, want bracketed receiver endpoint", got)
 	}
 	_, hosts, parsedKey, comment, rest, err := ssh.ParseKnownHosts(gotKnownHosts)
 	if err != nil {
 		t.Fatalf("parse known_hosts: %v", err)
 	}
-	if len(hosts) != 1 || hosts[0] != "[10.0.0.42]:2222" {
+	if len(hosts) != 1 || hosts[0] != "[10.0.0.42]:2205" {
 		t.Fatalf("known_hosts hosts = %v, want receiver endpoint", hosts)
 	}
 	if parsedKey.Type() != "ssh-ed25519" {
@@ -298,7 +306,7 @@ func TestRunningRunRequeuesAtExplicitLeaseRenewalDeadline(t *testing.T) {
 	names := objectNamesForRun(run.Name)
 	task := readyReceiveTask(run, names, "10.0.0.42", testReceiverHostKey)
 	task.Spec.SSH.ExpiresAt = metav1.NewTime(now.Add(15 * time.Minute))
-	sender := mustRunSenderJob(t, run, names, "datamover:test", task.Status.Endpoint.Host)
+	sender := mustSenderJob(t, run, "sender:test", task.Status.Endpoint.Host)
 	r := newRunReconciler(t, run, task, sender)
 	r.now = func() time.Time { return now }
 
@@ -875,7 +883,7 @@ func TestRunReconcileLogsSenderSuccess(t *testing.T) {
 	run.Status.ReceiverPodName = "zfs-receiver-worker-b"
 	run.Status.ReceiverPodIP = "10.0.0.42"
 	task := readyReceiveTask(run, names, "10.0.0.42", testReceiverHostKey)
-	sender := mustRunSenderJob(t, run, names, "datamover:test", "10.0.0.42")
+	sender := mustSenderJob(t, run, "sender:test", "10.0.0.42")
 	sender.Status.Succeeded = 1
 	r := newRunReconciler(t, run, task, sender)
 	ctx, logs := captureRunLogger()
@@ -898,7 +906,7 @@ func TestRunReconcileLogsSenderJobAlreadyPresent(t *testing.T) {
 	run.Status.ReceiverPodName = "zfs-receiver-worker-b"
 	run.Status.ReceiverPodIP = "10.0.0.42"
 	task := readyReceiveTask(run, names, "10.0.0.42", testReceiverHostKey)
-	sender := mustRunSenderJob(t, run, names, "datamover:test", "10.0.0.42")
+	sender := mustSenderJob(t, run, "sender:test", "10.0.0.42")
 	r := newRunReconciler(t, run, task, sender)
 	ctx, logs := captureRunLogger()
 
@@ -915,7 +923,7 @@ func TestRunReconcileLogsSenderFailure(t *testing.T) {
 	run.Status.ReceiverPodName = "zfs-receiver-worker-b"
 	run.Status.ReceiverPodIP = "10.0.0.42"
 	task := readyReceiveTask(run, names, "10.0.0.42", testReceiverHostKey)
-	sender := mustRunSenderJob(t, run, names, "datamover:test", "10.0.0.42")
+	sender := mustSenderJob(t, run, "sender:test", "10.0.0.42")
 	sender.Status.Failed = 1
 	sender.Status.Conditions = []batchv1.JobCondition{
 		{Type: batchv1.JobFailed, Status: corev1.ConditionTrue, Message: "syncoid exited with status 1"},
@@ -939,10 +947,9 @@ func TestRunReconcileLogsSenderFailure(t *testing.T) {
 
 func TestRunReconcileUsesSanitizedTerminationMessageFromExactSenderJob(t *testing.T) {
 	run := replicationRun("manual-termination-message")
-	names := objectNamesForRun(run.Name)
 	run.Status.ReceiverPodName = "zfs-receiver-worker-b"
 	run.Status.ReceiverPodIP = "10.0.0.42"
-	sender := mustRunSenderJob(t, run, names, "datamover:test", "10.0.0.42")
+	sender := mustSenderJob(t, run, "sender:test", "10.0.0.42")
 	sender.UID = "sender-job-uid"
 	sender.Status.Failed = 1
 	finished := metav1.NewTime(time.Date(2026, 7, 19, 10, 0, 0, 0, time.UTC))
@@ -1010,8 +1017,7 @@ func TestRunReconcileSelectsNewestTerminatedSenderDeterministically(t *testing.T
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			run := replicationRun("manual-newest-" + strings.ReplaceAll(tt.name, " ", "-"))
-			names := objectNamesForRun(run.Name)
-			sender := mustRunSenderJob(t, run, names, "release:test", "10.0.0.42")
+			sender := mustSenderJob(t, run, "release:test", "10.0.0.42")
 			sender.UID = types.UID("sender-job-uid-" + tt.name)
 			sender.Status.Failed = 1
 			finished := metav1.NewTime(base)
@@ -1037,8 +1043,7 @@ func TestRunReconcileSelectsNewestTerminatedSenderDeterministically(t *testing.T
 
 func TestRunReconcileFallsBackToTerminationReasonAndExitCode(t *testing.T) {
 	run := replicationRun("manual-termination-reason")
-	names := objectNamesForRun(run.Name)
-	sender := mustRunSenderJob(t, run, names, "release:test", "10.0.0.42")
+	sender := mustSenderJob(t, run, "release:test", "10.0.0.42")
 	sender.UID = "sender-job-uid"
 	sender.Status.Failed = 1
 	pod := terminatedSenderPod(run.Namespace, "sender-pod", sender, metav1.Now(), "")
@@ -1065,7 +1070,7 @@ func TestRunReconcileRedactsQuotedJobFailedConditionWithoutPodLogs(t *testing.T)
 	run.Status.ReceiverPodName = "zfs-receiver-worker-b"
 	run.Status.ReceiverPodIP = "10.0.0.42"
 	task := readyReceiveTask(run, names, "10.0.0.42", testReceiverHostKey)
-	sender := mustRunSenderJob(t, run, names, "datamover:test", "10.0.0.42")
+	sender := mustSenderJob(t, run, "sender:test", "10.0.0.42")
 	sender.Status.Failed = 1
 	sender.Status.Conditions = []batchv1.JobCondition{
 		{
@@ -1314,9 +1319,9 @@ func replicationRun(name string) *zfsv1.ZFSReplicationRun {
 	}
 }
 
-func mustRunSenderJob(t *testing.T, run *zfsv1.ZFSReplicationRun, names runObjects, image, receiverPodIP string) *batchv1.Job {
+func mustSenderJob(t *testing.T, run *zfsv1.ZFSReplicationRun, image, receiverHost string) *batchv1.Job {
 	t.Helper()
-	job, err := runSenderJob(run, names, image, receiverPodIP)
+	job, err := senderJob(run, image, zfsv1.ReceiveTaskEndpoint{Host: receiverHost, Port: 2222})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1329,7 +1334,7 @@ func readyReceiveTask(run *zfsv1.ZFSReplicationRun, names runObjects, host, host
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      names.ReceiveTaskName,
 			Namespace: run.Namespace,
-			Labels:    cloneLabels(names.Labels),
+			Labels:    maps.Clone(names.Labels),
 			UID:       "task-uid",
 		},
 		Spec: zfsv1.ZFSReceiveTaskSpec{
@@ -1381,7 +1386,7 @@ func runSSHSecretForTest(run *zfsv1.ZFSReplicationRun, names runObjects) *corev1
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      names.SecretName,
 			Namespace: run.Namespace,
-			Labels:    cloneLabels(names.Labels),
+			Labels:    maps.Clone(names.Labels),
 		},
 		Data: map[string][]byte{
 			"id_rsa":     []byte("test-private-key"),
@@ -1402,7 +1407,7 @@ func terminatedSenderPod(namespace, name string, job *batchv1.Job, finished meta
 		},
 		Status: corev1.PodStatus{ContainerStatuses: []corev1.ContainerStatus{
 			{
-				Name: "datamover",
+				Name: "sender",
 				State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
 					ExitCode:   1,
 					Reason:     "Error",
@@ -1422,7 +1427,7 @@ func newRunReconciler(t *testing.T, objs ...client.Object) *ZFSReplicationRunRec
 		Client:            c,
 		APIReader:         c,
 		Scheme:            scheme,
-		ReleaseImage:      "datamover:test",
+		ReleaseImage:      "sender:test",
 		ReceiverNamespace: "zfsreplication-system",
 	}
 }
@@ -1449,7 +1454,7 @@ func newRunReconcilerWithInterceptors(t *testing.T, funcs interceptor.Funcs, obj
 		Client:            c,
 		APIReader:         c,
 		Scheme:            scheme,
-		ReleaseImage:      "datamover:test",
+		ReleaseImage:      "sender:test",
 		ReceiverNamespace: "zfsreplication-system",
 	}
 }

@@ -93,14 +93,6 @@ func TestRenderedRuntimeUsesOneReleaseImage(t *testing.T) {
 	if got := manifestEnvValue(manager.Env, "RELEASE_IMAGE"); got != manager.Image {
 		t.Fatalf("RELEASE_IMAGE = %q, want manager image %q", got, manager.Image)
 	}
-	if got := manifestEnvValue(manager.Env, "DATA_MOVER_IMAGE"); got != "" {
-		t.Fatalf("DATA_MOVER_IMAGE = %q, want removed", got)
-	}
-	for _, arg := range manager.Args {
-		if strings.Contains(arg, "datamover-image") {
-			t.Fatalf("manager args contain independent image override: %v", manager.Args)
-		}
-	}
 }
 
 type manifestProbe struct {

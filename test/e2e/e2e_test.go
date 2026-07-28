@@ -159,7 +159,7 @@ func TestE2EExternalSnapshotsWithoutCommonBaseFails(t *testing.T) {
 
 	k.applyReplication(sc)
 	status := k.waitForFailed(sc, 4*time.Minute)
-	assertFailedAfterDataMoverSetupStatus(t, sc, status, "")
+	assertFailedAfterSenderSetupStatus(t, sc, status, "")
 	k.assertReceiveTaskTerminal(sc, status, e2eReceiveTaskPhaseFailed)
 	k.assertRealZFSSnapshotExists(sc.SourceNode, "zfs-src-snap-no-base-"+suffix, sc.sourceSnapshot())
 	k.assertRunEphemeralCleanup(sc.Name)
@@ -205,7 +205,7 @@ func TestE2ESyncoidFailure(t *testing.T) {
 
 	k.applyReplication(sc)
 	status := k.waitForFailed(sc, 4*time.Minute)
-	assertFailedAfterDataMoverSetupStatus(t, sc, status, "CRITICAL ERROR")
+	assertFailedAfterSenderSetupStatus(t, sc, status, "CRITICAL ERROR")
 	k.assertReceiveTaskTerminal(sc, status, e2eReceiveTaskPhaseFailed)
 	if !strings.Contains(status.LastError, sc.TargetDataset) {
 		t.Fatalf("lastError = %q, want to mention target dataset %q", status.LastError, sc.TargetDataset)
@@ -1074,7 +1074,7 @@ func (k kubectlRunner) collectDiagnosticsInNamespace(namespace, name string) {
 
 	pods, err := k.podsForReplicationInNamespace(namespace, name)
 	if err != nil {
-		k.t.Logf("list datamover pods for diagnostics failed: %v", err)
+		k.t.Logf("list Sender Pods for diagnostics failed: %v", err)
 		return
 	}
 	for _, pod := range pods.Items {
@@ -1109,7 +1109,7 @@ func (k kubectlRunner) assertSenderTerminationDiagnosis(sc replicationCase) {
 	}
 	for _, pod := range pods.Items {
 		for _, status := range pod.Status.ContainerStatuses {
-			if status.Name != "datamover" || status.State.Terminated == nil {
+			if status.Name != "sender" || status.State.Terminated == nil {
 				continue
 			}
 			message := status.State.Terminated.Message
@@ -1706,11 +1706,11 @@ func assertFailedStatus(t *testing.T, sc replicationCase, st replicationStatus, 
 	}
 }
 
-func assertFailedAfterDataMoverSetupStatus(t *testing.T, sc replicationCase, st replicationStatus, wantError string) {
+func assertFailedAfterSenderSetupStatus(t *testing.T, sc replicationCase, st replicationStatus, wantError string) {
 	t.Helper()
 	assertFailedStatus(t, sc, st, wantError)
 	if st.ReceiveTaskName == "" || st.ReceiverPodName == "" || st.ReceiverPodIP == "" || st.SSHSecretName == "" {
-		t.Fatalf("receiver/ssh status names missing after datamover setup for %s: %#v", sc.Name, st)
+		t.Fatalf("receiver/ssh status names missing after Sender setup for %s: %#v", sc.Name, st)
 	}
 }
 

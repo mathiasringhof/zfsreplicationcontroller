@@ -11,6 +11,15 @@ var invalidDNSLabel = regexp.MustCompile(`[^a-z0-9-]+`)
 
 const dnsLabelMaxLength = 63
 
+const labelPrefix = "zfsreplication.ringhof.io"
+
+type runObjects struct {
+	SecretName      string
+	ReceiveTaskName string
+	SenderName      string
+	Labels          map[string]string
+}
+
 func sanitizeName(parts ...string) string {
 	raw := strings.ToLower(strings.Join(parts, "-"))
 	name := raw

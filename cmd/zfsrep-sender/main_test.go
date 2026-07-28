@@ -8,8 +8,8 @@ import (
 	"testing"
 
 	zfsv1 "github.com/mathias/zfsreplicationcontroller/api/v1alpha1"
-	"github.com/mathias/zfsreplicationcontroller/internal/datamover"
 	"github.com/mathias/zfsreplicationcontroller/internal/replication/diagnosis"
+	"github.com/mathias/zfsreplicationcontroller/internal/sender"
 	"github.com/mathias/zfsreplicationcontroller/internal/syncoid"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
@@ -86,7 +86,7 @@ func (p *recordingPublisher) Publish(value diagnosis.Diagnosis) error {
 	return p.err
 }
 
-func senderConfig(t *testing.T) datamover.SenderConfig {
+func senderConfig(t *testing.T) sender.SenderConfig {
 	t.Helper()
 	run := &zfsv1.ZFSReplicationRun{
 		ObjectMeta: metav1.ObjectMeta{Namespace: "storage"},
@@ -102,9 +102,9 @@ func senderConfig(t *testing.T) datamover.SenderConfig {
 	values := make(map[string]string)
 	for _, entry := range append(contract.SenderEnvironment, syncoid.ConnectionEnvironment(syncoid.Connection{
 		TargetHost:     "root@10.0.0.42",
-		SSHKeyFile:     datamover.DefaultSSHKeyFile,
-		KnownHostsFile: datamover.DefaultKnownHostsFile,
-		SSHPort:        datamover.DefaultSSHPort,
+		SSHKeyFile:     "/var/run/zfsrep/ssh/id_rsa",
+		KnownHostsFile: "/var/run/zfsrep/ssh/known_hosts",
+		SSHPort:        "2222",
 	})...) {
 		values[entry.Name] = entry.Value
 	}
@@ -115,5 +115,5 @@ func senderConfig(t *testing.T) datamover.SenderConfig {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return datamover.SenderConfig{Invocation: invocation}
+	return sender.SenderConfig{Invocation: invocation}
 }

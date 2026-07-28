@@ -6,7 +6,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 )
 
-func TestImagePullPolicyFor(t *testing.T) {
+func TestSenderImagePullPolicy(t *testing.T) {
 	tests := []struct {
 		name  string
 		image string
@@ -46,8 +46,8 @@ func TestImagePullPolicyFor(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := imagePullPolicyFor(tt.image); got != tt.want {
-				t.Fatalf("imagePullPolicyFor(%q) = %q, want %q", tt.image, got, tt.want)
+			if got := senderImagePullPolicy(tt.image); got != tt.want {
+				t.Fatalf("senderImagePullPolicy(%q) = %q, want %q", tt.image, got, tt.want)
 			}
 		})
 	}

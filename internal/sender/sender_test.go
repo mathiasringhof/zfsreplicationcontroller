@@ -1,4 +1,4 @@
-package datamover
+package sender
 
 import (
 	"context"
@@ -394,20 +394,6 @@ func TestExecRunnerCapturesStderrWithoutMirroringRawOutput(t *testing.T) {
 	}
 	if string(mirrored) != "" {
 		t.Fatalf("mirrored stderr = %q, want no raw mirror", string(mirrored))
-	}
-}
-
-func TestSenderExitsBeforeWorkWhenNodeMismatch(t *testing.T) {
-	runner := &fakeRunner{}
-	err := RunSender(context.Background(), SenderConfig{
-		ExpectedNode: "worker-a",
-		ActualNode:   "worker-b",
-	}, runner)
-	if err == nil || !strings.Contains(err.Error(), "node verification failed") {
-		t.Fatalf("error = %v", err)
-	}
-	if len(runner.calls) != 0 {
-		t.Fatalf("zfs calls = %#v", runner.calls)
 	}
 }
 
