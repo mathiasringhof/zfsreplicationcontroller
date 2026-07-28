@@ -9,6 +9,7 @@ import (
 
 	zfsv1 "github.com/mathias/zfsreplicationcontroller/api/v1alpha1"
 	"github.com/mathias/zfsreplicationcontroller/internal/controller"
+	"github.com/mathias/zfsreplicationcontroller/internal/release"
 	batchv1 "k8s.io/api/batch/v1"
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -21,14 +22,6 @@ import (
 	logzap "sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 )
-
-func requiredReleaseImage(lookup func(string) string) (string, error) {
-	image := lookup("RELEASE_IMAGE")
-	if strings.TrimSpace(image) == "" {
-		return "", fmt.Errorf("release image environment variable RELEASE_IMAGE must not be empty")
-	}
-	return image, nil
-}
 
 func main() {
 	os.Exit(managerMain(os.Stderr, runManager))
@@ -50,7 +43,7 @@ func runManager() error {
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "probe bind address")
 	flag.StringVar(&watchNamespace, "watch-namespace", os.Getenv("WATCH_NAMESPACE"), "namespace to watch; empty watches all namespaces")
 	flag.Parse()
-	releaseImage, err := requiredReleaseImage(os.Getenv)
+	releaseImage, err := release.RequiredImage(os.Getenv)
 	if err != nil {
 		return err
 	}

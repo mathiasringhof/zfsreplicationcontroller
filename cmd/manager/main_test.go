@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"errors"
-	"strings"
 	"testing"
 
 	"k8s.io/apimachinery/pkg/runtime"
@@ -20,28 +19,6 @@ func TestManagerMainReportsExpectedFailureOnce(t *testing.T) {
 	}
 	if got := stderr.String(); got != "create manager: control plane unavailable\n" {
 		t.Fatalf("stderr = %q, want one concise fatal line", got)
-	}
-}
-
-func TestRequiredReleaseImage(t *testing.T) {
-	for _, image := range []string{
-		"ghcr.io/mathiasringhof/zfsreplicationcontroller:v0.4.0",
-		"ghcr.io/mathiasringhof/zfsreplicationcontroller@sha256:abc123",
-		"zfsreplicationcontroller:main",
-	} {
-		t.Run(image, func(t *testing.T) {
-			got, err := requiredReleaseImage(func(string) string { return image })
-			if err != nil {
-				t.Fatal(err)
-			}
-			if got != image {
-				t.Fatalf("release image = %q, want exact reference %q", got, image)
-			}
-		})
-	}
-
-	if _, err := requiredReleaseImage(func(string) string { return "  " }); err == nil || !strings.Contains(err.Error(), "RELEASE_IMAGE") {
-		t.Fatalf("missing release image error = %v", err)
 	}
 }
 

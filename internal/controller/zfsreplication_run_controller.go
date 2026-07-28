@@ -4,13 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"net"
 	"strconv"
 	"strings"
 	"time"
 
 	zfsv1 "github.com/mathias/zfsreplicationcontroller/api/v1alpha1"
-	"github.com/mathias/zfsreplicationcontroller/internal/datamover"
 	"github.com/mathias/zfsreplicationcontroller/internal/replication"
 	"github.com/mathias/zfsreplicationcontroller/internal/replication/diagnosis"
 	"github.com/mathias/zfsreplicationcontroller/internal/syncoid"
@@ -42,7 +42,6 @@ type runReceiverStatus struct {
 }
 
 const (
-	senderPodHostname      = "zfsrep-sender"
 	authorizationLease     = 30 * time.Minute
 	authorizationRenewLead = 10 * time.Minute
 )
@@ -204,7 +203,7 @@ func (r *ZFSReplicationRunReconciler) ensureSenderStarted(ctx context.Context, r
 		result, err := r.waitForReplicationReceiver(ctx, run, names)
 		return runReceiverStatus{}, result, true, err
 	}
-	created, recheck, err := r.ensureRunSenderJob(ctx, run, names, receiver.podIP)
+	created, recheck, err := r.ensureRunSenderJob(ctx, run, task.Status.Endpoint)
 	if err != nil {
 		return runReceiverStatus{}, ctrl.Result{}, false, err
 	}
@@ -435,8 +434,8 @@ func withEarlierRequeue(result ctrl.Result, leaseRequeueAfter time.Duration) ctr
 	return result
 }
 
-func (r *ZFSReplicationRunReconciler) ensureRunSenderJob(ctx context.Context, run *zfsv1.ZFSReplicationRun, names runObjects, receiverPodIP string) (bool, bool, error) {
-	job, err := runSenderJob(run, names, r.ReleaseImage, receiverPodIP)
+func (r *ZFSReplicationRunReconciler) ensureRunSenderJob(ctx context.Context, run *zfsv1.ZFSReplicationRun, endpoint zfsv1.ReceiveTaskEndpoint) (bool, bool, error) {
+	job, err := senderJob(run, r.ReleaseImage, endpoint)
 	if err != nil {
 		return false, false, err
 	}
@@ -624,7 +623,7 @@ func (r *ZFSReplicationRunReconciler) senderTerminationDiagnosis(ctx context.Con
 			continue
 		}
 		for _, status := range pod.Status.ContainerStatuses {
-			if status.Name != "datamover" || status.State.Terminated == nil {
+			if status.Name != senderContainerName || status.State.Terminated == nil {
 				continue
 			}
 			candidate := terminatedSender{
@@ -866,7 +865,7 @@ func objectNamesForRun(runName string) runObjects {
 }
 
 func runSSHSecret(run *zfsv1.ZFSReplicationRun, names runObjects, key sshKeyMaterial) *corev1.Secret {
-	labels := cloneLabels(names.Labels)
+	labels := maps.Clone(names.Labels)
 	labels[labelPrefix+"/role"] = "ssh"
 	return &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
@@ -884,7 +883,7 @@ func runSSHSecret(run *zfsv1.ZFSReplicationRun, names runObjects, key sshKeyMate
 }
 
 func runReceiveTask(run *zfsv1.ZFSReplicationRun, names runObjects, publicKey string, expiresAt metav1.Time) (*zfsv1.ZFSReceiveTask, error) {
-	labels := cloneLabels(names.Labels)
+	labels := maps.Clone(names.Labels)
 	labels[labelPrefix+"/role"] = "receiver"
 	contract, err := syncoid.Translate(run)
 	if err != nil {
@@ -907,34 +906,6 @@ func runReceiveTask(run *zfsv1.ZFSReplicationRun, names runObjects, publicKey st
 			Policy: contract.ReceiverPolicy,
 		},
 	}, nil
-}
-
-func runSenderJob(run *zfsv1.ZFSReplicationRun, names runObjects, image, receiverPodIP string) (*batchv1.Job, error) {
-	labels := cloneLabels(names.Labels)
-	labels[labelPrefix+"/role"] = "sender"
-	contract, err := syncoid.Translate(run)
-	if err != nil {
-		return nil, fmt.Errorf("translate Syncoid Replication Contract: %w", err)
-	}
-	env := []corev1.EnvVar{
-		{Name: datamover.EnvRole, Value: datamover.RoleSender},
-	}
-	env = append(env, contract.SenderEnvironment...)
-	env = append(env, syncoid.ConnectionEnvironment(syncoid.Connection{
-		TargetHost:     fmt.Sprintf("zfs-recv@%s", receiverPodIP),
-		SSHKeyFile:     datamover.DefaultSSHKeyFile,
-		KnownHostsFile: datamover.DefaultKnownHostsFile,
-		SSHPort:        datamover.DefaultSSHPort,
-	})...)
-	job := dataMoverJobForRun(run, names.SenderName, image, labels, run.Spec.Source.NodeName, "/usr/local/bin/zfsrep-sender", env, names.SecretName, false)
-	job.Spec.Template.Spec.Hostname = senderPodHostname
-	job.Spec.Template.Spec.Containers[0].TerminationMessagePath = "/dev/termination-log"
-	job.Spec.Template.Spec.Containers[0].TerminationMessagePolicy = corev1.TerminationMessageReadFile
-	return job, nil
-}
-
-func dataMoverJobForRun(run *zfsv1.ZFSReplicationRun, name, image string, labels map[string]string, nodeName, command string, env []corev1.EnvVar, secretName string, readiness bool) *batchv1.Job {
-	return dataMoverJob(run.Namespace, name, image, labels, nodeName, command, env, secretName, readiness)
 }
 
 func knownHostsLine(host string, port int32, hostKey string) (string, error) {

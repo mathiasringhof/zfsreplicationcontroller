@@ -65,8 +65,8 @@ Tags:
 - `<version>` and `<major>.<minor>`: published from `v*` release tags.
 
 The default manifests use `ghcr.io/mathiasringhof/zfsreplicationcontroller:main`
-for the controller, receiver DaemonSet, and data mover image. The controller
-Deployment, receiver DaemonSet, and generated data mover Jobs use
+for the controller, Receiver DaemonSet, and Sender image. The controller
+Deployment, Receiver DaemonSet, and generated Sender Jobs use
 `imagePullPolicy: Always` for mutable `main` and `latest` tags. For GitOps
 deployments, pin all image references to the same digest after the image has
 been published. A `sha-<commit>` tag is a useful fallback, but a digest is the
@@ -282,11 +282,10 @@ terminal or expired tasks while keeping unrelated grants active and the
 node-level Receiver ready. The sender Job has `ttlSecondsAfterFinished: 86400`
 so Kubernetes can keep it briefly for inspection before TTL cleanup.
 
-Sender Jobs pin pods with `spec.template.spec.nodeName` and use a stable pod
+Sender Jobs pin Pods with `spec.template.spec.nodeName` and use a stable Pod
 hostname so Syncoid-owned sync snapshots keep a stable pruning prefix across
-runs. At startup, the sender compares the downward API node name with the
-expected source node and exits before running ZFS commands on a mismatch.
-Receiver DaemonSet pods publish their own node and pod IP through
+runs. Kubernetes node placement is authoritative for executing the Sender on
+the Replication Source. Receiver DaemonSet Pods publish their own node and Pod IP through
 `ZFSReceiveTask.status`.
 
 Sender Jobs use `backoffLimit: 0`, `restartPolicy: Never`, and

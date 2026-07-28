@@ -7,14 +7,14 @@ import (
 	"io"
 	"os"
 
-	"github.com/mathias/zfsreplicationcontroller/internal/datamover"
 	"github.com/mathias/zfsreplicationcontroller/internal/replication/diagnosis"
+	"github.com/mathias/zfsreplicationcontroller/internal/sender"
 )
 
 const terminationMessagePath = "/dev/termination-log"
 
 func main() {
-	cfg, err := datamover.SenderConfigFromEnv()
+	cfg, err := sender.SenderConfigFromEnv()
 	if err != nil {
 		os.Exit(publishFailure(err, os.Stderr, filePublisher{path: terminationMessagePath}))
 	}
@@ -22,7 +22,7 @@ func main() {
 		context.Background(),
 		cfg,
 		os.Stderr,
-		datamover.ExecRunner{},
+		sender.ExecRunner{},
 		filePublisher{path: terminationMessagePath},
 	))
 }
@@ -39,8 +39,8 @@ func (p filePublisher) Publish(value diagnosis.Diagnosis) error {
 	return os.WriteFile(p.path, []byte(value.String()), 0o600)
 }
 
-func run(ctx context.Context, cfg datamover.SenderConfig, stderr io.Writer, runner datamover.CommandRunner, publisher diagnosisPublisher) int {
-	if err := datamover.RunSenderWithLog(ctx, cfg, runner, stderr); err != nil {
+func run(ctx context.Context, cfg sender.SenderConfig, stderr io.Writer, runner sender.CommandRunner, publisher diagnosisPublisher) int {
+	if err := sender.RunSenderWithLog(ctx, cfg, runner, stderr); err != nil {
 		return publishFailure(err, stderr, publisher)
 	}
 	return 0

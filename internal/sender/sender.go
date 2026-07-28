@@ -1,4 +1,4 @@
-package datamover
+package sender
 
 import (
 	"context"
@@ -14,21 +14,8 @@ import (
 	"github.com/mathias/zfsreplicationcontroller/internal/syncoid"
 )
 
-const (
-	EnvRole             = "ZFSREP_ROLE"
-	EnvExpectedNodeName = "EXPECTED_NODE_NAME"
-	EnvActualNodeName   = "ACTUAL_NODE_NAME"
-
-	RoleSender            = "sender"
-	DefaultSSHKeyFile     = "/var/run/zfsrep/ssh/id_rsa"
-	DefaultKnownHostsFile = "/var/run/zfsrep/ssh/known_hosts"
-	DefaultSSHPort        = "2222"
-)
-
 type SenderConfig struct {
-	Invocation   syncoid.Invocation
-	ExpectedNode string
-	ActualNode   string
+	Invocation syncoid.Invocation
 }
 
 func SenderConfigFromEnv() (SenderConfig, error) {
@@ -40,9 +27,7 @@ func SenderConfigFromLookup(lookup func(string) (string, bool)) (SenderConfig, e
 	if err != nil {
 		return SenderConfig{}, fmt.Errorf("decode Syncoid sender environment: %w", err)
 	}
-	expectedNode, _ := lookup(EnvExpectedNodeName)
-	actualNode, _ := lookup(EnvActualNodeName)
-	return SenderConfig{Invocation: invocation, ExpectedNode: expectedNode, ActualNode: actualNode}, nil
+	return SenderConfig{Invocation: invocation}, nil
 }
 
 func RunSender(ctx context.Context, cfg SenderConfig, r CommandRunner) error {
@@ -55,9 +40,6 @@ func RunSenderWithLog(ctx context.Context, cfg SenderConfig, r CommandRunner, lo
 
 func runSender(ctx context.Context, cfg SenderConfig, r CommandRunner, logw io.Writer) error {
 	started := time.Now()
-	if err := validateNode(cfg.ExpectedNode, cfg.ActualNode); err != nil {
-		return err
-	}
 	args := cfg.Invocation.Arguments()
 	logSenderStart(logw, cfg)
 	logSenderLine(logw, "syncoid command command=%s", strings.Join(sanitizeSyncoidArgs(args), " "))
@@ -196,14 +178,4 @@ func commandExitCode(err error) int {
 		return exitErr.ExitCode()
 	}
 	return -1
-}
-
-func validateNode(expected, actual string) error {
-	if expected == "" {
-		return nil
-	}
-	if actual != expected {
-		return fmt.Errorf("node verification failed: expected %q, got %q", expected, actual)
-	}
-	return nil
 }

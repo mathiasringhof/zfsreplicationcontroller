@@ -1,4 +1,4 @@
-package datamover
+package sender
 
 import (
 	"bytes"

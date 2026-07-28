@@ -1,4 +1,4 @@
-package datamover
+package release_test
 
 import (
 	"os"

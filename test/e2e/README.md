@@ -1,7 +1,7 @@
 # VM E2E Environment
 
 These scripts build a Lima-backed k3s cluster with a control-plane VM, two
-worker VMs, real ZFS pools, and the controller/data mover image. The Go e2e
+worker VMs, real ZFS pools, and the shared controller/Sender image. The Go e2e
 tests create `ZFSReplicationRun` objects and verify replication or failure state
 through Kubernetes.
 
