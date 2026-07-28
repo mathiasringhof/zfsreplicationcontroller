@@ -21,6 +21,10 @@ The matched agreement between one immutable Replication Run's sender invocation 
 **Failure Diagnosis**:
 A concise, sanitized, best-effort explanation of why a replication attempt failed. It is intended for operators, not as a stable classification or an input to automated behavior.
 
+**Replication Run Success**:
+A terminal outcome indicating that the configured replication operation completed without reporting a failure. It does not assert that warning-level post-transfer work, such as target snapshot deletion, completed.
+_Avoid_: Warning-free success, clean mirror
+
 **Receiver Authorization Snapshot**:
 The complete, immutable set of replication receive permissions available on one receiver at a reconciliation instant. Every accepted identity and its permitted operations belong to the same snapshot.
 
