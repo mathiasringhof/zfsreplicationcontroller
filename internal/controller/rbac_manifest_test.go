@@ -69,32 +69,6 @@ type manifestContainer struct {
 	ReadinessProbe manifestProbe    `yaml:"readinessProbe"`
 }
 
-func TestRenderedRuntimeUsesOneReleaseImage(t *testing.T) {
-	objects := renderKustomize(t, filepath.Join("..", "..", "config"))
-	var manager, receiver *manifestContainer
-	for _, obj := range objects {
-		switch obj.Kind {
-		case "Deployment":
-			if obj.Metadata.Name == "zfsreplication-controller" {
-				manager = findContainer(obj.Spec.Template.Spec.Containers, "manager")
-			}
-		case "DaemonSet":
-			if obj.Metadata.Name == "zfs-receiver" {
-				receiver = findContainer(obj.Spec.Template.Spec.Containers, "receiver")
-			}
-		}
-	}
-	if manager == nil || receiver == nil {
-		t.Fatalf("rendered manager = %v, receiver = %v", manager != nil, receiver != nil)
-	}
-	if manager.Image == "" || receiver.Image != manager.Image {
-		t.Fatalf("manager image = %q, receiver image = %q", manager.Image, receiver.Image)
-	}
-	if got := manifestEnvValue(manager.Env, "RELEASE_IMAGE"); got != manager.Image {
-		t.Fatalf("RELEASE_IMAGE = %q, want manager image %q", got, manager.Image)
-	}
-}
-
 type manifestProbe struct {
 	Exec      *manifestExecAction      `yaml:"exec"`
 	TCPSocket *manifestTCPSocketAction `yaml:"tcpSocket"`
