@@ -331,12 +331,12 @@ func TestE2EControllerServiceAccountRBAC(t *testing.T) {
 		{verb: "get", resource: "pods"},
 		{verb: "list", resource: "pods"},
 		{verb: "watch", resource: "pods"},
-		{verb: "delete", resource: "pods"},
 		{verb: "create", resource: "events"},
 		{verb: "patch", resource: "events"},
 	} {
 		k.assertCanIWithSubresource(tt.verb, tt.resource, tt.subresource, e2eNamespace, true)
 	}
+	k.assertCanI("delete", "pods", e2eNamespace, false)
 }
 
 func TestE2ENamespacedDeploymentSmoke(t *testing.T) {
@@ -355,7 +355,7 @@ func TestE2ENamespacedDeploymentSmoke(t *testing.T) {
 
 	k.assertControllerWatchesNamespace(e2eSmokeNamespace)
 	k.assertCanI("create", "jobs.batch", e2eSmokeNamespace, true)
-	k.assertCanI("delete", "pods", e2eSmokeNamespace, true)
+	k.assertCanI("delete", "pods", e2eSmokeNamespace, false)
 	k.assertCanI("create", "jobs.batch", e2eNamespace, false)
 	k.assertCanI("delete", "pods", e2eNamespace, false)
 
