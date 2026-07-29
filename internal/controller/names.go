@@ -17,20 +17,11 @@ type runObjects struct {
 	SecretName      string
 	ReceiveTaskName string
 	SenderName      string
-	Labels          map[string]string
 }
 
 func sanitizeName(parts ...string) string {
 	raw := strings.ToLower(strings.Join(parts, "-"))
-	name := raw
-	name = invalidDNSLabel.ReplaceAllString(name, "-")
-	name = strings.Trim(name, "-")
-	for strings.Contains(name, "--") {
-		name = strings.ReplaceAll(name, "--", "-")
-	}
-	if name == "" {
-		name = "zfsrep"
-	}
+	name := normalizeDNSLabel(raw)
 	if len(name) > dnsLabelMaxLength {
 		sum := sha256.Sum256([]byte(raw))
 		suffix := hex.EncodeToString(sum[:])[:10]
@@ -40,6 +31,19 @@ func sanitizeName(parts ...string) string {
 			prefix = "zfsrep"
 		}
 		name = prefix + "-" + suffix
+	}
+	return name
+}
+
+func normalizeDNSLabel(name string) string {
+	name = strings.ToLower(name)
+	name = invalidDNSLabel.ReplaceAllString(name, "-")
+	name = strings.Trim(name, "-")
+	for strings.Contains(name, "--") {
+		name = strings.ReplaceAll(name, "--", "-")
+	}
+	if name == "" {
+		name = "zfsrep"
 	}
 	return name
 }

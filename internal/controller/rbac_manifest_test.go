@@ -655,9 +655,14 @@ func TestCRDSchemaExposesSyncoidOptions(t *testing.T) {
 		t.Fatalf("spec validations = %#v, want immutable spec rule", runSpec.XKubernetesValidations)
 	}
 	statusProps := crd.Spec.Versions[0].Schema.OpenAPIV3Schema.Properties["status"].Properties
-	for _, field := range []string{"senderJobName", "receiveTaskName", "receiverPodName", "receiverPodIP", "sshSecretName"} {
+	for _, field := range []string{"senderJobName", "senderJobUID", "receiverPodName", "receiverPodIP"} {
 		if statusProps[field].Type != "string" {
 			t.Fatalf("status.%s schema = %#v, want string", field, statusProps[field])
+		}
+	}
+	for _, field := range []string{"receiveTaskName", "sshSecretName"} {
+		if _, exists := statusProps[field]; exists {
+			t.Fatalf("status.%s remains in schema", field)
 		}
 	}
 }
@@ -694,10 +699,13 @@ func TestReceiveTaskCRDSchemaExposesMVP1Fields(t *testing.T) {
 		t.Fatalf("%s has no versions", crdPath)
 	}
 	spec := crd.Spec.Versions[0].Schema.OpenAPIV3Schema.Properties["spec"]
-	for _, required := range []string{"runRef", "nodeName", "destination", "ssh"} {
+	for _, required := range []string{"nodeName", "destination", "ssh"} {
 		if !contains(spec.Required, required) {
 			t.Fatalf("receive task required fields = %v, missing %q", spec.Required, required)
 		}
+	}
+	if _, exists := spec.Properties["runRef"]; exists || contains(spec.Required, "runRef") {
+		t.Fatalf("receive task schema retains runRef")
 	}
 	if spec.Properties["ssh"].Properties["authorizedPublicKey"].Type != "string" {
 		t.Fatalf("authorizedPublicKey schema = %#v", spec.Properties["ssh"].Properties["authorizedPublicKey"])
@@ -733,7 +741,7 @@ func TestReceiveTaskCRDSchemaExposesMVP1Fields(t *testing.T) {
 	if status.Properties["ssh"].Properties["hostKey"].Type != "string" {
 		t.Fatalf("ssh.hostKey schema = %#v", status.Properties["ssh"].Properties["hostKey"])
 	}
-	if !hasValidationRule(spec.XKubernetesValidations, "self.runRef == oldSelf.runRef && self.nodeName == oldSelf.nodeName && self.destination == oldSelf.destination && self.policy == oldSelf.policy && self.ssh.authorizedPublicKey == oldSelf.ssh.authorizedPublicKey", "only spec.ssh.expiresAt may change") {
+	if !hasValidationRule(spec.XKubernetesValidations, "self.nodeName == oldSelf.nodeName && self.destination == oldSelf.destination && self.policy == oldSelf.policy && self.ssh.authorizedPublicKey == oldSelf.ssh.authorizedPublicKey", "only spec.ssh.expiresAt may change") {
 		t.Fatalf("receive task spec validations = %#v, want all fields except expiresAt immutable", spec.XKubernetesValidations)
 	}
 	if !hasValidationRule(spec.XKubernetesValidations, "timestamp(self.ssh.expiresAt) >= timestamp(oldSelf.ssh.expiresAt)", "spec.ssh.expiresAt may only move forward") {

@@ -16,6 +16,8 @@ import (
 	"testing"
 	"time"
 	"unicode/utf8"
+
+	"github.com/mathias/zfsreplicationcontroller/internal/runchildren"
 )
 
 const (
@@ -59,11 +61,14 @@ func TestE2EFullAndIncrementalReplication(t *testing.T) {
 	k.runRealZFS(first.TargetNode, "zfs-dst-"+suffix, realZFSSetupTargetScript(pool, first.TargetDataset))
 
 	k.applyReplication(first)
+	k.waitForOwnedRunSecret(first)
 	firstStatus := k.waitForSuccess(first, 4*time.Minute)
 	assertSucceededStatus(t, first, firstStatus)
-	k.assertReceiveTaskTerminal(first, firstStatus, e2eReceiveTaskPhaseCompleted)
+	k.assertReceiveTaskTerminal(first, e2eReceiveTaskPhaseCompleted)
+	k.assertRunExecutionIdentity(first, firstStatus)
 	k.assertRealZFSMarker(first.TargetNode, "zfs-dst-p1-"+suffix, pool, first.TargetDataset, "first-"+suffix)
 	k.assertRunEphemeralCleanup(first.Name)
+	k.deleteRunAndAssertGarbageCollected(e2eNamespace, first.Name)
 
 	second := first
 	second.Name = name + "-2"
@@ -75,7 +80,8 @@ func TestE2EFullAndIncrementalReplication(t *testing.T) {
 	k.applyReplication(second)
 	secondStatus := k.waitForSuccess(second, 4*time.Minute)
 	assertSucceededStatus(t, second, secondStatus)
-	k.assertReceiveTaskTerminal(second, secondStatus, e2eReceiveTaskPhaseCompleted)
+	k.assertReceiveTaskTerminal(second, e2eReceiveTaskPhaseCompleted)
+	k.assertRunExecutionIdentity(second, secondStatus)
 	k.assertRealZFSMarker(second.TargetNode, "zfs-dst-p2-"+suffix, pool, second.TargetDataset, "second-"+suffix)
 	k.assertRealZFSSyncoidSnapshots(second.SourceNode, "zfs-src-sync-snaps-"+suffix, pool, second.SourceDataset, 1)
 	k.assertRealZFSSyncoidSnapshots(second.TargetNode, "zfs-dst-sync-snaps-"+suffix, pool, second.TargetDataset, 1)
@@ -160,7 +166,7 @@ func TestE2EExternalSnapshotsWithoutCommonBaseFails(t *testing.T) {
 	k.applyReplication(sc)
 	status := k.waitForFailed(sc, 4*time.Minute)
 	assertFailedAfterSenderSetupStatus(t, sc, status, "")
-	k.assertReceiveTaskTerminal(sc, status, e2eReceiveTaskPhaseFailed)
+	k.assertReceiveTaskTerminal(sc, e2eReceiveTaskPhaseFailed)
 	k.assertRealZFSSnapshotExists(sc.SourceNode, "zfs-src-snap-no-base-"+suffix, sc.sourceSnapshot())
 	k.assertRunEphemeralCleanup(sc.Name)
 }
@@ -206,7 +212,7 @@ func TestE2ESyncoidFailure(t *testing.T) {
 	k.applyReplication(sc)
 	status := k.waitForFailed(sc, 4*time.Minute)
 	assertFailedAfterSenderSetupStatus(t, sc, status, "CRITICAL ERROR")
-	k.assertReceiveTaskTerminal(sc, status, e2eReceiveTaskPhaseFailed)
+	k.assertReceiveTaskTerminal(sc, e2eReceiveTaskPhaseFailed)
 	if !strings.Contains(status.LastError, sc.TargetDataset) {
 		t.Fatalf("lastError = %q, want to mention target dataset %q", status.LastError, sc.TargetDataset)
 	}
@@ -423,12 +429,14 @@ type e2eSSHKey struct {
 }
 
 type receiverAuthorizationCase struct {
-	Name       string
-	NodeName   string
-	Dataset    string
-	PublicKey  string
-	PrivateKey string
-	ExpiresAt  time.Time
+	Name         string
+	NodeName     string
+	Dataset      string
+	PublicKey    string
+	PrivateKey   string
+	ExpiresAt    time.Time
+	OwnerRunName string
+	OwnerRunUID  string
 }
 
 func newE2ESSHKey(t *testing.T, comment string) e2eSSHKey {
@@ -455,18 +463,18 @@ func newE2ESSHKey(t *testing.T, comment string) e2eSSHKey {
 
 func (c receiverAuthorizationCase) manifestJSON(t *testing.T) []byte {
 	t.Helper()
+	metadata := map[string]any{
+		"name":      c.Name,
+		"namespace": e2eNamespace,
+		"labels": map[string]any{
+			e2eLabelPrefix + "/authorization-test": c.Name,
+		},
+	}
 	doc := map[string]any{
 		"apiVersion": "zfsreplication.ringhof.io/v1alpha1",
 		"kind":       "ZFSReceiveTask",
-		"metadata": map[string]any{
-			"name":      c.Name,
-			"namespace": e2eNamespace,
-			"labels": map[string]any{
-				e2eLabelPrefix + "/authorization-test": c.Name,
-			},
-		},
+		"metadata":   metadata,
 		"spec": map[string]any{
-			"runRef":   map[string]any{"name": c.Name},
 			"nodeName": c.NodeName,
 			"destination": map[string]any{
 				"dataset": c.Dataset,
@@ -481,6 +489,9 @@ func (c receiverAuthorizationCase) manifestJSON(t *testing.T) []byte {
 				"compression":      "none",
 			},
 		},
+	}
+	if c.OwnerRunUID != "" {
+		metadata["ownerReferences"] = []any{runControllerOwnerReference(c.OwnerRunName, c.OwnerRunUID)}
 	}
 	return manifestBytes(t, doc)
 }
@@ -579,8 +590,9 @@ func (k kubectlRunner) cleanupReplication(name string) {
 func (k kubectlRunner) cleanupReplicationInNamespace(namespace, name string) {
 	k.t.Helper()
 	k.run(75*time.Second, "delete", "zfsreplicationrun", name, "-n", namespace, "--ignore-not-found=true", "--wait=true", "--timeout=60s")
-	k.run(75*time.Second, "delete", "zfsreceivetasks", "-n", namespace, "-l", e2eLabelPrefix+"/run="+name, "--ignore-not-found=true", "--wait=true", "--timeout=60s")
-	k.run(75*time.Second, "delete", "jobs,pods,secrets", "-n", namespace, "-l", e2eLabelPrefix+"/run="+name, "--ignore-not-found=true", "--wait=true", "--timeout=60s")
+	k.run(75*time.Second, "delete", "zfsreceivetask", runObjectName(name, "receiver"), "-n", namespace, "--ignore-not-found=true", "--wait=true", "--timeout=60s")
+	k.run(75*time.Second, "delete", "job", runObjectName(name, "sender"), "-n", namespace, "--ignore-not-found=true", "--wait=true", "--timeout=60s")
+	k.run(75*time.Second, "delete", "secret", runObjectName(name, "ssh"), "-n", namespace, "--ignore-not-found=true", "--wait=true", "--timeout=60s")
 }
 
 func (k kubectlRunner) cleanupReplicationOnExit(name string) {
@@ -871,7 +883,10 @@ func (k kubectlRunner) verifySenderWaitsForExactReceiverPodReadiness(suffix stri
 	k.scaleController(0)
 	k.t.Cleanup(func() { k.scaleController(1) })
 	k.applyReplication(sc)
-	k.applyRunSSHSecret(sc.Name, key)
+	runUID := k.runUID(e2eNamespace, sc.Name)
+	task.OwnerRunName = sc.Name
+	task.OwnerRunUID = runUID
+	k.applyRunSSHSecret(sc.Name, runUID, key)
 	k.applyReceiverAuthorization(task)
 	staleReady := k.waitForReceiveTaskPhase(task.Name, e2eReceiveTaskPhaseReady, 30*time.Second)
 	if staleReady.ReceiverPod.Name == "" || staleReady.ReceiverPod.UID == "" {
@@ -896,7 +911,7 @@ func (k kubectlRunner) verifySenderWaitsForExactReceiverPodReadiness(suffix stri
 	k.assertRealZFSMarker(sc.TargetNode, "zfs-dst-gate-"+suffix, pool, sc.TargetDataset, "sender-gate-"+suffix)
 }
 
-func (k kubectlRunner) applyRunSSHSecret(runName string, key e2eSSHKey) {
+func (k kubectlRunner) applyRunSSHSecret(runName, runUID string, key e2eSSHKey) {
 	k.t.Helper()
 	doc := map[string]any{
 		"apiVersion": "v1",
@@ -904,7 +919,10 @@ func (k kubectlRunner) applyRunSSHSecret(runName string, key e2eSSHKey) {
 		"metadata": map[string]any{
 			"name":      runObjectName(runName, "ssh"),
 			"namespace": e2eNamespace,
-			"labels":    runLabels(runName, "ssh"),
+			"labels":    roleLabels("ssh"),
+			"ownerReferences": []any{
+				runControllerOwnerReference(runName, runUID),
+			},
 		},
 		"type": "Opaque",
 		"stringData": map[string]any{
@@ -1089,7 +1107,7 @@ func (k kubectlRunner) collectDiagnosticsInNamespace(namespace, name string) {
 
 func (k kubectlRunner) podsForReplicationInNamespace(namespace, name string) (podList, error) {
 	k.t.Helper()
-	selector := e2eLabelPrefix + "/run=" + name
+	selector := "batch.kubernetes.io/job-name=" + runObjectName(name, "sender")
 	out, err := k.runOutput(20*time.Second, "get", "pods", "-n", namespace, "-l", selector, "-o", "json")
 	if err != nil {
 		return podList{}, err
@@ -1136,35 +1154,27 @@ func (k kubectlRunner) assertRunEphemeralCleanup(name string) {
 
 func (k kubectlRunner) assertRunEphemeralCleanupInNamespace(namespace, name string) {
 	k.t.Helper()
-	k.assertNoLabelledResourcesEventuallyInNamespace(namespace, name, "run secrets", "secrets", "")
+	k.assertNamedObjectDeletedEventually(namespace, "secret", runObjectName(name, "ssh"))
 }
 
-func (k kubectlRunner) assertNoLabelledResourcesEventuallyInNamespace(namespace, name, description, resource, extraSelector string) {
+func (k kubectlRunner) assertNamedObjectDeletedEventually(namespace, resource, name string) {
 	k.t.Helper()
-	selector := e2eLabelPrefix + "/run=" + name
-	if extraSelector != "" {
-		selector += "," + extraSelector
-	}
 	deadline := time.Now().Add(60 * time.Second)
 	var lastOut string
 	var lastErr error
 	for time.Now().Before(deadline) {
-		out, err := k.runOutput(20*time.Second, "get", resource, "-n", namespace, "-l", selector, "-o", "name")
+		out, err := k.runOutput(20*time.Second, "get", resource, name, "-n", namespace, "-o", "name")
 		if err != nil {
-			if strings.Contains(err.Error(), "No resources found") {
+			if strings.Contains(err.Error(), "NotFound") {
 				return
 			}
 			lastErr = err
 		} else {
 			lastOut = out
-			if strings.TrimSpace(out) == "" {
-				return
-			}
 		}
 		time.Sleep(1 * time.Second)
 	}
-	k.collectDiagnosticsInNamespace(namespace, name)
-	k.t.Fatalf("%s still exist for %s/%s after terminal cleanup; selector=%q last output=%q last error=%v", description, namespace, name, selector, lastOut, lastErr)
+	k.t.Fatalf("%s %s/%s still exists; last output=%q last error=%v", resource, namespace, name, lastOut, lastErr)
 }
 
 func (k kubectlRunner) assertNoJobsOrSecrets(name string) {
@@ -1174,23 +1184,26 @@ func (k kubectlRunner) assertNoJobsOrSecrets(name string) {
 
 func (k kubectlRunner) assertNoJobsOrSecretsInNamespace(namespace, name string) {
 	k.t.Helper()
-	out, err := k.runOutput(20*time.Second, "get", "jobs,secrets", "-n", namespace, "-l", e2eLabelPrefix+"/run="+name, "-o", "name")
-	if err != nil && !strings.Contains(err.Error(), "No resources found") {
-		k.t.Fatal(err)
-	}
-	if strings.TrimSpace(out) != "" {
-		k.t.Fatalf("jobs/secrets exist for %s/%s:\n%s", namespace, name, out)
+	for resource, childName := range map[string]string{
+		"job":    runObjectName(name, "sender"),
+		"secret": runObjectName(name, "ssh"),
+	} {
+		if out, err := k.runOutput(20*time.Second, "get", resource, childName, "-n", namespace, "-o", "name"); err == nil {
+			k.t.Fatalf("%s exists for %s/%s:\n%s", resource, namespace, name, out)
+		} else if !strings.Contains(err.Error(), "NotFound") {
+			k.t.Fatal(err)
+		}
 	}
 }
 
 func (k kubectlRunner) assertNoSenderJob(name string) {
 	k.t.Helper()
-	selector := e2eLabelPrefix + "/run=" + name + "," + e2eLabelPrefix + "/role=sender"
-	out, err := k.runOutput(20*time.Second, "get", "jobs", "-n", e2eNamespace, "-l", selector, "-o", "name")
-	if err != nil && !strings.Contains(err.Error(), "No resources found") {
+	jobName := runObjectName(name, "sender")
+	out, err := k.runOutput(20*time.Second, "get", "job", jobName, "-n", e2eNamespace, "-o", "name")
+	if err != nil && !strings.Contains(err.Error(), "NotFound") {
 		k.t.Fatal(err)
 	}
-	if strings.TrimSpace(out) != "" {
+	if err == nil {
 		k.collectDiagnosticsInNamespace(e2eNamespace, name)
 		k.t.Fatalf("sender job exists for blocked run %s:\n%s", name, out)
 	}
@@ -1217,13 +1230,14 @@ func (k kubectlRunner) patchRunPhase(namespace, name, phase string) {
 
 func (k kubectlRunner) seedTerminalCleanupObjects(namespace string, sc replicationCase, objects []terminalCleanupObject) {
 	k.t.Helper()
+	runUID := k.runUID(namespace, sc.Name)
 	for _, obj := range objects {
 		var manifest []byte
 		switch obj {
 		case terminalCleanupReceiveTask:
-			manifest = receiveTaskManifest(k.t, namespace, sc)
+			manifest = receiveTaskManifest(k.t, namespace, sc, runUID)
 		case terminalCleanupSSHSecret:
-			manifest = runSSHSecretManifest(k.t, namespace, sc.Name)
+			manifest = runSSHSecretManifest(k.t, namespace, sc.Name, runUID)
 		default:
 			k.t.Fatalf("unknown cleanup object %q", obj)
 		}
@@ -1235,16 +1249,17 @@ func (k kubectlRunner) seedTerminalCleanupObjects(namespace string, sc replicati
 
 func (k kubectlRunner) logSelectedRunObjects(namespace, name, stage string) {
 	k.t.Helper()
-	for _, selector := range []string{
-		e2eLabelPrefix + "/run=" + name,
-		e2eLabelPrefix + "/run=" + name + "," + e2eLabelPrefix + "/role=receiver",
+	for _, object := range []string{
+		"zfsreceivetask/" + runObjectName(name, "receiver"),
+		"job/" + runObjectName(name, "sender"),
+		"secret/" + runObjectName(name, "ssh"),
 	} {
-		args := []string{"get", "zfsreceivetasks,pods,jobs,secrets", "-n", namespace, "-l", selector, "-o", "wide", "--show-labels"}
+		args := []string{"get", object, "-n", namespace, "-o", "wide", "--show-labels"}
 		out, err := k.runOutput(20*time.Second, args...)
-		if err != nil && !strings.Contains(err.Error(), "No resources found") {
-			k.t.Fatalf("capture %s objects for %s/%s selector %q: %v", stage, namespace, name, selector, err)
+		if err != nil && !strings.Contains(err.Error(), "NotFound") {
+			k.t.Fatalf("capture %s object for %s/%s %q: %v", stage, namespace, name, object, err)
 		}
-		k.t.Logf("%s objects for %s/%s selector %q:\n%s", stage, namespace, name, selector, out)
+		k.t.Logf("%s object for %s/%s %q:\n%s", stage, namespace, name, object, out)
 	}
 }
 
@@ -1253,12 +1268,10 @@ func (k kubectlRunner) assertReceiverDaemonSetAvailable() {
 	k.run(90*time.Second, "rollout", "status", "daemonset/zfs-receiver", "-n", e2eControllerNamespace, "--timeout=90s")
 }
 
-func (k kubectlRunner) assertReceiveTaskTerminal(sc replicationCase, runStatus replicationStatus, wantPhase string) {
+func (k kubectlRunner) assertReceiveTaskTerminal(sc replicationCase, wantPhase string) {
 	k.t.Helper()
-	if runStatus.ReceiveTaskName == "" {
-		k.t.Fatalf("receiveTaskName is empty for %s: %#v", sc.Name, runStatus)
-	}
-	st := k.assertReceiveTaskPhase(e2eNamespace, runStatus.ReceiveTaskName, wantPhase)
+	taskName := runObjectName(sc.Name, "receiver")
+	st := k.assertReceiveTaskPhase(e2eNamespace, taskName, wantPhase)
 	if st.Endpoint.Host == "" || st.Endpoint.Port == 0 || st.SSH.HostKey == "" || st.ReceiverPod.Name == "" {
 		k.t.Fatalf("receive task status missing daemonset receiver details for %s: %#v", sc.Name, st)
 	}
@@ -1266,7 +1279,7 @@ func (k kubectlRunner) assertReceiveTaskTerminal(sc replicationCase, runStatus r
 		k.t.Fatalf("receive task error = %q, want empty", st.Error)
 	}
 	if wantPhase == e2eReceiveTaskPhaseFailed && st.Error == "" {
-		k.t.Fatalf("receive task error is empty for failed task %s", runStatus.ReceiveTaskName)
+		k.t.Fatalf("receive task error is empty for failed task %s", taskName)
 	}
 }
 
@@ -1563,13 +1576,25 @@ type replicationObject struct {
 	Status replicationStatus `json:"status"`
 }
 
+type metadataObject struct {
+	Metadata struct {
+		UID             string `json:"uid"`
+		OwnerReferences []struct {
+			APIVersion string `json:"apiVersion"`
+			Kind       string `json:"kind"`
+			Name       string `json:"name"`
+			UID        string `json:"uid"`
+			Controller bool   `json:"controller"`
+		} `json:"ownerReferences"`
+	} `json:"metadata"`
+}
+
 type replicationStatus struct {
 	Phase           string `json:"phase"`
 	SenderJobName   string `json:"senderJobName"`
-	ReceiveTaskName string `json:"receiveTaskName"`
+	SenderJobUID    string `json:"senderJobUID"`
 	ReceiverPodName string `json:"receiverPodName"`
 	ReceiverPodIP   string `json:"receiverPodIP"`
-	SSHSecretName   string `json:"sshSecretName"`
 	StartedAt       string `json:"startedAt"`
 	CompletedAt     string `json:"completedAt"`
 	LastError       string `json:"lastError"`
@@ -1679,15 +1704,93 @@ func assertSucceededStatus(t *testing.T, sc replicationCase, st replicationStatu
 	if st.LastError != "" {
 		t.Fatalf("lastError = %q, want empty", st.LastError)
 	}
-	if st.SenderJobName == "" {
-		t.Fatalf("status object names missing: %#v", st)
+	if st.SenderJobName == "" || st.SenderJobUID == "" {
+		t.Fatalf("status sender Job identity missing: %#v", st)
 	}
-	if st.ReceiveTaskName == "" || st.ReceiverPodName == "" || st.ReceiverPodIP == "" || st.SSHSecretName == "" {
-		t.Fatalf("receiver/ssh status names missing: %#v", st)
+	if st.ReceiverPodName == "" || st.ReceiverPodIP == "" {
+		t.Fatalf("receiver observations missing: %#v", st)
 	}
 	if st.StartedAt == "" || st.CompletedAt == "" {
 		t.Fatalf("status timestamps missing: %#v", st)
 	}
+}
+
+func (k kubectlRunner) assertRunExecutionIdentity(sc replicationCase, status replicationStatus) {
+	k.t.Helper()
+	runUID := k.runUID(e2eNamespace, sc.Name)
+	for resource, name := range map[string]string{
+		"zfsreceivetask": runObjectName(sc.Name, "receiver"),
+		"job":            status.SenderJobName,
+	} {
+		obj := k.metadataObject(e2eNamespace, resource, name)
+		k.assertControlledByRun(resource, e2eNamespace, name, sc.Name, runUID, obj)
+		if resource == "job" && obj.Metadata.UID != status.SenderJobUID {
+			k.t.Fatalf("sender Job UID = %q, status senderJobUID = %q", obj.Metadata.UID, status.SenderJobUID)
+		}
+	}
+	k.assertNamedObjectDeletedEventually(e2eNamespace, "secret", runObjectName(sc.Name, "ssh"))
+}
+
+func (k kubectlRunner) waitForOwnedRunSecret(sc replicationCase) {
+	k.t.Helper()
+	runUID := k.runUID(e2eNamespace, sc.Name)
+	secretName := runObjectName(sc.Name, "ssh")
+	deadline := time.Now().Add(60 * time.Second)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		out, err := k.runOutput(20*time.Second, "get", "secret", secretName, "-n", e2eNamespace, "-o", "json")
+		if err == nil {
+			var obj metadataObject
+			if err := json.Unmarshal([]byte(out), &obj); err != nil {
+				k.t.Fatalf("parse Secret %s/%s metadata: %v\n%s", e2eNamespace, secretName, err, out)
+			}
+			k.assertControlledByRun("secret", e2eNamespace, secretName, sc.Name, runUID, obj)
+			return
+		}
+		lastErr = err
+		time.Sleep(250 * time.Millisecond)
+	}
+	k.t.Fatalf("timed out waiting for owned SSH Secret %s/%s: %v", e2eNamespace, secretName, lastErr)
+}
+
+func (k kubectlRunner) assertControlledByRun(resource, namespace, name, runName, runUID string, obj metadataObject) {
+	k.t.Helper()
+	for _, owner := range obj.Metadata.OwnerReferences {
+		if owner.Controller &&
+			owner.APIVersion == "zfsreplication.ringhof.io/v1alpha1" &&
+			owner.Kind == "ZFSReplicationRun" &&
+			owner.Name == runName &&
+			owner.UID == runUID {
+			return
+		}
+	}
+	k.t.Fatalf("%s %s/%s is not controlled by exact Run UID %s: %#v", resource, namespace, name, runUID, obj.Metadata.OwnerReferences)
+}
+
+func (k kubectlRunner) runUID(namespace, name string) string {
+	k.t.Helper()
+	return k.metadataObject(namespace, "zfsreplicationrun", name).Metadata.UID
+}
+
+func (k kubectlRunner) metadataObject(namespace, resource, name string) metadataObject {
+	k.t.Helper()
+	out, err := k.runOutput(20*time.Second, "get", resource, name, "-n", namespace, "-o", "json")
+	if err != nil {
+		k.t.Fatal(err)
+	}
+	var obj metadataObject
+	if err := json.Unmarshal([]byte(out), &obj); err != nil {
+		k.t.Fatalf("parse %s %s/%s metadata: %v\n%s", resource, namespace, name, err, out)
+	}
+	return obj
+}
+
+func (k kubectlRunner) deleteRunAndAssertGarbageCollected(namespace, name string) {
+	k.t.Helper()
+	k.run(75*time.Second, "delete", "zfsreplicationrun", name, "-n", namespace, "--wait=true", "--timeout=60s")
+	k.assertNamedObjectDeletedEventually(namespace, "zfsreceivetask", runObjectName(name, "receiver"))
+	k.assertNamedObjectDeletedEventually(namespace, "job", runObjectName(name, "sender"))
+	k.assertNamedObjectDeletedEventually(namespace, "secret", runObjectName(name, "ssh"))
 }
 
 func assertFailedStatus(t *testing.T, sc replicationCase, st replicationStatus, wantError string) {
@@ -1709,12 +1812,12 @@ func assertFailedStatus(t *testing.T, sc replicationCase, st replicationStatus, 
 func assertFailedAfterSenderSetupStatus(t *testing.T, sc replicationCase, st replicationStatus, wantError string) {
 	t.Helper()
 	assertFailedStatus(t, sc, st, wantError)
-	if st.ReceiveTaskName == "" || st.ReceiverPodName == "" || st.ReceiverPodIP == "" || st.SSHSecretName == "" {
-		t.Fatalf("receiver/ssh status names missing after Sender setup for %s: %#v", sc.Name, st)
+	if st.SenderJobName == "" || st.SenderJobUID == "" || st.ReceiverPodName == "" || st.ReceiverPodIP == "" {
+		t.Fatalf("execution identity or receiver observations missing after Sender setup for %s: %#v", sc.Name, st)
 	}
 }
 
-func receiveTaskManifest(t *testing.T, namespace string, sc replicationCase) []byte {
+func receiveTaskManifest(t *testing.T, namespace string, sc replicationCase, runUID string) []byte {
 	t.Helper()
 	doc := map[string]any{
 		"apiVersion": "zfsreplication.ringhof.io/v1alpha1",
@@ -1722,12 +1825,12 @@ func receiveTaskManifest(t *testing.T, namespace string, sc replicationCase) []b
 		"metadata": map[string]any{
 			"name":      runObjectName(sc.Name, "receiver"),
 			"namespace": namespace,
-			"labels":    runLabels(sc.Name, "receiver"),
+			"labels":    roleLabels("receiver"),
+			"ownerReferences": []any{
+				runControllerOwnerReference(sc.Name, runUID),
+			},
 		},
 		"spec": map[string]any{
-			"runRef": map[string]any{
-				"name": sc.Name,
-			},
 			"nodeName": sc.TargetNode,
 			"destination": map[string]any{
 				"dataset": sc.TargetDataset,
@@ -1746,7 +1849,7 @@ func receiveTaskManifest(t *testing.T, namespace string, sc replicationCase) []b
 	return manifestBytes(t, doc)
 }
 
-func runSSHSecretManifest(t *testing.T, namespace, runName string) []byte {
+func runSSHSecretManifest(t *testing.T, namespace, runName, runUID string) []byte {
 	t.Helper()
 	doc := map[string]any{
 		"apiVersion": "v1",
@@ -1754,7 +1857,10 @@ func runSSHSecretManifest(t *testing.T, namespace, runName string) []byte {
 		"metadata": map[string]any{
 			"name":      runObjectName(runName, "ssh"),
 			"namespace": namespace,
-			"labels":    runLabels(runName, "ssh"),
+			"labels":    roleLabels("ssh"),
+			"ownerReferences": []any{
+				runControllerOwnerReference(runName, runUID),
+			},
 		},
 		"type": "Opaque",
 		"stringData": map[string]any{
@@ -1766,15 +1872,35 @@ func runSSHSecretManifest(t *testing.T, namespace, runName string) []byte {
 	return manifestBytes(t, doc)
 }
 
-func runLabels(runName, role string) map[string]any {
+func roleLabels(role string) map[string]any {
 	return map[string]any{
-		e2eLabelPrefix + "/run":  runName,
 		e2eLabelPrefix + "/role": role,
 	}
 }
 
+func runControllerOwnerReference(runName, runUID string) map[string]any {
+	return map[string]any{
+		"apiVersion":         "zfsreplication.ringhof.io/v1alpha1",
+		"kind":               "ZFSReplicationRun",
+		"name":               runName,
+		"uid":                runUID,
+		"controller":         true,
+		"blockOwnerDeletion": true,
+	}
+}
+
 func runObjectName(runName, suffix string) string {
-	return "zfsrep-" + runName + "-" + suffix
+	names := runchildren.ForRun(runName)
+	switch suffix {
+	case "ssh":
+		return names.SSHSecret
+	case "receiver":
+		return names.ReceiveTask
+	case "sender":
+		return names.SenderJob
+	default:
+		panic("unknown Replication Run child role " + suffix)
+	}
 }
 
 func manifestBytes(t *testing.T, doc map[string]any) []byte {

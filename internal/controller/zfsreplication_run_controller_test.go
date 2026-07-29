@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"maps"
 	"strings"
 	"testing"
 	"time"
@@ -37,7 +36,7 @@ func TestRunReconcileSenderJobEmbedsSyncoidTranslation(t *testing.T) {
 	task := readyReceiveTask(run, names, "10.0.0.42", testReceiverHostKey)
 	task.Status.Endpoint.Port = 2205
 	pod := readyReceiverPodForTask(task)
-	r := newRunReconciler(t, run, task, pod)
+	r := newRunReconciler(t, run, task, runSSHSecretForTest(run, names), pod)
 	r.APIReader = newRunAPIReader(t, run, task, pod)
 	if _, err := r.Reconcile(context.Background(), request("manual-1")); err != nil {
 		t.Fatal(err)
@@ -124,13 +123,13 @@ func TestRunReconcileCreatesReceiveTaskBeforeSenderJob(t *testing.T) {
 	if result.RequeueAfter == 0 {
 		t.Fatalf("RequeueAfter = %v, want receiver wait", result.RequeueAfter)
 	}
+	if _, err := r.Reconcile(context.Background(), request("manual-1")); err != nil {
+		t.Fatal(err)
+	}
 
 	var task zfsv1.ZFSReceiveTask
 	if err := r.Get(context.Background(), types.NamespacedName{Name: names.ReceiveTaskName, Namespace: run.Namespace}, &task); err != nil {
 		t.Fatal(err)
-	}
-	if task.Spec.RunRef.Name != run.Name {
-		t.Fatalf("task runRef = %#v", task.Spec.RunRef)
 	}
 	if task.Spec.NodeName != run.Spec.Target.NodeName {
 		t.Fatalf("task nodeName = %q", task.Spec.NodeName)
@@ -153,6 +152,162 @@ func TestRunReconcileCreatesReceiveTaskBeforeSenderJob(t *testing.T) {
 	}
 	assertObjectDeleted(t, r.Client, &batchv1.Job{}, names.SenderName)
 	assertRunPhase(t, r.Client, run.Name, zfsv1.PhaseStartingReceiver)
+}
+
+func TestRunReconcileCreatesOwnedChildrenWithoutRunLabels(t *testing.T) {
+	run := replicationRun("owned-children")
+	names := objectNamesForRun(run.Name)
+	r := newRunReconciler(t, run)
+
+	if _, err := r.Reconcile(context.Background(), request(run.Name)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Reconcile(context.Background(), request(run.Name)); err != nil {
+		t.Fatal(err)
+	}
+
+	var secret corev1.Secret
+	if err := r.Get(context.Background(), types.NamespacedName{Name: names.SecretName, Namespace: run.Namespace}, &secret); err != nil {
+		t.Fatal(err)
+	}
+	var task zfsv1.ZFSReceiveTask
+	if err := r.Get(context.Background(), types.NamespacedName{Name: names.ReceiveTaskName, Namespace: run.Namespace}, &task); err != nil {
+		t.Fatal(err)
+	}
+	assertControlledByRun(t, &secret, run)
+	assertControlledByRun(t, &task, run)
+	assertOnlyRoleLabel(t, &secret, "ssh")
+	assertOnlyRoleLabel(t, &task, "receiver")
+
+	task.UID = "task-owned-children"
+	if err := r.Update(context.Background(), &task); err != nil {
+		t.Fatal(err)
+	}
+	task.Status = readyReceiveTask(run, names, "10.0.0.42", testReceiverHostKey).Status
+	if err := r.Status().Update(context.Background(), &task); err != nil {
+		t.Fatal(err)
+	}
+	pod := readyReceiverPodForTask(&task)
+	if err := r.Create(context.Background(), pod); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Reconcile(context.Background(), request(run.Name)); err != nil {
+		t.Fatal(err)
+	}
+
+	var job batchv1.Job
+	if err := r.Get(context.Background(), types.NamespacedName{Name: names.SenderName, Namespace: run.Namespace}, &job); err != nil {
+		t.Fatal(err)
+	}
+	assertControlledByRun(t, &job, run)
+	assertOnlyRoleLabel(t, &job, "sender")
+	if _, exists := job.Spec.Template.Labels[labelPrefix+"/run"]; exists {
+		t.Fatalf("sender Pod template labels retain per-run relationship: %#v", job.Spec.Template.Labels)
+	}
+}
+
+func TestRunReconcileFailsForForeignSameNameChildWithoutMutation(t *testing.T) {
+	for _, kind := range []string{"Secret", "Receive Task", "sender Job"} {
+		t.Run(kind, func(t *testing.T) {
+			run := replicationRun("foreign-" + strings.ReplaceAll(strings.ToLower(kind), " ", "-"))
+			names := objectNamesForRun(run.Name)
+			foreignOwner := replicationRun("foreign-owner")
+			foreignOwner.UID = "foreign-owner-uid"
+
+			var foreign client.Object
+			switch kind {
+			case "Secret":
+				foreign = runSSHSecretForTest(run, names)
+				foreign.SetOwnerReferences([]metav1.OwnerReference{*metav1.NewControllerRef(foreignOwner, zfsv1.SchemeGroupVersion.WithKind("ZFSReplicationRun"))})
+				foreign.SetLabels(map[string]string{"keep": "secret"})
+			case "Receive Task":
+				foreign = readyReceiveTask(run, names, "10.0.0.42", testReceiverHostKey)
+				foreign.SetOwnerReferences(nil)
+				foreign.SetLabels(map[string]string{"keep": "task"})
+			case "sender Job":
+				foreign = mustSenderJob(t, run, "sender:test", "10.0.0.42")
+				foreign.SetOwnerReferences([]metav1.OwnerReference{*metav1.NewControllerRef(foreignOwner, zfsv1.SchemeGroupVersion.WithKind("ZFSReplicationRun"))})
+				foreign.SetLabels(map[string]string{"keep": "job"})
+			}
+			r := newRunReconciler(t, run, foreign)
+
+			if _, err := r.Reconcile(context.Background(), request(run.Name)); err != nil {
+				t.Fatal(err)
+			}
+
+			var got zfsv1.ZFSReplicationRun
+			if err := r.Get(context.Background(), request(run.Name).NamespacedName, &got); err != nil {
+				t.Fatal(err)
+			}
+			if got.Status.Phase != zfsv1.PhaseFailed || !strings.Contains(got.Status.LastError, "is not controlled by Replication Run") {
+				t.Fatalf("run status = %#v, want foreign-owner Failure Diagnosis", got.Status)
+			}
+			if err := r.Get(context.Background(), client.ObjectKeyFromObject(foreign), foreign); err != nil {
+				t.Fatalf("foreign %s was deleted: %v", kind, err)
+			}
+			if foreign.GetLabels()["keep"] == "" {
+				t.Fatalf("foreign %s was mutated: %#v", kind, foreign)
+			}
+		})
+	}
+}
+
+func TestRunReconcileRecoversPreSenderChildrenSafely(t *testing.T) {
+	for _, tt := range []struct {
+		name          string
+		secret        bool
+		task          bool
+		wantPhase     zfsv1.Phase
+		wantSecret    bool
+		wantTask      bool
+		wantPublicKey string
+		reconciles    int
+	}{
+		{name: "both present", secret: true, task: true, wantPhase: zfsv1.PhaseStartingReceiver, wantSecret: true, wantTask: true, wantPublicKey: "ssh-rsa AAAATEST zfsreplication-controller", reconciles: 1},
+		{name: "Secret only", secret: true, wantPhase: zfsv1.PhaseStartingReceiver, wantSecret: true, wantTask: true, wantPublicKey: "ssh-rsa AAAATEST zfsreplication-controller", reconciles: 1},
+		{name: "neither present", wantPhase: zfsv1.PhaseStartingReceiver, wantSecret: true, wantTask: true, reconciles: 2},
+		{name: "Receive Task only", task: true, wantPhase: zfsv1.PhaseFailed, wantTask: true, reconciles: 1},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			run := replicationRun("recovery-" + strings.ReplaceAll(strings.ToLower(tt.name), " ", "-"))
+			names := objectNamesForRun(run.Name)
+			var objects []client.Object
+			objects = append(objects, run)
+			if tt.secret {
+				objects = append(objects, runSSHSecretForTest(run, names))
+			}
+			if tt.task {
+				task := readyReceiveTask(run, names, "10.0.0.42", testReceiverHostKey)
+				task.Status = zfsv1.ZFSReceiveTaskStatus{}
+				objects = append(objects, task)
+			}
+			r := newRunReconciler(t, objects...)
+
+			for i := 0; i < tt.reconciles; i++ {
+				if _, err := r.Reconcile(context.Background(), request(run.Name)); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			assertRunPhase(t, r.Client, run.Name, tt.wantPhase)
+			if tt.wantSecret {
+				assertObjectExists(t, r.Client, &corev1.Secret{}, names.SecretName)
+			} else {
+				assertObjectDeleted(t, r.Client, &corev1.Secret{}, names.SecretName)
+			}
+			if tt.wantTask {
+				var task zfsv1.ZFSReceiveTask
+				if err := r.Get(context.Background(), types.NamespacedName{Name: names.ReceiveTaskName, Namespace: run.Namespace}, &task); err != nil {
+					t.Fatal(err)
+				}
+				if tt.wantPublicKey != "" && task.Spec.SSH.AuthorizedPublicKey != tt.wantPublicKey {
+					t.Fatalf("recovered public key = %q, want %q", task.Spec.SSH.AuthorizedPublicKey, tt.wantPublicKey)
+				}
+			} else {
+				assertObjectDeleted(t, r.Client, &zfsv1.ZFSReceiveTask{}, names.ReceiveTaskName)
+			}
+		})
+	}
 }
 
 func TestReceiveTaskLeaseSchedulesAndRenewsAtPolicyDeadline(t *testing.T) {
@@ -326,7 +481,7 @@ func TestRunReconcileRechecksLeaseImmediatelyBeforeSenderCreation(t *testing.T) 
 	task := readyReceiveTask(run, names, "10.0.0.42", testReceiverHostKey)
 	task.Spec.SSH.ExpiresAt = metav1.NewTime(now.Add(15 * time.Minute))
 	pod := readyReceiverPodForTask(task)
-	r := newRunReconciler(t, run, task, pod)
+	r := newRunReconciler(t, run, task, runSSHSecretForTest(run, names), pod)
 	r.now = func() time.Time { return now }
 	freshReads := 0
 	r.APIReader = fake.NewClientBuilder().
@@ -465,7 +620,7 @@ func TestRunReconcileGatesSenderCreationOnFreshExactReadyReceiverPod(t *testing.
 			if tt.mutateTask != nil {
 				tt.mutateTask(task)
 			}
-			objects := []client.Object{run, task}
+			objects := []client.Object{run, task, runSSHSecretForTest(run, names)}
 			if tt.pod != nil {
 				objects = append(objects, tt.pod(task))
 			}
@@ -495,7 +650,7 @@ func TestRunReconcileRejectsStaleReadyTaskIncarnation(t *testing.T) {
 	live.UID = "replacement-task-uid"
 	live.Status = zfsv1.ZFSReceiveTaskStatus{Phase: zfsv1.ReceiveTaskPhasePending}
 	pod := readyReceiverPodForTask(stale)
-	r := newRunReconciler(t, run, stale, pod)
+	r := newRunReconciler(t, run, stale, runSSHSecretForTest(run, names), pod)
 	r.APIReader = newRunAPIReader(t, run, live, pod)
 
 	if _, err := r.Reconcile(context.Background(), request(run.Name)); err != nil {
@@ -513,7 +668,7 @@ func TestRunReconcileUsesFreshReceiverPodRead(t *testing.T) {
 	cachedReadyPod := readyReceiverPodForTask(task)
 	liveUnreadyPod := cachedReadyPod.DeepCopy()
 	liveUnreadyPod.Status.Conditions[0].Status = corev1.ConditionFalse
-	r := newRunReconciler(t, run, task, cachedReadyPod)
+	r := newRunReconciler(t, run, task, runSSHSecretForTest(run, names), cachedReadyPod)
 	r.APIReader = newRunAPIReader(t, run, task, liveUnreadyPod)
 
 	if _, err := r.Reconcile(context.Background(), request(run.Name)); err != nil {
@@ -529,7 +684,7 @@ func TestRunReconcileGetsExactReceiverPodByNamespace(t *testing.T) {
 	names := objectNamesForRun(run.Name)
 	task := readyReceiveTask(run, names, "10.0.0.42", testReceiverHostKey)
 	pod := readyReceiverPodForTask(task)
-	r := newRunReconciler(t, run, task, pod)
+	r := newRunReconciler(t, run, task, runSSHSecretForTest(run, names), pod)
 	r.APIReader = fake.NewClientBuilder().
 		WithScheme(newTestScheme(t)).
 		WithStatusSubresource(&zfsv1.ZFSReplicationRun{}, &zfsv1.ZFSReceiveTask{}).
@@ -567,7 +722,7 @@ func TestRunReconcileLogsReceiverAndSenderLifecycle(t *testing.T) {
 	run := replicationRun("manual-logs")
 	names := objectNamesForRun(run.Name)
 	task := readyReceiveTask(run, names, "10.0.0.42", testReceiverHostKey)
-	r := newRunReconciler(t, run, task, readyReceiverPodForTask(task))
+	r := newRunReconciler(t, run, task, runSSHSecretForTest(run, names), readyReceiverPodForTask(task))
 	ctx, logs := captureRunLogger()
 
 	if _, err := r.Reconcile(ctx, request(run.Name)); err != nil {
@@ -615,7 +770,7 @@ func TestRunReconcileDoesNotRecheckSenderJobImmediatelyAfterCreate(t *testing.T)
 			}
 			return c.Get(ctx, key, obj, opts...)
 		},
-	}, run, task, readyReceiverPodForTask(task))
+	}, run, task, runSSHSecretForTest(run, names), readyReceiverPodForTask(task))
 	ctx, logs := captureRunLogger()
 
 	result, err := r.Reconcile(ctx, request(run.Name))
@@ -662,7 +817,7 @@ func TestRunReconcileTreatsSenderJobCreateAlreadyExistsAsSuccess(t *testing.T) {
 			}
 			return c.Create(ctx, obj, opts...)
 		},
-	}, run, task, readyReceiverPodForTask(task))
+	}, run, task, runSSHSecretForTest(run, names), readyReceiverPodForTask(task))
 
 	if _, err := r.Reconcile(context.Background(), request(run.Name)); err != nil {
 		t.Fatalf("Reconcile() error = %v, want nil after AlreadyExists sender job create", err)
@@ -709,6 +864,10 @@ func TestRunReconcileTreatsEphemeralCreateAlreadyExistsAsSuccess(t *testing.T) {
 				}
 			}
 			returnAlreadyExists := true
+			objects := []client.Object{run}
+			if tt.name == "receive task" {
+				objects = append(objects, runSSHSecretForTest(run, names))
+			}
 			r := newRunReconcilerWithInterceptors(t, interceptor.Funcs{
 				Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
 					if returnAlreadyExists && tt.alreadyExists(obj) {
@@ -720,7 +879,7 @@ func TestRunReconcileTreatsEphemeralCreateAlreadyExistsAsSuccess(t *testing.T) {
 					}
 					return c.Create(ctx, obj, opts...)
 				},
-			}, run)
+			}, objects...)
 
 			if _, err := r.Reconcile(context.Background(), request(run.Name)); err != nil {
 				t.Fatalf("Reconcile() error = %v, want nil after AlreadyExists %s create", err, tt.name)
@@ -756,7 +915,10 @@ func TestRunReconcileDoesNotReadSecretFromCacheImmediatelyAfterCreate(t *testing
 	if result.RequeueAfter == 0 {
 		t.Fatalf("RequeueAfter = %v, want receiver wait", result.RequeueAfter)
 	}
-	assertObjectExists(t, r.Client, &zfsv1.ZFSReceiveTask{}, names.ReceiveTaskName)
+	if !secretCreated {
+		t.Fatal("SSH Secret was not created")
+	}
+	assertObjectDeleted(t, r.Client, &zfsv1.ZFSReceiveTask{}, names.ReceiveTaskName)
 }
 
 func TestRunReconcileDoesNotReadReceiveTaskFromCacheImmediatelyAfterCreate(t *testing.T) {
@@ -812,7 +974,7 @@ func TestWaitForReplicationReceiverUsesFreshStatusForTransitionLogs(t *testing.T
 	now := metav1.Now()
 	fresh.Status.StartedAt = &now
 	fresh.Status.Phase = zfsv1.PhaseStartingReceiver
-	fillRunStatusNames(&fresh.Status, names)
+	initializeRunStatus(&fresh.Status, names)
 	r := newRunReconciler(t, run)
 	r.APIReader = fake.NewClientBuilder().
 		WithScheme(newTestScheme(t)).
@@ -856,6 +1018,9 @@ func TestRunReconcileLogsReceiverWait(t *testing.T) {
 		"sourceDataset": run.Spec.Source.Dataset,
 		"targetDataset": run.Spec.Target.Dataset,
 	})
+	if _, err := r.Reconcile(context.Background(), request(run.Name)); err != nil {
+		t.Fatal(err)
+	}
 	var task zfsv1.ZFSReceiveTask
 	if err := r.Get(context.Background(), types.NamespacedName{Name: names.ReceiveTaskName, Namespace: run.Namespace}, &task); err != nil {
 		t.Fatal(err)
@@ -898,6 +1063,139 @@ func TestRunReconcileLogsSenderSuccess(t *testing.T) {
 		"senderJob":   names.SenderName,
 		"receiverPod": "zfs-receiver-worker-b",
 	})
+}
+
+func TestRunReconcileBindsAndEnforcesSenderJobUID(t *testing.T) {
+	t.Run("discovered Job binds UID and continues", func(t *testing.T) {
+		run := replicationRun("bind-job-uid")
+		names := objectNamesForRun(run.Name)
+		sender := mustSenderJob(t, run, "sender:test", "10.0.0.42")
+		r := newRunReconciler(t, run, sender)
+
+		if _, err := r.Reconcile(context.Background(), request(run.Name)); err != nil {
+			t.Fatal(err)
+		}
+
+		var got zfsv1.ZFSReplicationRun
+		if err := r.Get(context.Background(), request(run.Name).NamespacedName, &got); err != nil {
+			t.Fatal(err)
+		}
+		if got.Status.Phase != zfsv1.PhaseRunning ||
+			got.Status.SenderJobName != names.SenderName ||
+			got.Status.SenderJobUID != string(sender.UID) {
+			t.Fatalf("run status = %#v, want running with exact Job identity", got.Status)
+		}
+	})
+
+	t.Run("matching recorded UID continues", func(t *testing.T) {
+		run := replicationRun("matching-job-uid")
+		sender := mustSenderJob(t, run, "sender:test", "10.0.0.42")
+		run.Status.Phase = zfsv1.PhaseRunning
+		run.Status.SenderJobName = sender.Name
+		run.Status.SenderJobUID = string(sender.UID)
+		r := newRunReconciler(t, run, sender)
+
+		if _, err := r.Reconcile(context.Background(), request(run.Name)); err != nil {
+			t.Fatal(err)
+		}
+		assertRunPhase(t, r.Client, run.Name, zfsv1.PhaseRunning)
+	})
+
+	t.Run("replacement UID fails without deleting replacement", func(t *testing.T) {
+		run := replicationRun("replacement-job-uid")
+		sender := mustSenderJob(t, run, "sender:test", "10.0.0.42")
+		run.Status.Phase = zfsv1.PhaseRunning
+		run.Status.SenderJobName = sender.Name
+		run.Status.SenderJobUID = "original-job-uid"
+		r := newRunReconciler(t, run, sender)
+
+		if _, err := r.Reconcile(context.Background(), request(run.Name)); err != nil {
+			t.Fatal(err)
+		}
+
+		var got zfsv1.ZFSReplicationRun
+		if err := r.Get(context.Background(), request(run.Name).NamespacedName, &got); err != nil {
+			t.Fatal(err)
+		}
+		if got.Status.Phase != zfsv1.PhaseFailed || !strings.Contains(got.Status.LastError, "differs from recorded UID original-job-uid") {
+			t.Fatalf("run status = %#v, want replacement Job Failure Diagnosis", got.Status)
+		}
+		if got.Status.SenderJobUID != "original-job-uid" {
+			t.Fatalf("senderJobUID = %q, want write-once original UID", got.Status.SenderJobUID)
+		}
+		assertObjectExists(t, r.Client, &batchv1.Job{}, sender.Name)
+	})
+
+	t.Run("missing active Job fails", func(t *testing.T) {
+		run := replicationRun("missing-active-job")
+		names := objectNamesForRun(run.Name)
+		run.Status.Phase = zfsv1.PhaseRunning
+		run.Status.SenderJobName = names.SenderName
+		run.Status.SenderJobUID = "missing-job-uid"
+		r := newRunReconciler(t, run)
+
+		if _, err := r.Reconcile(context.Background(), request(run.Name)); err != nil {
+			t.Fatal(err)
+		}
+
+		var got zfsv1.ZFSReplicationRun
+		if err := r.Get(context.Background(), request(run.Name).NamespacedName, &got); err != nil {
+			t.Fatal(err)
+		}
+		if got.Status.Phase != zfsv1.PhaseFailed || !strings.Contains(got.Status.LastError, "with UID missing-job-uid is missing") {
+			t.Fatalf("run status = %#v, want missing Job Failure Diagnosis", got.Status)
+		}
+	})
+
+	t.Run("terminal Run retains identity after TTL deletion", func(t *testing.T) {
+		run := replicationRun("terminal-job-ttl")
+		names := objectNamesForRun(run.Name)
+		run.Status.Phase = zfsv1.PhaseSucceeded
+		run.Status.SenderJobName = names.SenderName
+		run.Status.SenderJobUID = "historical-job-uid"
+		r := newRunReconciler(t, run)
+
+		if _, err := r.Reconcile(context.Background(), request(run.Name)); err != nil {
+			t.Fatal(err)
+		}
+
+		var got zfsv1.ZFSReplicationRun
+		if err := r.Get(context.Background(), request(run.Name).NamespacedName, &got); err != nil {
+			t.Fatal(err)
+		}
+		if got.Status.Phase != zfsv1.PhaseSucceeded ||
+			got.Status.SenderJobName != names.SenderName ||
+			got.Status.SenderJobUID != "historical-job-uid" {
+			t.Fatalf("terminal run status = %#v, want retained Job identity", got.Status)
+		}
+	})
+}
+
+func TestRunReconcileTerminalSenderObservationRevokesAuthorityAndKeyMaterial(t *testing.T) {
+	run := replicationRun("sender-terminal-cleanup")
+	names := objectNamesForRun(run.Name)
+	task := readyReceiveTask(run, names, "10.0.0.42", testReceiverHostKey)
+	secret := runSSHSecretForTest(run, names)
+	sender := mustSenderJob(t, run, "sender:test", "10.0.0.42")
+	sender.Status.Succeeded = 1
+	r := newRunReconciler(t, run, task, secret, sender)
+
+	if _, err := r.Reconcile(context.Background(), request(run.Name)); err != nil {
+		t.Fatal(err)
+	}
+
+	var got zfsv1.ZFSReplicationRun
+	if err := r.Get(context.Background(), request(run.Name).NamespacedName, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Status.Phase != zfsv1.PhaseSucceeded ||
+		got.Status.SenderJobName != sender.Name ||
+		got.Status.SenderJobUID != string(sender.UID) {
+		t.Fatalf("run status = %#v, want succeeded with exact Job identity", got.Status)
+	}
+	assertObjectDeleted(t, r.Client, &corev1.Secret{}, names.SecretName)
+	assertReceiveTaskPhase(t, r.Client, names.ReceiveTaskName, zfsv1.ReceiveTaskPhaseCompleted)
+	assertObjectExists(t, r.Client, &batchv1.Job{}, names.SenderName)
 }
 
 func TestRunReconcileLogsSenderJobAlreadyPresent(t *testing.T) {
@@ -1168,7 +1466,7 @@ func TestRunReconcileRetriesCleanupForTerminalRun(t *testing.T) {
 			run.Status.Phase = phase
 			names := objectNamesForRun(run.Name)
 			receiveTask := readyReceiveTask(run, names, "10.0.0.42", testReceiverHostKey)
-			sshSecret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: names.SecretName, Namespace: run.Namespace}}
+			sshSecret := runSSHSecretForTest(run, names)
 			deleteSecretFailures := 1
 			r := newRunReconcilerWithInterceptors(t, interceptor.Funcs{
 				Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
@@ -1302,7 +1600,7 @@ func TestDestinationLockedHandlesOverlappingTargetDatasets(t *testing.T) {
 func replicationRun(name string) *zfsv1.ZFSReplicationRun {
 	return &zfsv1.ZFSReplicationRun{
 		TypeMeta:   metav1.TypeMeta{APIVersion: zfsv1.Group + "/" + zfsv1.Version, Kind: "ZFSReplicationRun"},
-		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "storage"},
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "storage", UID: types.UID("run-" + name)},
 		Spec: zfsv1.ZFSReplicationRunSpec{
 			Source: zfsv1.DatasetRef{NodeName: "worker-a", Dataset: "tank/src"},
 			Target: zfsv1.DatasetRef{NodeName: "worker-b", Dataset: "tank/dst"},
@@ -1325,6 +1623,11 @@ func mustSenderJob(t *testing.T, run *zfsv1.ZFSReplicationRun, image, receiverHo
 	if err != nil {
 		t.Fatal(err)
 	}
+	job.UID = types.UID("job-" + run.Name)
+	job.OwnerReferences = []metav1.OwnerReference{*metav1.NewControllerRef(
+		run,
+		zfsv1.SchemeGroupVersion.WithKind("ZFSReplicationRun"),
+	)}
 	return job
 }
 
@@ -1332,13 +1635,13 @@ func readyReceiveTask(run *zfsv1.ZFSReplicationRun, names runObjects, host, host
 	return &zfsv1.ZFSReceiveTask{
 		TypeMeta: metav1.TypeMeta{APIVersion: zfsv1.Group + "/" + zfsv1.Version, Kind: "ZFSReceiveTask"},
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      names.ReceiveTaskName,
-			Namespace: run.Namespace,
-			Labels:    maps.Clone(names.Labels),
-			UID:       "task-uid",
+			Name:            names.ReceiveTaskName,
+			Namespace:       run.Namespace,
+			Labels:          map[string]string{labelPrefix + "/role": "receiver"},
+			UID:             "task-uid",
+			OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(run, zfsv1.SchemeGroupVersion.WithKind("ZFSReplicationRun"))},
 		},
 		Spec: zfsv1.ZFSReceiveTaskSpec{
-			RunRef:      zfsv1.LocalObjectReference{Name: run.Name},
 			NodeName:    run.Spec.Target.NodeName,
 			Destination: zfsv1.ReceiveDestination{Dataset: run.Spec.Target.Dataset},
 			SSH: zfsv1.ReceiveTaskSSHSpec{
@@ -1384,9 +1687,10 @@ func readyReceiverPodForTask(task *zfsv1.ZFSReceiveTask) *corev1.Pod {
 func runSSHSecretForTest(run *zfsv1.ZFSReplicationRun, names runObjects) *corev1.Secret {
 	return &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      names.SecretName,
-			Namespace: run.Namespace,
-			Labels:    maps.Clone(names.Labels),
+			Name:            names.SecretName,
+			Namespace:       run.Namespace,
+			Labels:          map[string]string{labelPrefix + "/role": "ssh"},
+			OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(run, zfsv1.SchemeGroupVersion.WithKind("ZFSReplicationRun"))},
 		},
 		Data: map[string][]byte{
 			"id_rsa":     []byte("test-private-key"),
@@ -1599,6 +1903,22 @@ func assertRunPhase(t *testing.T, c client.Client, name string, phase zfsv1.Phas
 	}
 	if run.Status.Phase != phase {
 		t.Fatalf("run phase = %q, want %q", run.Status.Phase, phase)
+	}
+}
+
+func assertControlledByRun(t *testing.T, child client.Object, run *zfsv1.ZFSReplicationRun) {
+	t.Helper()
+	owner := metav1.GetControllerOf(child)
+	if owner == nil || owner.UID != run.UID || owner.Kind != "ZFSReplicationRun" {
+		t.Fatalf("%T controller owner = %#v, want Replication Run UID %q", child, owner, run.UID)
+	}
+}
+
+func assertOnlyRoleLabel(t *testing.T, child client.Object, role string) {
+	t.Helper()
+	labels := child.GetLabels()
+	if len(labels) != 1 || labels[labelPrefix+"/role"] != role {
+		t.Fatalf("%T labels = %#v, want only role %q", child, labels, role)
 	}
 }
 

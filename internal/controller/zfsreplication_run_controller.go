@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"maps"
 	"net"
 	"strconv"
 	"strings"
@@ -13,6 +12,7 @@ import (
 	zfsv1 "github.com/mathias/zfsreplicationcontroller/api/v1alpha1"
 	"github.com/mathias/zfsreplicationcontroller/internal/replication"
 	"github.com/mathias/zfsreplicationcontroller/internal/replication/diagnosis"
+	"github.com/mathias/zfsreplicationcontroller/internal/runchildren"
 	"github.com/mathias/zfsreplicationcontroller/internal/syncoid"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/knownhosts"
@@ -73,13 +73,37 @@ func (r *ZFSReplicationRunReconciler) Reconcile(ctx context.Context, req ctrl.Re
 		err := r.patchRunStatus(ctx, &run, func(st *zfsv1.ZFSReplicationRunStatus) {
 			st.Phase = zfsv1.PhasePending
 			st.LastError = msg
-			fillRunStatusNames(st, names)
+			initializeRunStatus(st, names)
 		})
 		if err == nil && initialStatus {
 			logger.Info("accepted replication run")
 		}
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, err
 	}
+	observedStatus := r.observedRunStatus(ctx, &run)
+	sender, senderMessage, err := r.senderJobForRun(ctx, &run, names, observedStatus)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if senderMessage != "" {
+		return ctrl.Result{}, r.failRunObject(ctx, &run, names, senderMessage)
+	}
+
+	receiver := runReceiverStatus{
+		podName: run.Status.ReceiverPodName,
+		podIP:   run.Status.ReceiverPodIP,
+	}
+	if sender != nil && sender.UID == "" {
+		return ctrl.Result{RequeueAfter: time.Second}, nil
+	}
+	if sender != nil && observedStatus.SenderJobUID == "" {
+		if err := r.bindSenderJobIdentity(ctx, &run, names, sender); err != nil {
+			return ctrl.Result{}, err
+		}
+		run.Status.SenderJobName = names.SenderName
+		run.Status.SenderJobUID = string(sender.UID)
+	}
+
 	leaseRequeueAfter, leaseMessage, err := r.reconcileRunReceiveTaskLease(ctx, &run, names)
 	if err != nil {
 		return ctrl.Result{}, err
@@ -88,17 +112,9 @@ func (r *ZFSReplicationRunReconciler) Reconcile(ctx context.Context, req ctrl.Re
 		return ctrl.Result{}, r.failRunObject(ctx, &run, names, leaseMessage)
 	}
 
-	receiver := runReceiverStatus{
-		podName: run.Status.ReceiverPodName,
-		podIP:   run.Status.ReceiverPodIP,
-	}
-	senderExists, err := r.jobExists(ctx, run.Namespace, names.SenderName)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-	if senderExists {
+	if sender != nil {
 		logger.WithValues("senderJob", names.SenderName, "receiverPod", receiver.podName).V(1).Info("sender job already present")
-		if result, done, err := r.finishFromSenderJob(ctx, &run, names, receiver); err != nil || done {
+		if result, done, err := r.finishFromSenderJob(ctx, &run, names, receiver, sender); err != nil || done {
 			return result, err
 		}
 		result := ctrl.Result{RequeueAfter: leaseRequeueAfter}
@@ -109,22 +125,18 @@ func (r *ZFSReplicationRunReconciler) Reconcile(ctx context.Context, req ctrl.Re
 			st.Phase = zfsv1.PhaseRunning
 			st.ReceiverPodName = receiver.podName
 			st.ReceiverPodIP = receiver.podIP
-			fillRunStatusNames(st, names)
+			initializeRunStatus(st, names)
 		})
 	}
 
-	publicKey, secretCreated, err := r.ensureRunSecret(ctx, &run, names)
+	childrenCreated, childrenMessage, err := r.ensurePreSenderChildren(ctx, &run, names)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	if secretCreated && publicKey == "" {
-		return ctrl.Result{RequeueAfter: time.Second}, nil
+	if childrenMessage != "" {
+		return ctrl.Result{}, r.failRunObject(ctx, &run, names, childrenMessage)
 	}
-	receiveTaskCreated, err := r.ensureRunReceiveTask(ctx, &run, names, publicKey)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-	if receiveTaskCreated {
+	if childrenCreated {
 		return r.waitForReplicationReceiver(ctx, &run, names)
 	}
 
@@ -134,16 +146,7 @@ func (r *ZFSReplicationRunReconciler) Reconcile(ctx context.Context, req ctrl.Re
 	}
 	receiver = nextReceiver
 
-	if result, done, err := r.finishFromSenderJob(ctx, &run, names, receiver); err != nil || done {
-		return result, err
-	}
-
-	return withEarlierRequeue(ctrl.Result{RequeueAfter: 5 * time.Second}, leaseRequeueAfter), r.patchRunStatus(ctx, &run, func(st *zfsv1.ZFSReplicationRunStatus) {
-		st.Phase = zfsv1.PhaseRunning
-		st.ReceiverPodName = receiver.podName
-		st.ReceiverPodIP = receiver.podIP
-		fillRunStatusNames(st, names)
-	})
+	return withEarlierRequeue(result, leaseRequeueAfter), nil
 }
 
 func (r *ZFSReplicationRunReconciler) reconcileTerminalRun(ctx context.Context, run *zfsv1.ZFSReplicationRun, names runObjects) error {
@@ -177,15 +180,19 @@ func (r *ZFSReplicationRunReconciler) ensureSenderStarted(ctx context.Context, r
 	} else {
 		receiverLogger.Info("replication receiver is ready")
 	}
-	if err := r.ensureRunKnownHosts(ctx, run, names, task); err != nil {
+	knownHostsMessage, err := r.ensureRunKnownHosts(ctx, run, names, task)
+	if err != nil {
 		return runReceiverStatus{}, ctrl.Result{}, false, err
+	}
+	if knownHostsMessage != "" {
+		return runReceiverStatus{}, ctrl.Result{}, true, r.failRunObject(ctx, run, names, knownHostsMessage)
 	}
 	initialStatus := r.needsInitialRunStatus(ctx, run)
 	if err := r.patchRunStatus(ctx, run, func(st *zfsv1.ZFSReplicationRunStatus) {
 		st.Phase = zfsv1.PhaseReceiverReady
 		st.ReceiverPodName = receiver.podName
 		st.ReceiverPodIP = receiver.podIP
-		fillRunStatusNames(st, names)
+		initializeRunStatus(st, names)
 	}); err != nil {
 		return runReceiverStatus{}, ctrl.Result{}, false, err
 	}
@@ -237,8 +244,14 @@ func (r *ZFSReplicationRunReconciler) receiveTaskEligibleForSender(ctx context.C
 	return true, "", nil
 }
 
-func (r *ZFSReplicationRunReconciler) finishFromSenderJob(ctx context.Context, run *zfsv1.ZFSReplicationRun, names runObjects, receiver runReceiverStatus) (ctrl.Result, bool, error) {
-	if failed, msg, err := r.jobFailed(ctx, run.Namespace, names.SenderName, "sender Job failed"); err != nil || failed {
+func (r *ZFSReplicationRunReconciler) finishFromSenderJob(
+	ctx context.Context,
+	run *zfsv1.ZFSReplicationRun,
+	names runObjects,
+	receiver runReceiverStatus,
+	job *batchv1.Job,
+) (ctrl.Result, bool, error) {
+	if failed, msg, err := r.jobFailed(ctx, job, "sender Job failed"); err != nil || failed {
 		if err != nil {
 			return ctrl.Result{}, false, err
 		}
@@ -247,11 +260,7 @@ func (r *ZFSReplicationRunReconciler) finishFromSenderJob(ctx context.Context, r
 		return ctrl.Result{}, true, r.failRunObject(failureCtx, run, names, msg)
 	}
 
-	senderDone, err := r.jobSucceeded(ctx, run.Namespace, names.SenderName)
-	if err != nil {
-		return ctrl.Result{}, false, err
-	}
-	if senderDone {
+	if job.Status.Succeeded > 0 {
 		now := metav1.Now()
 		if err := r.patchRunStatus(ctx, run, func(st *zfsv1.ZFSReplicationRunStatus) {
 			st.Phase = zfsv1.PhaseSucceeded
@@ -259,7 +268,7 @@ func (r *ZFSReplicationRunReconciler) finishFromSenderJob(ctx context.Context, r
 			st.ReceiverPodIP = receiver.podIP
 			st.CompletedAt = &now
 			st.LastError = ""
-			fillRunStatusNames(st, names)
+			initializeRunStatus(st, names)
 		}); err != nil {
 			return ctrl.Result{}, false, err
 		}
@@ -293,7 +302,7 @@ func (r *ZFSReplicationRunReconciler) waitForReplicationReceiver(ctx context.Con
 	initialStatus := runStatusNeedsInitialStatus(observedStatus)
 	err := r.patchRunStatus(ctx, run, func(st *zfsv1.ZFSReplicationRunStatus) {
 		st.Phase = zfsv1.PhaseStartingReceiver
-		fillRunStatusNames(st, names)
+		initializeRunStatus(st, names)
 	})
 	if err == nil && initialStatus {
 		logger.Info("accepted replication run")
@@ -301,31 +310,87 @@ func (r *ZFSReplicationRunReconciler) waitForReplicationReceiver(ctx context.Con
 	return ctrl.Result{RequeueAfter: 5 * time.Second}, err
 }
 
-func (r *ZFSReplicationRunReconciler) ensureRunSecret(ctx context.Context, run *zfsv1.ZFSReplicationRun, names runObjects) (string, bool, error) {
+func (r *ZFSReplicationRunReconciler) ensurePreSenderChildren(
+	ctx context.Context,
+	run *zfsv1.ZFSReplicationRun,
+	names runObjects,
+) (bool, string, error) {
 	var secret corev1.Secret
-	err := r.Get(ctx, types.NamespacedName{Name: names.SecretName, Namespace: run.Namespace}, &secret)
-	if err == nil {
-		publicKey, err := publicKeyFromSecret(&secret)
-		return publicKey, false, err
+	secretErr := r.Get(ctx, types.NamespacedName{Name: names.SecretName, Namespace: run.Namespace}, &secret)
+	if secretErr != nil && !apierrors.IsNotFound(secretErr) {
+		return false, "", fmt.Errorf("read SSH Secret %s/%s before sender creation: %w", run.Namespace, names.SecretName, secretErr)
 	}
-	if !apierrors.IsNotFound(err) {
-		return "", false, err
-	}
-	key, err := generateSSHKeyMaterial()
-	if err != nil {
-		return "", false, err
-	}
-	secretObj := runSSHSecret(run, names, key)
-	if err := ctrl.SetControllerReference(run, secretObj, r.Scheme); err != nil {
-		return "", false, err
-	}
-	if err := r.Create(ctx, secretObj); err != nil {
-		if apierrors.IsAlreadyExists(err) {
-			return "", true, nil
+	secretExists := secretErr == nil
+	if secretExists {
+		if msg := runChildRefusal(run, &secret, "SSH Secret"); msg != "" {
+			return false, msg, nil
 		}
-		return "", false, err
 	}
-	return strings.TrimSpace(string(key.PublicKey)), true, nil
+
+	var task zfsv1.ZFSReceiveTask
+	taskErr := r.Get(ctx, types.NamespacedName{Name: names.ReceiveTaskName, Namespace: run.Namespace}, &task)
+	if taskErr != nil && !apierrors.IsNotFound(taskErr) {
+		return false, "", fmt.Errorf("read Receive Task %s/%s before sender creation: %w", run.Namespace, names.ReceiveTaskName, taskErr)
+	}
+	taskExists := taskErr == nil
+	if taskExists {
+		if msg := runChildRefusal(run, &task, "Receive Task"); msg != "" {
+			return false, msg, nil
+		}
+	}
+
+	if taskExists && !secretExists {
+		return false, fmt.Sprintf(
+			"Receive Task %s/%s exists without its matching SSH Secret %s",
+			task.Namespace,
+			task.Name,
+			names.SecretName,
+		), nil
+	}
+
+	if !secretExists {
+		key, err := generateSSHKeyMaterial()
+		if err != nil {
+			return false, "", fmt.Errorf("generate SSH key material for Replication Run %s/%s: %w", run.Namespace, run.Name, err)
+		}
+		secretObj := runSSHSecret(run, names, key)
+		if err := ctrl.SetControllerReference(run, secretObj, r.Scheme); err != nil {
+			return false, "", fmt.Errorf("set Replication Run %s/%s as controller of SSH Secret %s: %w", run.Namespace, run.Name, secretObj.Name, err)
+		}
+		if err := r.Create(ctx, secretObj); err != nil && !apierrors.IsAlreadyExists(err) {
+			return false, "", fmt.Errorf("create SSH Secret %s/%s: %w", secretObj.Namespace, secretObj.Name, err)
+		}
+		return true, "", nil
+	}
+
+	publicKey, err := publicKeyFromSecret(&secret)
+	if err != nil {
+		return false, err.Error(), nil
+	}
+	if taskExists {
+		if task.Spec.SSH.AuthorizedPublicKey != publicKey {
+			return false, fmt.Sprintf(
+				"Receive Task %s/%s authorized public key does not match SSH Secret %s",
+				task.Namespace,
+				task.Name,
+				secret.Name,
+			), nil
+		}
+		return false, "", nil
+	}
+
+	expiresAt := metav1.NewTime(r.controllerNow().Add(authorizationLease))
+	newTask, err := runReceiveTask(run, names, publicKey, expiresAt)
+	if err != nil {
+		return false, "", fmt.Errorf("build Receive Task %s/%s: %w", run.Namespace, names.ReceiveTaskName, err)
+	}
+	if err := ctrl.SetControllerReference(run, newTask, r.Scheme); err != nil {
+		return false, "", fmt.Errorf("set Replication Run %s/%s as controller of Receive Task %s: %w", run.Namespace, run.Name, newTask.Name, err)
+	}
+	if err := r.Create(ctx, newTask); err != nil && !apierrors.IsAlreadyExists(err) {
+		return false, "", fmt.Errorf("create Receive Task %s/%s: %w", newTask.Namespace, newTask.Name, err)
+	}
+	return true, "", nil
 }
 
 func publicKeyFromSecret(secret *corev1.Secret) (string, error) {
@@ -334,32 +399,6 @@ func publicKeyFromSecret(secret *corev1.Secret) (string, error) {
 		return "", fmt.Errorf("ssh secret %s/%s is missing id_rsa.pub", secret.Namespace, secret.Name)
 	}
 	return publicKey, nil
-}
-
-func (r *ZFSReplicationRunReconciler) ensureRunReceiveTask(ctx context.Context, run *zfsv1.ZFSReplicationRun, names runObjects, publicKey string) (bool, error) {
-	var existing zfsv1.ZFSReceiveTask
-	err := r.Get(ctx, types.NamespacedName{Name: names.ReceiveTaskName, Namespace: run.Namespace}, &existing)
-	if err == nil {
-		return false, nil
-	}
-	if !apierrors.IsNotFound(err) {
-		return false, err
-	}
-	expiresAt := metav1.NewTime(r.controllerNow().Add(authorizationLease))
-	task, err := runReceiveTask(run, names, publicKey, expiresAt)
-	if err != nil {
-		return false, err
-	}
-	if err := ctrl.SetControllerReference(run, task, r.Scheme); err != nil {
-		return false, err
-	}
-	if err := r.Create(ctx, task); err != nil {
-		if apierrors.IsAlreadyExists(err) {
-			return true, nil
-		}
-		return false, err
-	}
-	return true, nil
 }
 
 func (r *ZFSReplicationRunReconciler) reconcileRunReceiveTaskLease(ctx context.Context, run *zfsv1.ZFSReplicationRun, names runObjects) (time.Duration, string, error) {
@@ -390,6 +429,9 @@ func (r *ZFSReplicationRunReconciler) reconcileRunReceiveTaskLease(ctx context.C
 			return 0, "", nil
 		}
 		return 0, "", fmt.Errorf("read current receive task %s/%s for lease renewal: %w", key.Namespace, key.Name, err)
+	}
+	if msg := runChildRefusal(run, &task, "Receive Task"); msg != "" {
+		return 0, msg, nil
 	}
 	now := r.controllerNow()
 	if msg := receiveTaskLeaseRefusal(&task, now); msg != "" {
@@ -437,7 +479,7 @@ func withEarlierRequeue(result ctrl.Result, leaseRequeueAfter time.Duration) ctr
 func (r *ZFSReplicationRunReconciler) ensureRunSenderJob(ctx context.Context, run *zfsv1.ZFSReplicationRun, endpoint zfsv1.ReceiveTaskEndpoint) (bool, bool, error) {
 	job, err := senderJob(run, r.ReleaseImage, endpoint)
 	if err != nil {
-		return false, false, err
+		return false, false, fmt.Errorf("build sender Job for Replication Run %s/%s: %w", run.Namespace, run.Name, err)
 	}
 	return r.ensureRunJob(ctx, run, job)
 }
@@ -446,39 +488,104 @@ func (r *ZFSReplicationRunReconciler) ensureRunJob(ctx context.Context, run *zfs
 	var existing batchv1.Job
 	err := r.Get(ctx, types.NamespacedName{Name: job.Name, Namespace: job.Namespace}, &existing)
 	if err == nil {
-		return false, false, nil
+		return false, true, nil
 	}
 	if !apierrors.IsNotFound(err) {
-		return false, false, err
+		return false, false, fmt.Errorf("read sender Job %s/%s before creation: %w", job.Namespace, job.Name, err)
 	}
 	if err := ctrl.SetControllerReference(run, job, r.Scheme); err != nil {
-		return false, false, err
+		return false, false, fmt.Errorf("set Replication Run %s/%s as controller of sender Job %s: %w", run.Namespace, run.Name, job.Name, err)
 	}
 	if err := r.Create(ctx, job); err != nil {
 		if apierrors.IsAlreadyExists(err) {
 			return false, true, nil
 		}
-		return false, false, err
+		return false, false, fmt.Errorf("create sender Job %s/%s: %w", job.Namespace, job.Name, err)
 	}
 	return true, true, nil
 }
 
-func (r *ZFSReplicationRunReconciler) jobExists(ctx context.Context, ns, name string) (bool, error) {
+func (r *ZFSReplicationRunReconciler) senderJobForRun(
+	ctx context.Context,
+	run *zfsv1.ZFSReplicationRun,
+	names runObjects,
+	status zfsv1.ZFSReplicationRunStatus,
+) (*batchv1.Job, string, error) {
 	var job batchv1.Job
-	err := r.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, &job)
-	if err == nil {
-		return true, nil
-	}
+	err := r.Get(ctx, types.NamespacedName{Name: names.SenderName, Namespace: run.Namespace}, &job)
 	if apierrors.IsNotFound(err) {
-		return false, nil
+		if status.SenderJobUID != "" {
+			return nil, fmt.Sprintf(
+				"sender Job %s/%s with UID %s is missing",
+				run.Namespace,
+				names.SenderName,
+				status.SenderJobUID,
+			), nil
+		}
+		return nil, "", nil
 	}
-	return false, err
+	if err != nil {
+		return nil, "", fmt.Errorf("read sender Job %s/%s: %w", run.Namespace, names.SenderName, err)
+	}
+	if msg := runChildRefusal(run, &job, "sender Job"); msg != "" {
+		return nil, msg, nil
+	}
+	if status.SenderJobUID != "" && string(job.UID) != status.SenderJobUID {
+		return nil, fmt.Sprintf(
+			"sender Job %s/%s UID %s differs from recorded UID %s",
+			job.Namespace,
+			job.Name,
+			job.UID,
+			status.SenderJobUID,
+		), nil
+	}
+	return &job, "", nil
+}
+
+func (r *ZFSReplicationRunReconciler) bindSenderJobIdentity(
+	ctx context.Context,
+	run *zfsv1.ZFSReplicationRun,
+	names runObjects,
+	job *batchv1.Job,
+) error {
+	if err := r.patchRunStatus(ctx, run, func(st *zfsv1.ZFSReplicationRunStatus) {
+		if st.SenderJobUID == "" {
+			st.SenderJobName = names.SenderName
+			st.SenderJobUID = string(job.UID)
+			initializeRunStatus(st, names)
+		}
+	}); err != nil {
+		return fmt.Errorf("bind sender Job %s/%s UID %s in Replication Run status: %w", job.Namespace, job.Name, job.UID, err)
+	}
+	return nil
+}
+
+func runChildRefusal(run *zfsv1.ZFSReplicationRun, child client.Object, kind string) string {
+	owner := metav1.GetControllerOf(child)
+	if owner == nil || owner.UID != run.UID {
+		return fmt.Sprintf(
+			"%s %s/%s is not controlled by Replication Run %s/%s with UID %s",
+			kind,
+			child.GetNamespace(),
+			child.GetName(),
+			run.Namespace,
+			run.Name,
+			run.UID,
+		)
+	}
+	if deletionTimestamp := child.GetDeletionTimestamp(); deletionTimestamp != nil && !deletionTimestamp.IsZero() {
+		return fmt.Sprintf("%s %s/%s is being deleted", kind, child.GetNamespace(), child.GetName())
+	}
+	return ""
 }
 
 func (r *ZFSReplicationRunReconciler) readyReceiveTask(ctx context.Context, run *zfsv1.ZFSReplicationRun, names runObjects) (*zfsv1.ZFSReceiveTask, bool, string, error) {
 	var task zfsv1.ZFSReceiveTask
 	if err := r.Get(ctx, types.NamespacedName{Name: names.ReceiveTaskName, Namespace: run.Namespace}, &task); err != nil {
 		return nil, false, "", err
+	}
+	if msg := runChildRefusal(run, &task, "Receive Task"); msg != "" {
+		return &task, false, msg, nil
 	}
 	if task.UID == "" {
 		return &task, false, "receive task is missing its UID", nil
@@ -497,6 +604,9 @@ func (r *ZFSReplicationRunReconciler) readyReceiveTask(ctx context.Context, run 
 		return &task, false, "", nil
 	}
 	task = fresh
+	if msg := runChildRefusal(run, &task, "Receive Task"); msg != "" {
+		return &task, false, msg, nil
+	}
 	if msg := receiveTaskLeaseRefusal(&task, r.controllerNow()); msg != "" {
 		return &task, false, msg, nil
 	}
@@ -556,43 +666,42 @@ func (r *ZFSReplicationRunReconciler) exactReceiverPodReady(ctx context.Context,
 	return false, nil
 }
 
-func (r *ZFSReplicationRunReconciler) ensureRunKnownHosts(ctx context.Context, run *zfsv1.ZFSReplicationRun, names runObjects, task *zfsv1.ZFSReceiveTask) error {
+func (r *ZFSReplicationRunReconciler) ensureRunKnownHosts(
+	ctx context.Context,
+	run *zfsv1.ZFSReplicationRun,
+	names runObjects,
+	task *zfsv1.ZFSReceiveTask,
+) (string, error) {
 	var secret corev1.Secret
 	if err := r.Get(ctx, types.NamespacedName{Name: names.SecretName, Namespace: run.Namespace}, &secret); err != nil {
-		return err
+		return "", fmt.Errorf("read SSH Secret %s/%s for sender preflight: %w", run.Namespace, names.SecretName, err)
+	}
+	if msg := runChildRefusal(run, &secret, "SSH Secret"); msg != "" {
+		return msg, nil
 	}
 	line, err := knownHostsLine(task.Status.Endpoint.Host, task.Status.Endpoint.Port, task.Status.SSH.HostKey)
 	if err != nil {
-		return err
+		return "", err
 	}
 	if string(secret.Data["known_hosts"]) == line {
-		return nil
+		return "", nil
 	}
 	copy := secret.DeepCopy()
 	if copy.Data == nil {
 		copy.Data = map[string][]byte{}
 	}
 	copy.Data["known_hosts"] = []byte(line)
-	return r.Update(ctx, copy)
+	if err := r.Update(ctx, copy); err != nil {
+		return "", fmt.Errorf("update SSH Secret %s/%s with receiver host key: %w", copy.Namespace, copy.Name, err)
+	}
+	return "", nil
 }
 
-func (r *ZFSReplicationRunReconciler) jobSucceeded(ctx context.Context, ns, name string) (bool, error) {
-	var job batchv1.Job
-	if err := r.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, &job); err != nil {
-		return false, err
-	}
-	return job.Status.Succeeded > 0, nil
-}
-
-func (r *ZFSReplicationRunReconciler) jobFailed(ctx context.Context, ns, name, fallback string) (bool, string, error) {
-	var job batchv1.Job
-	if err := r.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, &job); err != nil {
-		return false, "", err
-	}
+func (r *ZFSReplicationRunReconciler) jobFailed(ctx context.Context, job *batchv1.Job, fallback string) (bool, string, error) {
 	if job.Status.Failed == 0 {
 		return false, "", nil
 	}
-	if msg, err := r.senderTerminationDiagnosis(ctx, &job); err != nil {
+	if msg, err := r.senderTerminationDiagnosis(ctx, job); err != nil {
 		return false, "", err
 	} else if msg != "" {
 		return true, msg, nil
@@ -672,8 +781,18 @@ func newerTerminatedSender(left, right terminatedSender) bool {
 }
 
 func (r *ZFSReplicationRunReconciler) deleteRunSSHSecret(ctx context.Context, run *zfsv1.ZFSReplicationRun, names runObjects) error {
-	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: names.SecretName, Namespace: run.Namespace}}
-	if err := r.Delete(ctx, secret); client.IgnoreNotFound(err) != nil {
+	var secret corev1.Secret
+	key := types.NamespacedName{Name: names.SecretName, Namespace: run.Namespace}
+	if err := r.Get(ctx, key, &secret); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("read SSH Secret %s/%s for deletion: %w", key.Namespace, key.Name, err)
+	}
+	if runChildRefusal(run, &secret, "SSH Secret") != "" {
+		return nil
+	}
+	if err := r.Delete(ctx, &secret); client.IgnoreNotFound(err) != nil {
 		return fmt.Errorf("delete SSH Secret %s/%s: %w", secret.Namespace, secret.Name, err)
 	}
 	return nil
@@ -693,7 +812,7 @@ func (r *ZFSReplicationRunReconciler) failRunObject(ctx context.Context, run *zf
 		st.Phase = zfsv1.PhaseFailed
 		st.CompletedAt = &now
 		st.LastError = msg
-		fillRunStatusNames(st, names)
+		initializeRunStatus(st, names)
 	}); err != nil {
 		return err
 	}
@@ -732,6 +851,9 @@ func (r *ZFSReplicationRunReconciler) markReceiveTaskTerminal(ctx context.Contex
 	var task zfsv1.ZFSReceiveTask
 	if err := r.Get(ctx, types.NamespacedName{Name: names.ReceiveTaskName, Namespace: run.Namespace}, &task); err != nil {
 		return client.IgnoreNotFound(err)
+	}
+	if runChildRefusal(run, &task, "Receive Task") != "" {
+		return nil
 	}
 	if task.Status.Phase == phase && task.Status.Error == msg {
 		return nil
@@ -831,14 +953,12 @@ func shouldWaitForDestinationRun(run, other *zfsv1.ZFSReplicationRun) bool {
 	return otherTime.Before(runTime)
 }
 
-func fillRunStatusNames(st *zfsv1.ZFSReplicationRunStatus, names runObjects) {
+func initializeRunStatus(st *zfsv1.ZFSReplicationRunStatus, names runObjects) {
 	if st.StartedAt == nil {
 		now := metav1.Now()
 		st.StartedAt = &now
 	}
 	st.SenderJobName = names.SenderName
-	st.ReceiveTaskName = names.ReceiveTaskName
-	st.SSHSecretName = names.SecretName
 }
 
 func runLogValues(run *zfsv1.ZFSReplicationRun) []any {
@@ -853,25 +973,20 @@ func runLogValues(run *zfsv1.ZFSReplicationRun) []any {
 }
 
 func objectNamesForRun(runName string) runObjects {
-	labels := map[string]string{
-		labelPrefix + "/run": runName,
-	}
+	names := runchildren.ForRun(runName)
 	return runObjects{
-		SecretName:      sanitizeName("zfsrep", runName, "ssh"),
-		ReceiveTaskName: sanitizeName("zfsrep", runName, "receiver"),
-		SenderName:      sanitizeName("zfsrep", runName, "sender"),
-		Labels:          labels,
+		SecretName:      names.SSHSecret,
+		ReceiveTaskName: names.ReceiveTask,
+		SenderName:      names.SenderJob,
 	}
 }
 
 func runSSHSecret(run *zfsv1.ZFSReplicationRun, names runObjects, key sshKeyMaterial) *corev1.Secret {
-	labels := maps.Clone(names.Labels)
-	labels[labelPrefix+"/role"] = "ssh"
 	return &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      names.SecretName,
 			Namespace: run.Namespace,
-			Labels:    labels,
+			Labels:    map[string]string{labelPrefix + "/role": "ssh"},
 		},
 		Type: corev1.SecretTypeOpaque,
 		Data: map[string][]byte{
@@ -883,8 +998,6 @@ func runSSHSecret(run *zfsv1.ZFSReplicationRun, names runObjects, key sshKeyMate
 }
 
 func runReceiveTask(run *zfsv1.ZFSReplicationRun, names runObjects, publicKey string, expiresAt metav1.Time) (*zfsv1.ZFSReceiveTask, error) {
-	labels := maps.Clone(names.Labels)
-	labels[labelPrefix+"/role"] = "receiver"
 	contract, err := syncoid.Translate(run)
 	if err != nil {
 		return nil, fmt.Errorf("translate Syncoid Replication Contract: %w", err)
@@ -893,10 +1006,9 @@ func runReceiveTask(run *zfsv1.ZFSReplicationRun, names runObjects, publicKey st
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      names.ReceiveTaskName,
 			Namespace: run.Namespace,
-			Labels:    labels,
+			Labels:    map[string]string{labelPrefix + "/role": "receiver"},
 		},
 		Spec: zfsv1.ZFSReceiveTaskSpec{
-			RunRef:      zfsv1.LocalObjectReference{Name: run.Name},
 			NodeName:    run.Spec.Target.NodeName,
 			Destination: zfsv1.ReceiveDestination{Dataset: run.Spec.Target.Dataset},
 			SSH: zfsv1.ReceiveTaskSSHSpec{

@@ -118,13 +118,11 @@ spec:
                     - Failed
                 senderJobName:
                   type: string
-                receiveTaskName:
+                senderJobUID:
                   type: string
                 receiverPodName:
                   type: string
                 receiverPodIP:
-                  type: string
-                sshSecretName:
                   type: string
                 startedAt:
                   type: string
