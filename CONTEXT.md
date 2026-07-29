@@ -34,5 +34,8 @@ The receive permission issued by one specific Receive Task incarnation. It binds
 **Authorization Lease**:
 A renewable deadline bounding how long a Receiver Authorization Grant remains available without confirmation from the run controller. Renewal may extend an unexpired deadline but cannot change the grant's identity, destination, or permitted operations.
 
+**Receive Task**:
+The per-run authorization intent whose exact incarnation may yield one Receiver Authorization Grant and whose terminal state revokes it. It shares the Replication Run lifecycle but is not itself proof that the run is trusted.
+
 **Ready Receive Task**:
 A Receive Task for which the identified Receiver most recently reported the exact grant active. It is an eventually consistent readiness observation; live command admission remains authoritative.
