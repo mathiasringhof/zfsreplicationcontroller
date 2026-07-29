@@ -26,8 +26,7 @@ const (
 
 func senderJob(run *zfsv1.ZFSReplicationRun, releaseImage string, endpoint zfsv1.ReceiveTaskEndpoint) (*batchv1.Job, error) {
 	names := objectNamesForRun(run.Name)
-	labels := maps.Clone(names.Labels)
-	labels[labelPrefix+"/role"] = "sender"
+	labels := map[string]string{labelPrefix + "/role": "sender"}
 
 	contract, err := syncoid.Translate(run)
 	if err != nil {

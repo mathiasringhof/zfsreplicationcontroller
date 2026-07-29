@@ -22,7 +22,7 @@ func TestSenderJobBuildsConcreteSyncoidManifest(t *testing.T) {
 	if job.Name != names.SenderName || job.Namespace != run.Namespace {
 		t.Fatalf("sender Job identity = %s/%s, want %s/%s", job.Namespace, job.Name, run.Namespace, names.SenderName)
 	}
-	if job.Labels[labelPrefix+"/run"] != run.Name || job.Labels[labelPrefix+"/role"] != "sender" {
+	if _, exists := job.Labels[labelPrefix+"/run"]; exists || job.Labels[labelPrefix+"/role"] != "sender" {
 		t.Fatalf("sender Job labels = %#v", job.Labels)
 	}
 	if job.Spec.BackoffLimit == nil || *job.Spec.BackoffLimit != 0 {

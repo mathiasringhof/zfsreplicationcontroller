@@ -50,10 +50,6 @@ type DatasetRef struct {
 	Dataset  string `json:"dataset"`
 }
 
-type LocalObjectReference struct {
-	Name string `json:"name"`
-}
-
 type SyncoidSpec struct {
 	NoSyncSnap            *bool    `json:"noSyncSnap,omitempty"`
 	NoRollback            *bool    `json:"noRollback,omitempty"`
@@ -75,10 +71,9 @@ type ZFSReplicationRunSpec struct {
 type ZFSReplicationRunStatus struct {
 	Phase           Phase        `json:"phase,omitempty"`
 	SenderJobName   string       `json:"senderJobName,omitempty"`
-	ReceiveTaskName string       `json:"receiveTaskName,omitempty"`
+	SenderJobUID    string       `json:"senderJobUID,omitempty"`
 	ReceiverPodName string       `json:"receiverPodName,omitempty"`
 	ReceiverPodIP   string       `json:"receiverPodIP,omitempty"`
-	SSHSecretName   string       `json:"sshSecretName,omitempty"`
 	StartedAt       *metav1.Time `json:"startedAt,omitempty"`
 	CompletedAt     *metav1.Time `json:"completedAt,omitempty"`
 	LastError       string       `json:"lastError,omitempty"`
@@ -123,11 +118,10 @@ type ReceiveTaskPolicy struct {
 }
 
 type ZFSReceiveTaskSpec struct {
-	RunRef      LocalObjectReference `json:"runRef"`
-	NodeName    string               `json:"nodeName"`
-	Destination ReceiveDestination   `json:"destination"`
-	SSH         ReceiveTaskSSHSpec   `json:"ssh"`
-	Policy      ReceiveTaskPolicy    `json:"policy,omitempty"`
+	NodeName    string             `json:"nodeName"`
+	Destination ReceiveDestination `json:"destination"`
+	SSH         ReceiveTaskSSHSpec `json:"ssh"`
+	Policy      ReceiveTaskPolicy  `json:"policy,omitempty"`
 }
 
 type ReceiveTaskEndpoint struct {
