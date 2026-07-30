@@ -56,9 +56,29 @@ type manifestSubject struct {
 }
 
 type manifestPolicyRule struct {
-	APIGroups []string `yaml:"apiGroups"`
-	Resources []string `yaml:"resources"`
-	Verbs     []string `yaml:"verbs"`
+	APIGroups       []string `yaml:"apiGroups"`
+	Resources       []string `yaml:"resources"`
+	ResourceNames   []string `yaml:"resourceNames"`
+	NonResourceURLs []string `yaml:"nonResourceURLs"`
+	Verbs           []string `yaml:"verbs"`
+}
+
+type manifestCapability struct {
+	APIGroup string
+	Resource string
+}
+
+var controllerRBACCapabilities = map[manifestCapability][]string{
+	{APIGroup: "zfsreplication.ringhof.io", Resource: "zfsreplicationschedules"}:        {"get", "list", "watch"},
+	{APIGroup: "zfsreplication.ringhof.io", Resource: "zfsreplicationruns"}:             {"create", "get", "list", "watch", "delete"},
+	{APIGroup: "zfsreplication.ringhof.io", Resource: "zfsreceivetasks"}:                {"create", "get", "list", "watch", "update"},
+	{APIGroup: "zfsreplication.ringhof.io", Resource: "zfsreplicationruns/status"}:      {"get", "update", "patch"},
+	{APIGroup: "zfsreplication.ringhof.io", Resource: "zfsreceivetasks/status"}:         {"get", "update", "patch"},
+	{APIGroup: "zfsreplication.ringhof.io", Resource: "zfsreplicationschedules/status"}: {"get", "update", "patch"},
+	{APIGroup: "batch", Resource: "jobs"}:                                               {"create", "get", "list", "watch", "update", "patch", "delete"},
+	{APIGroup: "", Resource: "secrets"}:                                                 {"create", "get", "list", "watch", "update", "patch", "delete"},
+	{APIGroup: "", Resource: "pods"}:                                                    {"get", "list", "watch"},
+	{APIGroup: "", Resource: "events"}:                                                  {"create", "patch"},
 }
 
 type manifestContainer struct {
@@ -96,7 +116,7 @@ type manifestObjectFieldSelector struct {
 	FieldPath string `yaml:"fieldPath"`
 }
 
-func TestControllerClusterRoleHasRequiredPermissions(t *testing.T) {
+func TestControllerClusterRoleMatchesCapabilityContract(t *testing.T) {
 	t.Helper()
 
 	rolePath := filepath.Join("..", "..", "config", "rbac", "role.yaml")
@@ -112,57 +132,7 @@ func TestControllerClusterRoleHasRequiredPermissions(t *testing.T) {
 		t.Fatalf("parse %s: %v", rolePath, err)
 	}
 
-	verbs := verbsForResource(role.Rules, "zfsreplication.ringhof.io", "zfsreplicationruns")
-	for _, verb := range []string{"create", "get", "list", "watch", "delete"} {
-		if !contains(verbs, verb) {
-			t.Fatalf("zfsreplicationruns RBAC verbs = %v, missing %q", verbs, verb)
-		}
-	}
-
-	verbs = verbsForResource(role.Rules, "zfsreplication.ringhof.io", "zfsreceivetasks")
-	for _, verb := range []string{"create", "get", "list", "watch"} {
-		if !contains(verbs, verb) {
-			t.Fatalf("zfsreceivetasks RBAC verbs = %v, missing %q", verbs, verb)
-		}
-	}
-
-	verbs = verbsForResource(role.Rules, "zfsreplication.ringhof.io", "zfsreplicationruns/status")
-	for _, verb := range []string{"get", "update", "patch"} {
-		if !contains(verbs, verb) {
-			t.Fatalf("zfsreplicationruns/status RBAC verbs = %v, missing %q", verbs, verb)
-		}
-	}
-
-	verbs = verbsForResource(role.Rules, "zfsreplication.ringhof.io", "zfsreceivetasks/status")
-	for _, verb := range []string{"get", "update", "patch"} {
-		if !contains(verbs, verb) {
-			t.Fatalf("zfsreceivetasks/status RBAC verbs = %v, missing %q", verbs, verb)
-		}
-	}
-
-	verbs = verbsForResource(role.Rules, "zfsreplication.ringhof.io", "zfsreplicationschedules/status")
-	for _, verb := range []string{"get", "update", "patch"} {
-		if !contains(verbs, verb) {
-			t.Fatalf("zfsreplicationschedules/status RBAC verbs = %v, missing %q", verbs, verb)
-		}
-	}
-
-	verbs = verbsForResource(role.Rules, "", "pods/log")
-	if len(verbs) != 0 {
-		t.Fatalf("pods/log RBAC verbs = %v, want no Pod log access", verbs)
-	}
-
-	verbs = verbsForResource(role.Rules, "", "pods")
-	if !slices.Equal(verbs, []string{"get", "list", "watch"}) {
-		t.Fatalf("pods RBAC verbs = %v, want read-only access", verbs)
-	}
-
-	verbs = verbsForResource(role.Rules, "", "secrets")
-	for _, verb := range []string{"create", "get", "list", "watch", "update", "patch", "delete"} {
-		if !contains(verbs, verb) {
-			t.Fatalf("secrets RBAC verbs = %v, missing %q", verbs, verb)
-		}
-	}
+	assertExactControllerCapabilities(t, role.Rules)
 }
 
 func TestRenderedControllerPodReadRBACIsLeastPrivilege(t *testing.T) {
@@ -190,6 +160,7 @@ func TestRenderedControllerPodReadRBACIsLeastPrivilege(t *testing.T) {
 			if role == nil {
 				t.Fatalf("rendered %s has no zfsreplication-controller %s", tt.name, tt.roleKind)
 			}
+			assertExactControllerCapabilities(t, role.Rules)
 
 			podVerbs := verbsForResource(role.Rules, "", "pods")
 			if !slices.Equal(podVerbs, []string{"get", "list", "watch"}) {
@@ -357,35 +328,7 @@ func TestNamespacedRBACRestrictsWorkloadPermissionsToWatchedNamespace(t *testing
 		t.Fatalf("namespaced RBAC namespace = %q, want %s", role.Metadata.Namespace, smokeNamespace)
 	}
 
-	for _, tt := range []struct {
-		apiGroup string
-		resource string
-		verbs    []string
-	}{
-		{apiGroup: "zfsreplication.ringhof.io", resource: "zfsreplicationschedules", verbs: []string{"get", "list", "watch"}},
-		{apiGroup: "zfsreplication.ringhof.io", resource: "zfsreplicationruns", verbs: []string{"create", "get", "list", "watch", "delete"}},
-		{apiGroup: "zfsreplication.ringhof.io", resource: "zfsreceivetasks", verbs: []string{"create", "get", "list", "watch"}},
-		{apiGroup: "zfsreplication.ringhof.io", resource: "zfsreplicationruns/status", verbs: []string{"get", "update", "patch"}},
-		{apiGroup: "zfsreplication.ringhof.io", resource: "zfsreceivetasks/status", verbs: []string{"get", "update", "patch"}},
-		{apiGroup: "zfsreplication.ringhof.io", resource: "zfsreplicationschedules/status", verbs: []string{"get", "update", "patch"}},
-		{apiGroup: "batch", resource: "jobs", verbs: []string{"create", "get", "list", "watch", "update", "patch", "delete"}},
-		{apiGroup: "", resource: "secrets", verbs: []string{"create", "get", "list", "watch", "update", "patch", "delete"}},
-		{apiGroup: "", resource: "pods", verbs: []string{"get", "list", "watch"}},
-		{apiGroup: "", resource: "events", verbs: []string{"create", "patch"}},
-	} {
-		verbs := verbsForResource(role.Rules, tt.apiGroup, tt.resource)
-		if tt.apiGroup == "" && tt.resource == "pods" {
-			if !slices.Equal(verbs, tt.verbs) {
-				t.Fatalf("namespaced Pod RBAC verbs = %v, want read-only access", verbs)
-			}
-			continue
-		}
-		for _, verb := range tt.verbs {
-			if !contains(verbs, verb) {
-				t.Fatalf("%s/%s namespaced RBAC verbs = %v, missing %q", tt.apiGroup, tt.resource, verbs, verb)
-			}
-		}
-	}
+	assertExactControllerCapabilities(t, role.Rules)
 }
 
 func TestReceiverNamespacedRBACRestrictsTaskPermissionsToWatchedNamespace(t *testing.T) {
@@ -792,6 +735,41 @@ func verbsForResource(rules []manifestPolicyRule, apiGroup, resource string) []s
 		}
 	}
 	return nil
+}
+
+func assertExactControllerCapabilities(t *testing.T, rules []manifestPolicyRule) {
+	t.Helper()
+
+	actual := make(map[manifestCapability][]string)
+	for _, rule := range rules {
+		if len(rule.ResourceNames) != 0 {
+			t.Errorf("unexpected RBAC resourceNames restriction %v for resources %v", rule.ResourceNames, rule.Resources)
+		}
+		if len(rule.NonResourceURLs) != 0 {
+			t.Errorf("unexpected non-resource RBAC capability %v with verbs %v", rule.NonResourceURLs, rule.Verbs)
+		}
+		for _, apiGroup := range rule.APIGroups {
+			for _, resource := range rule.Resources {
+				capability := manifestCapability{APIGroup: apiGroup, Resource: resource}
+				actual[capability] = append(actual[capability], rule.Verbs...)
+			}
+		}
+	}
+
+	for capability, wantVerbs := range controllerRBACCapabilities {
+		gotVerbs := slices.Clone(actual[capability])
+		wantVerbs = slices.Clone(wantVerbs)
+		slices.Sort(gotVerbs)
+		slices.Sort(wantVerbs)
+		if !slices.Equal(gotVerbs, wantVerbs) {
+			t.Errorf("%s/%s RBAC verbs = %v, want exactly %v", capability.APIGroup, capability.Resource, gotVerbs, wantVerbs)
+		}
+	}
+	for capability, verbs := range actual {
+		if _, ok := controllerRBACCapabilities[capability]; !ok {
+			t.Errorf("unexpected RBAC capability %s/%s with verbs %v", capability.APIGroup, capability.Resource, verbs)
+		}
+	}
 }
 
 func findContainer(containers []manifestContainer, name string) *manifestContainer {

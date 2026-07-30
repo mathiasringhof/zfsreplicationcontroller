@@ -102,6 +102,12 @@ func (r *ZFSReplicationRunReconciler) Reconcile(ctx context.Context, req ctrl.Re
 		run.Status.SenderJobName = names.SenderName
 		run.Status.SenderJobUID = string(sender.UID)
 	}
+	if sender != nil {
+		logger.WithValues("senderJob", names.SenderName, "receiverPod", receiver.podName).V(1).Info("sender job already present")
+		if result, done, err := r.finishFromSenderJob(ctx, &run, names, receiver, sender); err != nil || done {
+			return result, err
+		}
+	}
 
 	leaseRequeueAfter, leaseMessage, err := r.reconcileRunReceiveTaskLease(ctx, &run, names)
 	if err != nil {
@@ -112,10 +118,6 @@ func (r *ZFSReplicationRunReconciler) Reconcile(ctx context.Context, req ctrl.Re
 	}
 
 	if sender != nil {
-		logger.WithValues("senderJob", names.SenderName, "receiverPod", receiver.podName).V(1).Info("sender job already present")
-		if result, done, err := r.finishFromSenderJob(ctx, &run, names, receiver, sender); err != nil || done {
-			return result, err
-		}
 		result := ctrl.Result{RequeueAfter: leaseRequeueAfter}
 		if result.RequeueAfter == 0 {
 			result.RequeueAfter = 5 * time.Second

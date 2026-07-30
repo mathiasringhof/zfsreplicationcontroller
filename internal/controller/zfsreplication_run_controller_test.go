@@ -1200,6 +1200,37 @@ func TestRunReconcileTerminalSenderObservationRevokesAuthorityAndKeyMaterial(t *
 	assertObjectExists(t, r.Client, &batchv1.Job{}, names.SenderName)
 }
 
+func TestRunReconcileObservesTerminalSenderBeforeLeaseRenewal(t *testing.T) {
+	now := time.Date(2026, 7, 30, 12, 0, 0, 0, time.UTC)
+	run := replicationRun("sender-terminal-before-renewal")
+	run.Status.Phase = zfsv1.PhaseRunning
+	names := objectNamesForRun(run.Name)
+	task := readyReceiveTask(run, names, "10.0.0.42", testReceiverHostKey)
+	task.Spec.SSH.ExpiresAt = metav1.NewTime(now.Add(5 * time.Minute))
+	sender := mustSenderJob(t, run, "sender:test", "10.0.0.42")
+	sender.Status.Succeeded = 1
+	renewalAttempts := 0
+	r := newRunReconcilerWithInterceptors(t, interceptor.Funcs{
+		Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+			if _, ok := obj.(*zfsv1.ZFSReceiveTask); ok {
+				renewalAttempts++
+				return errors.New("receive task update forbidden")
+			}
+			return c.Update(ctx, obj, opts...)
+		},
+	}, run, task, sender)
+	r.now = func() time.Time { return now }
+
+	if _, err := r.Reconcile(context.Background(), request(run.Name)); err != nil {
+		t.Fatal(err)
+	}
+
+	if renewalAttempts != 0 {
+		t.Fatalf("receive task renewal attempts = %d, want none after sender completion", renewalAttempts)
+	}
+	assertRunPhase(t, r.Client, run.Name, zfsv1.PhaseSucceeded)
+}
+
 func TestRunReconcileLogsSenderJobAlreadyPresent(t *testing.T) {
 	run := replicationRun("manual-present")
 	names := objectNamesForRun(run.Name)

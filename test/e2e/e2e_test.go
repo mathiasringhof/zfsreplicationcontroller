@@ -323,6 +323,7 @@ func TestE2EControllerServiceAccountRBAC(t *testing.T) {
 		{verb: "get", resource: "zfsreplicationschedules.zfsreplication.ringhof.io", subresource: "status"},
 		{verb: "update", resource: "zfsreplicationschedules.zfsreplication.ringhof.io", subresource: "status"},
 		{verb: "patch", resource: "zfsreplicationschedules.zfsreplication.ringhof.io", subresource: "status"},
+		{verb: "update", resource: "zfsreceivetasks.zfsreplication.ringhof.io"},
 		{verb: "create", resource: "jobs.batch"},
 		{verb: "get", resource: "jobs.batch"},
 		{verb: "list", resource: "jobs.batch"},
