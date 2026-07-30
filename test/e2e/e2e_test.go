@@ -67,6 +67,7 @@ func TestE2EFullAndIncrementalReplication(t *testing.T) {
 	k.assertReceiveTaskTerminal(first, e2eReceiveTaskPhaseCompleted)
 	k.assertRunExecutionIdentity(first, firstStatus)
 	k.assertRealZFSMarker(first.TargetNode, "zfs-dst-p1-"+suffix, pool, first.TargetDataset, "first-"+suffix)
+	k.assertSenderLogsContain(first, "Sending", first.SourceDataset)
 	k.assertRunEphemeralCleanup(first.Name)
 	k.deleteRunAndAssertGarbageCollected(e2eNamespace, first.Name)
 
@@ -85,6 +86,7 @@ func TestE2EFullAndIncrementalReplication(t *testing.T) {
 	k.assertRealZFSMarker(second.TargetNode, "zfs-dst-p2-"+suffix, pool, second.TargetDataset, "second-"+suffix)
 	k.assertRealZFSSyncoidSnapshots(second.SourceNode, "zfs-src-sync-snaps-"+suffix, pool, second.SourceDataset, 1)
 	k.assertRealZFSSyncoidSnapshots(second.TargetNode, "zfs-dst-sync-snaps-"+suffix, pool, second.TargetDataset, 1)
+	k.assertSenderLogsContain(second, "Sending", second.SourceDataset)
 	k.assertRunEphemeralCleanup(second.Name)
 }
 
@@ -211,12 +213,13 @@ func TestE2ESyncoidFailure(t *testing.T) {
 
 	k.applyReplication(sc)
 	status := k.waitForFailed(sc, 4*time.Minute)
-	assertFailedAfterSenderSetupStatus(t, sc, status, "CRITICAL ERROR")
+	assertFailedAfterSenderSetupStatus(t, sc, status, "syncoid exited with status")
 	k.assertReceiveTaskTerminal(sc, e2eReceiveTaskPhaseFailed)
-	if !strings.Contains(status.LastError, sc.TargetDataset) {
-		t.Fatalf("lastError = %q, want to mention target dataset %q", status.LastError, sc.TargetDataset)
+	terminationMessage := k.senderTerminationMessage(sc)
+	if status.LastError != terminationMessage {
+		t.Fatalf("lastError = %q, want exact Sender termination message %q", status.LastError, terminationMessage)
 	}
-	k.assertSenderTerminationDiagnosis(sc)
+	k.assertSenderLogsContain(sc, "CRITICAL ERROR", sc.TargetDataset)
 	k.assertRunEphemeralCleanup(sc.Name)
 }
 
@@ -1119,7 +1122,7 @@ func (k kubectlRunner) podsForReplicationInNamespace(namespace, name string) (po
 	return pods, nil
 }
 
-func (k kubectlRunner) assertSenderTerminationDiagnosis(sc replicationCase) {
+func (k kubectlRunner) senderTerminationMessage(sc replicationCase) string {
 	k.t.Helper()
 	pods, err := k.podsForReplicationInNamespace(e2eNamespace, sc.Name)
 	if err != nil {
@@ -1131,20 +1134,41 @@ func (k kubectlRunner) assertSenderTerminationDiagnosis(sc replicationCase) {
 				continue
 			}
 			message := status.State.Terminated.Message
-			if !strings.Contains(message, "CRITICAL ERROR") || !strings.Contains(message, sc.TargetDataset) {
-				k.t.Fatalf("sender termination message = %q, want critical target diagnosis", message)
+			exitCode := status.State.Terminated.ExitCode
+			if exitCode == 0 {
+				k.t.Fatalf("sender exit code = 0, want nonzero")
+			}
+			if want := fmt.Sprintf("syncoid exited with status %d", exitCode); message != want {
+				k.t.Fatalf("sender termination message = %q, want %q", message, want)
 			}
 			if len(message) > 4096 || !utf8.ValidString(message) || strings.ContainsAny(message, "\r\n") {
 				k.t.Fatalf("sender termination message is not bounded single-line UTF-8: %q", message)
 			}
-			if strings.Contains(message, "/var/run/zfsrep/ssh/id_rsa") {
-				k.t.Fatalf("sender termination message contains private key path: %q", message)
-			}
-			return
+			return message
 		}
 	}
 	k.collectDiagnosticsInNamespace(e2eNamespace, sc.Name)
 	k.t.Fatalf("no terminated sender container found for %s", sc.Name)
+	return ""
+}
+
+func (k kubectlRunner) assertSenderLogsContain(sc replicationCase, markers ...string) {
+	k.t.Helper()
+	logs, err := k.runOutput(
+		20*time.Second,
+		"logs",
+		"-n", e2eNamespace,
+		"job/"+runObjectName(sc.Name, "sender"),
+		"-c", "sender",
+	)
+	if err != nil {
+		k.t.Fatalf("collect Sender logs for %s: %v", sc.Name, err)
+	}
+	for _, marker := range markers {
+		if !strings.Contains(logs, marker) {
+			k.t.Fatalf("Sender logs for %s do not contain marker %q:\n%s", sc.Name, marker, logs)
+		}
+	}
 }
 
 func (k kubectlRunner) assertRunEphemeralCleanup(name string) {
@@ -1645,7 +1669,8 @@ type podList struct {
 				Name  string `json:"name"`
 				State struct {
 					Terminated *struct {
-						Message string `json:"message"`
+						Message  string `json:"message"`
+						ExitCode int32  `json:"exitCode"`
 					} `json:"terminated"`
 				} `json:"state"`
 			} `json:"containerStatuses"`

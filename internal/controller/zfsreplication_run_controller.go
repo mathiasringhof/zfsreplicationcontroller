@@ -11,7 +11,6 @@ import (
 
 	zfsv1 "github.com/mathias/zfsreplicationcontroller/api/v1alpha1"
 	"github.com/mathias/zfsreplicationcontroller/internal/replication"
-	"github.com/mathias/zfsreplicationcontroller/internal/replication/diagnosis"
 	"github.com/mathias/zfsreplicationcontroller/internal/runchildren"
 	"github.com/mathias/zfsreplicationcontroller/internal/syncoid"
 	"golang.org/x/crypto/ssh"
@@ -701,17 +700,17 @@ func (r *ZFSReplicationRunReconciler) jobFailed(ctx context.Context, job *batchv
 	if job.Status.Failed == 0 {
 		return false, "", nil
 	}
-	if msg, err := r.senderTerminationDiagnosis(ctx, job); err != nil {
+	if msg, err := r.senderTerminationMessage(ctx, job); err != nil {
 		return false, "", err
 	} else if msg != "" {
 		return true, msg, nil
 	}
 	for _, cond := range job.Status.Conditions {
 		if cond.Type == batchv1.JobFailed && cond.Status == corev1.ConditionTrue && cond.Message != "" {
-			return true, diagnosis.Sanitize(cond.Message).String(), nil
+			return true, cond.Message, nil
 		}
 	}
-	return true, diagnosis.Sanitize(fallback).String(), nil
+	return true, fallback, nil
 }
 
 type terminatedSender struct {
@@ -720,7 +719,7 @@ type terminatedSender struct {
 	podName   string
 }
 
-func (r *ZFSReplicationRunReconciler) senderTerminationDiagnosis(ctx context.Context, job *batchv1.Job) (string, error) {
+func (r *ZFSReplicationRunReconciler) senderTerminationMessage(ctx context.Context, job *batchv1.Job) (string, error) {
 	var pods corev1.PodList
 	if err := r.podReader().List(ctx, &pods, client.InNamespace(job.Namespace)); err != nil {
 		return "", fmt.Errorf("list sender Pods in namespace %s: %w", job.Namespace, err)
@@ -749,13 +748,13 @@ func (r *ZFSReplicationRunReconciler) senderTerminationDiagnosis(ctx context.Con
 		return "", nil
 	}
 	if newest.state.Message != "" {
-		return diagnosis.Sanitize(newest.state.Message).String(), nil
+		return newest.state.Message, nil
 	}
-	return diagnosis.Sanitize(fmt.Sprintf(
+	return fmt.Sprintf(
 		"sender terminated: reason %s, exit code %d",
 		newest.state.Reason,
 		newest.state.ExitCode,
-	)).String(), nil
+	), nil
 }
 
 func podControlledByJobUID(pod *corev1.Pod, uid types.UID) bool {
@@ -817,7 +816,7 @@ func (r *ZFSReplicationRunReconciler) failRunObject(ctx context.Context, run *zf
 		return err
 	}
 	if !wasFailed {
-		log.FromContext(ctx).WithValues("reason", diagnosis.Sanitize(msg).String()).Info("replication failed")
+		log.FromContext(ctx).WithValues("reason", msg).Info("replication failed")
 	}
 	return errors.Join(
 		r.markReceiveTaskTerminal(ctx, run, names, zfsv1.ReceiveTaskPhaseFailed, msg),
@@ -839,7 +838,7 @@ func (r *ZFSReplicationRunReconciler) failRunValidation(ctx context.Context, run
 		return err
 	}
 	if !wasFailed {
-		log.FromContext(ctx).WithValues("reason", diagnosis.Sanitize(msg).String()).Info("replication failed")
+		log.FromContext(ctx).WithValues("reason", msg).Info("replication failed")
 	}
 	return nil
 }
@@ -1015,7 +1014,7 @@ func runReceiveTask(run *zfsv1.ZFSReplicationRun, names runObjects, publicKey st
 				AuthorizedPublicKey: publicKey,
 				ExpiresAt:           expiresAt,
 			},
-			Policy: contract.ReceiverPolicy,
+			Policy: contract.ReceiverPolicy(),
 		},
 	}, nil
 }

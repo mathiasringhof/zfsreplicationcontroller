@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -58,23 +59,24 @@ func TestRunReconcileSenderJobEmbedsSyncoidTranslation(t *testing.T) {
 	if container.TerminationMessagePolicy != corev1.TerminationMessageReadFile {
 		t.Fatalf("termination message policy = %q, want File", container.TerminationMessagePolicy)
 	}
-	if got := envValue(sender, "DST_HOST"); got != "zfs-recv@10.0.0.42" {
-		t.Fatalf("DST_HOST = %q", got)
-	}
-	if got := envValue(sender, "KNOWN_HOSTS_FILE"); got != "/var/run/zfsrep/ssh/known_hosts" {
-		t.Fatalf("KNOWN_HOSTS_FILE = %q", got)
-	}
-	if got := envValue(sender, "SSH_PORT"); got != "2205" {
-		t.Fatalf("SSH_PORT = %q, want Receiver Endpoint port 2205", got)
-	}
 	contract, err := syncoid.Translate(run)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, entry := range contract.SenderEnvironment {
-		if got := envValue(sender, entry.Name); got != entry.Value {
-			t.Fatalf("sender environment %s = %q, want translated value %q", entry.Name, got, entry.Value)
-		}
+	wantArguments, err := contract.SenderArguments(syncoid.Connection{
+		TargetHost:     "zfs-recv@10.0.0.42",
+		SSHKeyFile:     "/var/run/zfsrep/ssh/id_rsa",
+		KnownHostsFile: "/var/run/zfsrep/ssh/known_hosts",
+		SSHPort:        2205,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(container.Args, wantArguments) {
+		t.Fatalf("sender arguments = %#v, want translated arguments %#v", container.Args, wantArguments)
+	}
+	if len(container.Env) != 0 {
+		t.Fatalf("sender environment = %#v, want no private Sender protocol", container.Env)
 	}
 	var secret corev1.Secret
 	if err := r.Get(context.Background(), types.NamespacedName{Name: names.SecretName, Namespace: run.Namespace}, &secret); err != nil {
@@ -147,8 +149,8 @@ func TestRunReconcileCreatesReceiveTaskBeforeSenderJob(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if task.Spec.Policy != contract.ReceiverPolicy {
-		t.Fatalf("task policy = %#v, want translated policy %#v", task.Spec.Policy, contract.ReceiverPolicy)
+	if task.Spec.Policy != contract.ReceiverPolicy() {
+		t.Fatalf("task policy = %#v, want translated policy %#v", task.Spec.Policy, contract.ReceiverPolicy())
 	}
 	assertObjectDeleted(t, r.Client, &batchv1.Job{}, names.SenderName)
 	assertRunPhase(t, r.Client, run.Name, zfsv1.PhaseStartingReceiver)
@@ -240,7 +242,7 @@ func TestRunReconcileFailsForForeignSameNameChildWithoutMutation(t *testing.T) {
 				t.Fatal(err)
 			}
 			if got.Status.Phase != zfsv1.PhaseFailed || !strings.Contains(got.Status.LastError, "is not controlled by Replication Run") {
-				t.Fatalf("run status = %#v, want foreign-owner Failure Diagnosis", got.Status)
+				t.Fatalf("run status = %#v, want foreign-owner Sender Failure Message", got.Status)
 			}
 			if err := r.Get(context.Background(), client.ObjectKeyFromObject(foreign), foreign); err != nil {
 				t.Fatalf("foreign %s was deleted: %v", kind, err)
@@ -1118,7 +1120,7 @@ func TestRunReconcileBindsAndEnforcesSenderJobUID(t *testing.T) {
 			t.Fatal(err)
 		}
 		if got.Status.Phase != zfsv1.PhaseFailed || !strings.Contains(got.Status.LastError, "differs from recorded UID original-job-uid") {
-			t.Fatalf("run status = %#v, want replacement Job Failure Diagnosis", got.Status)
+			t.Fatalf("run status = %#v, want replacement Job Sender Failure Message", got.Status)
 		}
 		if got.Status.SenderJobUID != "original-job-uid" {
 			t.Fatalf("senderJobUID = %q, want write-once original UID", got.Status.SenderJobUID)
@@ -1143,7 +1145,7 @@ func TestRunReconcileBindsAndEnforcesSenderJobUID(t *testing.T) {
 			t.Fatal(err)
 		}
 		if got.Status.Phase != zfsv1.PhaseFailed || !strings.Contains(got.Status.LastError, "with UID missing-job-uid is missing") {
-			t.Fatalf("run status = %#v, want missing Job Failure Diagnosis", got.Status)
+			t.Fatalf("run status = %#v, want missing Job Sender Failure Message", got.Status)
 		}
 	})
 
@@ -1243,7 +1245,7 @@ func TestRunReconcileLogsSenderFailure(t *testing.T) {
 	assertNoLogEntry(t, logs, "sender job failed")
 }
 
-func TestRunReconcileUsesSanitizedTerminationMessageFromExactSenderJob(t *testing.T) {
+func TestRunReconcilePreservesTerminationMessageFromExactSenderJob(t *testing.T) {
 	run := replicationRun("manual-termination-message")
 	run.Status.ReceiverPodName = "zfs-receiver-worker-b"
 	run.Status.ReceiverPodIP = "10.0.0.42"
@@ -1270,7 +1272,7 @@ func TestRunReconcileUsesSanitizedTerminationMessageFromExactSenderJob(t *testin
 	if got.Status.Phase != zfsv1.PhaseFailed {
 		t.Fatalf("phase = %q, want Failed", got.Status.Phase)
 	}
-	if got.Status.LastError != `cannot receive tank/archive --sshkey=<redacted>` {
+	if got.Status.LastError != `cannot receive tank/archive --sshkey=/var/run/zfsrep/ssh/id_rsa` {
 		t.Fatalf("lastError = %q", got.Status.LastError)
 	}
 }
@@ -1319,8 +1321,8 @@ func TestRunReconcileSelectsNewestTerminatedSenderDeterministically(t *testing.T
 			sender.UID = types.UID("sender-job-uid-" + tt.name)
 			sender.Status.Failed = 1
 			finished := metav1.NewTime(base)
-			older := terminatedSenderPod(run.Namespace, "sender-old", sender, finished, "older diagnosis")
-			newer := terminatedSenderPod(run.Namespace, "sender-new", sender, finished, "newest diagnosis")
+			older := terminatedSenderPod(run.Namespace, "sender-old", sender, finished, "older message")
+			newer := terminatedSenderPod(run.Namespace, "sender-new", sender, finished, "newest message")
 			tt.configure(older, newer)
 			r := newRunReconciler(t, run, sender, older, newer)
 
@@ -1332,7 +1334,7 @@ func TestRunReconcileSelectsNewestTerminatedSenderDeterministically(t *testing.T
 			if err := r.Get(context.Background(), request(run.Name).NamespacedName, &got); err != nil {
 				t.Fatal(err)
 			}
-			if got.Status.LastError != "newest diagnosis" {
+			if got.Status.LastError != "newest message" {
 				t.Fatalf("lastError = %q", got.Status.LastError)
 			}
 		})
@@ -1362,7 +1364,7 @@ func TestRunReconcileFallsBackToTerminationReasonAndExitCode(t *testing.T) {
 	}
 }
 
-func TestRunReconcileRedactsQuotedJobFailedConditionWithoutPodLogs(t *testing.T) {
+func TestRunReconcilePreservesJobFailedConditionWithoutPodLogs(t *testing.T) {
 	run := replicationRun("manual-fallback-redaction")
 	names := objectNamesForRun(run.Name)
 	run.Status.ReceiverPodName = "zfs-receiver-worker-b"
@@ -1388,14 +1390,83 @@ func TestRunReconcileRedactsQuotedJobFailedConditionWithoutPodLogs(t *testing.T)
 	if err := r.Get(context.Background(), request(run.Name).NamespacedName, &got); err != nil {
 		t.Fatal(err)
 	}
-	if got.Status.LastError != `syncoid exited with status 1 --sshkey=<redacted>` {
+	if got.Status.LastError != `syncoid exited with status 1 --sshkey=\"/var/run/zfsrep/ssh/id_rsa\"` {
 		t.Fatalf("lastError = %q", got.Status.LastError)
 	}
 	assertLogEntry(t, logs, "replication failed", map[string]string{
 		"namespace": run.Namespace,
 		"run":       run.Name,
-		"reason":    `syncoid exited with status 1 --sshkey=<redacted>`,
+		"reason":    `syncoid exited with status 1 --sshkey=\"/var/run/zfsrep/ssh/id_rsa\"`,
 	})
+}
+
+func TestJobFailedUsesNonLogEvidenceOrder(t *testing.T) {
+	for _, tt := range []struct {
+		name               string
+		terminationMessage string
+		terminationReason  string
+		conditionMessage   string
+		want               string
+	}{
+		{
+			name:               "termination message before every fallback",
+			terminationMessage: "Sender Failure Message",
+			terminationReason:  "Error",
+			conditionMessage:   "Job condition message",
+			want:               "Sender Failure Message",
+		},
+		{
+			name:              "termination reason before Job condition",
+			terminationReason: "OOMKilled",
+			conditionMessage:  "Job condition message",
+			want:              "sender terminated: reason OOMKilled, exit code 137",
+		},
+		{
+			name:             "Job condition before generic fallback",
+			conditionMessage: "Job condition message",
+			want:             "Job condition message",
+		},
+		{
+			name: "generic fallback",
+			want: "sender Job failed",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			job := &batchv1.Job{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "sender",
+					Namespace: "storage",
+					UID:       "sender-job-uid",
+				},
+				Status: batchv1.JobStatus{Failed: 1},
+			}
+			if tt.conditionMessage != "" {
+				job.Status.Conditions = []batchv1.JobCondition{{
+					Type:    batchv1.JobFailed,
+					Status:  corev1.ConditionTrue,
+					Message: tt.conditionMessage,
+				}}
+			}
+			var objects []client.Object
+			if tt.terminationMessage != "" || tt.terminationReason != "" {
+				pod := terminatedSenderPod(job.Namespace, "sender-pod", job, metav1.Now(), tt.terminationMessage)
+				pod.Status.ContainerStatuses[0].State.Terminated.Reason = tt.terminationReason
+				if tt.terminationReason == "OOMKilled" {
+					pod.Status.ContainerStatuses[0].State.Terminated.ExitCode = 137
+				}
+				objects = append(objects, pod)
+			}
+			reconciler := newRunReconciler(t, objects...)
+
+			failed, message, err := reconciler.jobFailed(context.Background(), job, "sender Job failed")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !failed || message != tt.want {
+				t.Fatalf("jobFailed() = (%t, %q), want (true, %q)", failed, message, tt.want)
+			}
+		})
+	}
 }
 
 func TestRunReconcileLogsDestinationWaitOnlyOnTransition(t *testing.T) {
@@ -1920,15 +1991,6 @@ func assertOnlyRoleLabel(t *testing.T, child client.Object, role string) {
 	if len(labels) != 1 || labels[labelPrefix+"/role"] != role {
 		t.Fatalf("%T labels = %#v, want only role %q", child, labels, role)
 	}
-}
-
-func envValue(job *batchv1.Job, name string) string {
-	for _, env := range job.Spec.Template.Spec.Containers[0].Env {
-		if env.Name == name {
-			return env.Value
-		}
-	}
-	return ""
 }
 
 func ptr[T any](v T) *T { return &v }

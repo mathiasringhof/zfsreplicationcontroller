@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"slices"
 	"testing"
 
 	zfsv1 "github.com/mathias/zfsreplicationcontroller/api/v1alpha1"
@@ -69,25 +70,24 @@ func TestSenderJobBuildsConcreteSyncoidManifest(t *testing.T) {
 		container.TerminationMessagePolicy != corev1.TerminationMessageReadFile {
 		t.Fatalf("termination message settings = (%q, %q)", container.TerminationMessagePath, container.TerminationMessagePolicy)
 	}
-	for name, want := range map[string]string{
-		"DST_HOST":         "zfs-recv@10.0.0.42",
-		"SSH_PORT":         "2205",
-		"SSH_KEY_FILE":     "/var/run/zfsrep/ssh/id_rsa",
-		"KNOWN_HOSTS_FILE": "/var/run/zfsrep/ssh/known_hosts",
-		"SRC_DATASET":      run.Spec.Source.Dataset,
-		"DST_DATASET":      run.Spec.Target.Dataset,
-	} {
-		if got := envValue(job, name); got != want {
-			t.Fatalf("%s = %q, want %q", name, got, want)
-		}
-	}
 	contract, err := syncoid.Translate(run)
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantEnvironmentCount := len(contract.SenderEnvironment) + len(syncoid.ConnectionEnvironment(syncoid.Connection{}))
-	if len(container.Env) != wantEnvironmentCount {
-		t.Fatalf("environment entries = %d, want only %d Syncoid contract and connection entries", len(container.Env), wantEnvironmentCount)
+	wantArguments, err := contract.SenderArguments(syncoid.Connection{
+		TargetHost:     "zfs-recv@10.0.0.42",
+		SSHKeyFile:     "/var/run/zfsrep/ssh/id_rsa",
+		KnownHostsFile: "/var/run/zfsrep/ssh/known_hosts",
+		SSHPort:        2205,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(container.Args, wantArguments) {
+		t.Fatalf("arguments = %#v, want final Syncoid arguments %#v", container.Args, wantArguments)
+	}
+	if len(container.Env) != 0 {
+		t.Fatalf("environment = %#v, want no private Sender protocol", container.Env)
 	}
 	assertSenderMount(t, container.VolumeMounts, "dev-zfs", "/dev/zfs", false)
 	assertSenderMount(t, container.VolumeMounts, "ssh", "/var/run/zfsrep/ssh", true)

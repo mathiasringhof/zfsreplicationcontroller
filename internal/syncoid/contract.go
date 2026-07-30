@@ -4,42 +4,26 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
-	"slices"
 	"strconv"
 	"strings"
 
 	zfsv1 "github.com/mathias/zfsreplicationcontroller/api/v1alpha1"
 	"github.com/mathias/zfsreplicationcontroller/internal/replication"
-	corev1 "k8s.io/api/core/v1"
 )
 
 const (
-	envSourceDataset          = "SRC_DATASET"
-	envTargetHost             = "DST_HOST"
-	envTargetDataset          = "DST_DATASET"
-	envSSHKeyFile             = "SSH_KEY_FILE"
-	envKnownHostsFile         = "KNOWN_HOSTS_FILE"
-	envSSHPort                = "SSH_PORT"
-	envNoSyncSnap             = "SYNCOID_NO_SYNC_SNAP"
-	envNoRollback             = "SYNCOID_NO_ROLLBACK"
-	envForceDelete            = "SYNCOID_FORCE_DELETE"
-	envDeleteTargetSnapshots  = "SYNCOID_DELETE_TARGET_SNAPSHOTS"
-	envCompression            = "SYNCOID_COMPRESS"
-	envIdentifier             = "SYNCOID_IDENTIFIER"
-	envReceiveUnmounted       = "RECEIVE_UNMOUNTED"
-	envReceiveResumable       = "RECEIVE_RESUMABLE"
-	envIncludeSnapshots       = "SYNCOID_INCLUDE_SNAPS"
-	envExcludeSnapshots       = "SYNCOID_EXCLUDE_SNAPS"
 	defaultCompression        = CompressionNone
 	relationshipIDPrefix      = "zrc-"
 	relationshipIDDigestBytes = 12
 )
 
-// Translation is the matched sender and Receiver side of one Syncoid
-// Replication Contract.
-type Translation struct {
-	SenderEnvironment []corev1.EnvVar
-	ReceiverPolicy    zfsv1.ReceiveTaskPolicy
+// Contract is the matched sender and Receiver side of one Syncoid Replication
+// Contract. Its normalized state is intentionally opaque.
+type Contract struct {
+	sourceDataset  string
+	targetDataset  string
+	options        options
+	receiverPolicy zfsv1.ReceiveTaskPolicy
 }
 
 // Connection contains sender-only SSH connection details supplied when the
@@ -48,14 +32,7 @@ type Connection struct {
 	TargetHost     string
 	SSHKeyFile     string
 	KnownHostsFile string
-	SSHPort        string
-}
-
-// Invocation is a strictly decoded, ready-to-execute Syncoid invocation.
-// Its normalized state is intentionally private.
-type Invocation struct {
-	arguments []string
-	summary   string
+	SSHPort        int32
 }
 
 type options struct {
@@ -73,19 +50,27 @@ type options struct {
 
 // Translate produces both sides of the Syncoid Replication Contract from one
 // immutable Replication Run.
-func Translate(run *zfsv1.ZFSReplicationRun) (Translation, error) {
+func Translate(run *zfsv1.ZFSReplicationRun) (Contract, error) {
 	if run == nil {
-		return Translation{}, fmt.Errorf("replication run is required")
+		return Contract{}, fmt.Errorf("replication run is required")
+	}
+	if !replication.ValidDatasetName(run.Spec.Source.Dataset) {
+		return Contract{}, fmt.Errorf("invalid source dataset %q", run.Spec.Source.Dataset)
+	}
+	if !replication.ValidDatasetName(run.Spec.Target.Dataset) {
+		return Contract{}, fmt.Errorf("invalid target dataset %q", run.Spec.Target.Dataset)
 	}
 	normalized := normalize(run.Spec.Syncoid)
 	if !CompressionSupported(normalized.compression) {
-		return Translation{}, fmt.Errorf("unsupported compression %q", normalized.compression)
+		return Contract{}, fmt.Errorf("unsupported compression %q", normalized.compression)
 	}
 	normalized.identifier = relationshipIdentifier(run)
 
-	return Translation{
-		SenderEnvironment: encodeEnvironment(run, normalized),
-		ReceiverPolicy: zfsv1.ReceiveTaskPolicy{
+	return Contract{
+		sourceDataset: run.Spec.Source.Dataset,
+		targetDataset: run.Spec.Target.Dataset,
+		options:       normalized,
+		receiverPolicy: zfsv1.ReceiveTaskPolicy{
 			ReceiveUnmounted:           normalized.receiveUnmounted,
 			ReceiveResumable:           normalized.receiveResumable,
 			AllowRollback:              !normalized.noRollback,
@@ -99,76 +84,39 @@ func Translate(run *zfsv1.ZFSReplicationRun) (Translation, error) {
 	}, nil
 }
 
-// ConnectionEnvironment encodes sender-only connection data using the same
-// private environment transport decoded by DecodeSenderEnvironment.
-func ConnectionEnvironment(connection Connection) []corev1.EnvVar {
-	return []corev1.EnvVar{
-		{Name: envTargetHost, Value: connection.TargetHost},
-		{Name: envSSHKeyFile, Value: connection.SSHKeyFile},
-		{Name: envKnownHostsFile, Value: connection.KnownHostsFile},
-		{Name: envSSHPort, Value: connection.SSHPort},
-	}
+// ReceiverPolicy returns the Receiver Authorization policy before a Receiver
+// connection is known.
+func (c Contract) ReceiverPolicy() zfsv1.ReceiveTaskPolicy {
+	return c.receiverPolicy
 }
 
-// DecodeSenderEnvironment strictly decodes the private environment transport
-// and constructs the final Syncoid invocation.
-func DecodeSenderEnvironment(lookup func(string) (string, bool)) (Invocation, error) {
-	sourceDataset, err := requiredString(lookup, envSourceDataset)
-	if err != nil {
-		return Invocation{}, err
+// SenderArguments produces the final Syncoid argument vector after the
+// Receiver connection is known.
+func (c Contract) SenderArguments(connection Connection) ([]string, error) {
+	if err := validateConnection(connection); err != nil {
+		return nil, err
 	}
-	if !replication.ValidDatasetName(sourceDataset) {
-		return Invocation{}, fmt.Errorf("invalid source dataset %q", sourceDataset)
-	}
-	targetDataset, err := requiredString(lookup, envTargetDataset)
-	if err != nil {
-		return Invocation{}, err
-	}
-	if !replication.ValidDatasetName(targetDataset) {
-		return Invocation{}, fmt.Errorf("invalid target dataset %q", targetDataset)
-	}
-	connection, err := decodeConnection(lookup)
-	if err != nil {
-		return Invocation{}, err
-	}
-	normalized, err := decodeOptions(lookup)
-	if err != nil {
-		return Invocation{}, err
-	}
-	compression, ok := senderCompression(normalized.compression)
+	compression, ok := senderCompression(c.options.compression)
 	if !ok {
-		return Invocation{}, fmt.Errorf("unsupported compression %q", normalized.compression)
+		return nil, fmt.Errorf("unsupported compression %q", c.options.compression)
 	}
-
-	arguments := arguments(sourceDataset, targetDataset, connection, normalized, compression)
-	return Invocation{
-		arguments: arguments,
-		summary: fmt.Sprintf(
-			"sourceDataset=%s targetDataset=%s targetHost=%s sshPort=%s syncoidIdentifier=%s noSyncSnap=%t noRollback=%t forceDelete=%t deleteTargetSnapshots=%t compress=%s receiveUnmounted=%t receiveResumable=%t includeSnaps=%q excludeSnaps=%q",
-			sourceDataset,
-			targetDataset,
-			connection.TargetHost,
-			connection.SSHPort,
-			normalized.identifier,
-			normalized.noSyncSnap,
-			normalized.noRollback,
-			normalized.forceDelete,
-			normalized.deleteTargetSnapshots,
-			normalized.compression,
-			normalized.receiveUnmounted,
-			normalized.receiveResumable,
-			strings.Join(normalized.includeSnapshots, ","),
-			strings.Join(normalized.excludeSnapshots, ","),
-		),
-	}, nil
+	return arguments(c.sourceDataset, c.targetDataset, connection, c.options, compression), nil
 }
 
-func (i Invocation) Arguments() []string {
-	return slices.Clone(i.arguments)
-}
-
-func (i Invocation) Summary() string {
-	return i.summary
+func validateConnection(connection Connection) error {
+	if connection.TargetHost == "" {
+		return fmt.Errorf("target host is required")
+	}
+	if connection.SSHKeyFile == "" {
+		return fmt.Errorf("SSH key file is required")
+	}
+	if connection.KnownHostsFile == "" {
+		return fmt.Errorf("known hosts file is required")
+	}
+	if connection.SSHPort < 1 || connection.SSHPort > 65535 {
+		return fmt.Errorf("invalid SSH port %d", connection.SSHPort)
+	}
+	return nil
 }
 
 func normalize(spec zfsv1.SyncoidSpec) options {
@@ -183,87 +131,6 @@ func normalize(spec zfsv1.SyncoidSpec) options {
 		includeSnapshots:      normalizeSnapshotPatterns(spec.IncludeSnaps),
 		excludeSnapshots:      normalizeSnapshotPatterns(spec.ExcludeSnaps),
 	}
-}
-
-func encodeEnvironment(run *zfsv1.ZFSReplicationRun, normalized options) []corev1.EnvVar {
-	return []corev1.EnvVar{
-		{Name: envSourceDataset, Value: run.Spec.Source.Dataset},
-		{Name: envTargetDataset, Value: run.Spec.Target.Dataset},
-		{Name: envNoSyncSnap, Value: strconv.FormatBool(normalized.noSyncSnap)},
-		{Name: envNoRollback, Value: strconv.FormatBool(normalized.noRollback)},
-		{Name: envForceDelete, Value: strconv.FormatBool(normalized.forceDelete)},
-		{Name: envDeleteTargetSnapshots, Value: strconv.FormatBool(normalized.deleteTargetSnapshots)},
-		{Name: envCompression, Value: normalized.compression},
-		{Name: envIdentifier, Value: normalized.identifier},
-		{Name: envReceiveUnmounted, Value: strconv.FormatBool(normalized.receiveUnmounted)},
-		{Name: envReceiveResumable, Value: strconv.FormatBool(normalized.receiveResumable)},
-		{Name: envIncludeSnapshots, Value: strings.Join(normalized.includeSnapshots, "\n")},
-		{Name: envExcludeSnapshots, Value: strings.Join(normalized.excludeSnapshots, "\n")},
-	}
-}
-
-func decodeConnection(lookup func(string) (string, bool)) (Connection, error) {
-	connection := Connection{}
-	var err error
-	if connection.TargetHost, err = requiredString(lookup, envTargetHost); err != nil {
-		return Connection{}, err
-	}
-	if connection.SSHKeyFile, err = requiredString(lookup, envSSHKeyFile); err != nil {
-		return Connection{}, err
-	}
-	if connection.KnownHostsFile, err = requiredString(lookup, envKnownHostsFile); err != nil {
-		return Connection{}, err
-	}
-	if connection.SSHPort, err = requiredString(lookup, envSSHPort); err != nil {
-		return Connection{}, err
-	}
-	port, err := strconv.ParseUint(connection.SSHPort, 10, 16)
-	if err != nil || port == 0 {
-		return Connection{}, fmt.Errorf("invalid SSH port %q", connection.SSHPort)
-	}
-	return connection, nil
-}
-
-func decodeOptions(lookup func(string) (string, bool)) (options, error) {
-	var decoded options
-	var err error
-	if decoded.noSyncSnap, err = requiredBool(lookup, envNoSyncSnap); err != nil {
-		return options{}, err
-	}
-	if decoded.noRollback, err = requiredBool(lookup, envNoRollback); err != nil {
-		return options{}, err
-	}
-	if decoded.forceDelete, err = requiredBool(lookup, envForceDelete); err != nil {
-		return options{}, err
-	}
-	if decoded.deleteTargetSnapshots, err = requiredBool(lookup, envDeleteTargetSnapshots); err != nil {
-		return options{}, err
-	}
-	if decoded.compression, err = requiredString(lookup, envCompression); err != nil {
-		return options{}, err
-	}
-	if !CompressionSupported(decoded.compression) {
-		return options{}, fmt.Errorf("unsupported compression %q", decoded.compression)
-	}
-	if decoded.identifier, err = requiredString(lookup, envIdentifier); err != nil {
-		return options{}, err
-	}
-	if !ValidIdentifier(decoded.identifier) {
-		return options{}, fmt.Errorf("unsafe Syncoid identifier %q", decoded.identifier)
-	}
-	if decoded.receiveUnmounted, err = requiredBool(lookup, envReceiveUnmounted); err != nil {
-		return options{}, err
-	}
-	if decoded.receiveResumable, err = requiredBool(lookup, envReceiveResumable); err != nil {
-		return options{}, err
-	}
-	if decoded.includeSnapshots, err = requiredList(lookup, envIncludeSnapshots); err != nil {
-		return options{}, err
-	}
-	if decoded.excludeSnapshots, err = requiredList(lookup, envExcludeSnapshots); err != nil {
-		return options{}, err
-	}
-	return decoded, nil
 }
 
 func arguments(sourceDataset, targetDataset string, connection Connection, normalized options, compression string) []string {
@@ -287,7 +154,7 @@ func arguments(sourceDataset, targetDataset string, connection Connection, norma
 		"--sshoption=StrictHostKeyChecking=yes",
 		"--sshoption=IdentitiesOnly=yes",
 		"--sshkey="+connection.SSHKeyFile,
-		"--sshport="+connection.SSHPort,
+		"--sshport="+strconv.FormatInt(int64(connection.SSHPort), 10),
 	)
 	if normalized.receiveUnmounted {
 		result = append(result, "--recvoptions=u")
@@ -338,46 +205,6 @@ func SnapshotOwnedByIdentifier(snapshot, identifier string) bool {
 	return ValidIdentifier(identifier) &&
 		replication.ValidSnapshotName(snapshot) &&
 		strings.HasPrefix(snapshot, "syncoid_"+identifier+"_")
-}
-
-func requiredString(lookup func(string) (string, bool), name string) (string, error) {
-	value, ok := lookup(name)
-	if !ok || value == "" {
-		return "", fmt.Errorf("required sender environment value %s is missing", name)
-	}
-	return value, nil
-}
-
-func requiredBool(lookup func(string) (string, bool), name string) (bool, error) {
-	value, ok := lookup(name)
-	if !ok {
-		return false, fmt.Errorf("required sender environment value %s is missing", name)
-	}
-	switch value {
-	case "true":
-		return true, nil
-	case "false":
-		return false, nil
-	default:
-		return false, fmt.Errorf("parse sender environment value %s: expected true or false", name)
-	}
-}
-
-func requiredList(lookup func(string) (string, bool), name string) ([]string, error) {
-	value, ok := lookup(name)
-	if !ok {
-		return nil, fmt.Errorf("required sender environment value %s is missing", name)
-	}
-	if value == "" {
-		return nil, nil
-	}
-	values := strings.Split(value, "\n")
-	for _, item := range values {
-		if item == "" || strings.ContainsAny(item, "\r\n") {
-			return nil, fmt.Errorf("sender environment value %s contains a malformed list", name)
-		}
-	}
-	return values, nil
 }
 
 func normalizeSnapshotPatterns(patterns []string) []string {
