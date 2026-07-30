@@ -3,7 +3,6 @@ package controller
 import (
 	"fmt"
 	"maps"
-	"strconv"
 	"strings"
 
 	zfsv1 "github.com/mathias/zfsreplicationcontroller/api/v1alpha1"
@@ -32,13 +31,15 @@ func senderJob(run *zfsv1.ZFSReplicationRun, releaseImage string, endpoint zfsv1
 	if err != nil {
 		return nil, fmt.Errorf("translate Syncoid Replication Contract: %w", err)
 	}
-	env := append([]corev1.EnvVar(nil), contract.SenderEnvironment...)
-	env = append(env, syncoid.ConnectionEnvironment(syncoid.Connection{
+	arguments, err := contract.SenderArguments(syncoid.Connection{
 		TargetHost:     fmt.Sprintf("zfs-recv@%s", endpoint.Host),
 		SSHKeyFile:     senderSSHKeyFile,
 		KnownHostsFile: senderKnownHostsFile,
-		SSHPort:        strconv.FormatInt(int64(endpoint.Port), 10),
-	})...)
+		SSHPort:        endpoint.Port,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("build Syncoid sender arguments: %w", err)
+	}
 
 	backoffLimit := int32(0)
 	finishedJobTTLSeconds := senderFinishedJobTTLSeconds
@@ -67,7 +68,7 @@ func senderJob(run *zfsv1.ZFSReplicationRun, releaseImage string, endpoint zfsv1
 							Image:                    releaseImage,
 							ImagePullPolicy:          senderImagePullPolicy(releaseImage),
 							Command:                  []string{senderExecutable},
-							Env:                      env,
+							Args:                     arguments,
 							SecurityContext:          &corev1.SecurityContext{Privileged: &privileged},
 							TerminationMessagePath:   senderTerminationMessage,
 							TerminationMessagePolicy: corev1.TerminationMessageReadFile,

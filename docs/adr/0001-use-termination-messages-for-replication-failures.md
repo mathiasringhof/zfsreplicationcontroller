@@ -1,5 +1,11 @@
 # Use termination messages for replication failures
 
+The output-derived Failure Diagnosis and controller-side sanitization portions
+of this decision are superseded by
+[ADR-0006](0006-use-a-transparent-syncoid-runtime.md). Kubernetes termination
+messages remain the Sender Failure Message transport, and the controller still
+does not read Pod logs.
+
 Sender Jobs publish one selected, concise, sanitized primary failure cause through the Kubernetes termination message instead of requiring the controller to recover machine-readable state from human-oriented pod logs. A Failure Diagnosis remains best-effort operator evidence rather than a stable classification, and detailed sanitized Syncoid output remains in pod logs for humans.
 
 ## Consequences

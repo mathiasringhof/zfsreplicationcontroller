@@ -9,8 +9,8 @@ compatibility or automation contract.
 - The manager and Receiver daemon initialize controller-runtime logging once at
   process startup with the production Zap logger. Controller-managed code uses
   the logger from its `context.Context`.
-- The Sender keeps concise `key=value` lifecycle lines alongside sanitized
-  Syncoid output on stderr.
+- The Sender forwards Syncoid standard output and standard error unchanged to
+  the corresponding container streams. It adds no normal lifecycle lines.
 - SSH, forced-command, and child-process streams remain explicit stdout and
   stderr. Operational logging must not corrupt command or protocol output.
 - Expected process startup or runtime failures produce one concise fatal
@@ -28,9 +28,10 @@ transitions. Repeated observations, unchanged reconciliations, expected
 waiting, and routine requeues belong at `V(1)` or are omitted.
 
 A Replication Run entering its defined `Failed` phase is a domain outcome, not
-automatically a controller error. Log that transition at `Info` with a
-sanitized reason. Error logs are for failures of the control mechanism, such as
-API access, authorization publication, reconciliation, or process startup.
+automatically a controller error. Log that transition at `Info` with the same
+opaque reason persisted in status. Error logs are for failures of the control
+mechanism, such as API access, authorization publication, reconciliation, or
+process startup.
 
 Important normal-level evidence includes:
 
@@ -38,15 +39,11 @@ Important normal-level evidence includes:
 - Receiver became available for a Run.
 - Sender Job created.
 - Replication succeeded or failed.
-- Sender started and completed.
 - Receiver began serving.
 
 `receiver serving` is emitted only after the cache has synchronized, the
 initial Receiver Authorization Snapshot has activated, and SSHD has started.
 It does not mean that a Receive Task or Kubernetes Pod has become Ready.
-
-The Sender and manager may each record the same replication outcome once. They
-are separate Pod log streams and report different observations.
 
 ## Error Ownership
 
@@ -87,14 +84,16 @@ Use the public API's source/target vocabulary. Avoid abbreviated `src` and
 `dst` field names. Log messages and field names may evolve and must not be
 parsed by automation.
 
-## Sensitive Output
+## Syncoid Output
 
-[ADR-0001](adr/0001-use-termination-messages-for-replication-failures.md)
-governs command-output capture and redaction. Syncoid output and returned
-command errors must cross the replication diagnosis boundary before reaching
-logs. Credentials, private-key material, credential paths, and unsafe raw
-command errors must not be logged.
+[ADR-0006](adr/0006-use-a-transparent-syncoid-runtime.md) governs Sender
+process output. Syncoid owns its output: the Runtime does not capture, redact,
+prefix, bound, normalize, or parse it. Credential contents and private-key
+material must not enter generated arguments. Credential file paths are ordinary
+process configuration rather than a redaction boundary.
 
+The Sender Failure Message is derived only from process startup or completion
+and crosses Kubernetes termination status without controller interpretation.
 CR status, Kubernetes conditions, metrics, and termination messages are the
 machine-readable surfaces. Controllers must not recover state by parsing Pod
 logs.
@@ -103,8 +102,9 @@ logs.
 
 Test logging policy rather than logger implementation:
 
-- Verify representative important events, redaction, and deliberate duplicate
-  suppression.
+- Verify representative important events and deliberate duplicate suppression.
+- Verify Sender stream bytes and stream selection at the Runtime seam; deployed
+  tests assert behavioral markers rather than complete Syncoid lines or order.
 - Assert exact counts only when once-per-transition behavior is an explicit
   requirement implemented by project code.
 - Do not assert timestamps, complete field sets, exact JSON encoding, full log

@@ -2,69 +2,65 @@ package main
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"os"
 
-	"github.com/mathias/zfsreplicationcontroller/internal/replication/diagnosis"
-	"github.com/mathias/zfsreplicationcontroller/internal/sender"
+	"github.com/mathias/zfsreplicationcontroller/internal/syncoidruntime"
 )
 
 const terminationMessagePath = "/dev/termination-log"
 
 func main() {
-	cfg, err := sender.SenderConfigFromEnv()
-	if err != nil {
-		os.Exit(publishFailure(err, os.Stderr, filePublisher{path: terminationMessagePath}))
-	}
 	os.Exit(run(
 		context.Background(),
-		cfg,
+		os.Args[1:],
+		os.Stdout,
 		os.Stderr,
-		sender.ExecRunner{},
+		func(ctx context.Context, arguments []string, stdout, stderr io.Writer) runtimeOutcome {
+			return syncoidruntime.Run(ctx, arguments, stdout, stderr)
+		},
 		filePublisher{path: terminationMessagePath},
 	))
 }
 
-type diagnosisPublisher interface {
-	Publish(diagnosis.Diagnosis) error
+type runtimeOutcome interface {
+	ExitCode() int
+	FailureMessage() string
+}
+
+type runtimeOperation func(context.Context, []string, io.Writer, io.Writer) runtimeOutcome
+
+type failureMessagePublisher interface {
+	Publish(string) error
 }
 
 type filePublisher struct {
 	path string
 }
 
-func (p filePublisher) Publish(value diagnosis.Diagnosis) error {
-	return os.WriteFile(p.path, []byte(value.String()), 0o600)
+func (p filePublisher) Publish(message string) error {
+	return os.WriteFile(p.path, []byte(message), 0o600)
 }
 
-func run(ctx context.Context, cfg sender.SenderConfig, stderr io.Writer, runner sender.CommandRunner, publisher diagnosisPublisher) int {
-	if err := sender.RunSenderWithLog(ctx, cfg, runner, stderr); err != nil {
-		return publishFailure(err, stderr, publisher)
+func run(
+	ctx context.Context,
+	arguments []string,
+	stdout io.Writer,
+	stderr io.Writer,
+	operation runtimeOperation,
+	publisher failureMessagePublisher,
+) int {
+	outcome := operation(ctx, arguments, stdout, stderr)
+	if outcome.ExitCode() == 0 {
+		return 0
 	}
-	return 0
-}
-
-func publishFailure(err error, stderr io.Writer, publisher diagnosisPublisher) int {
-	value := diagnosisFromError(err)
 	if publisher != nil {
-		if publishErr := publisher.Publish(value); publishErr != nil {
-			if _, logErr := fmt.Fprintf(stderr, "termination message publication failed error=%q\n", diagnosis.Sanitize(publishErr.Error()).String()); logErr != nil {
-				return 1
+		if err := publisher.Publish(outcome.FailureMessage()); err != nil && stderr != nil {
+			if _, writeErr := fmt.Fprintf(stderr, "publish Sender Failure Message: %q\n", err); writeErr != nil {
+				return outcome.ExitCode()
 			}
 		}
 	}
-	return 1
-}
-
-func diagnosisFromError(err error) diagnosis.Diagnosis {
-	type diagnosed interface {
-		Diagnosis() diagnosis.Diagnosis
-	}
-	var value diagnosed
-	if errors.As(err, &value) {
-		return value.Diagnosis()
-	}
-	return diagnosis.Sanitize(err.Error())
+	return outcome.ExitCode()
 }

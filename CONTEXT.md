@@ -18,8 +18,14 @@ A long-lived node-level replication endpoint that enforces the active Receiver A
 **Syncoid Replication Contract**:
 The matched agreement between one immutable Replication Run's sender invocation and Receiver Authorization Grant. It is translated as one paired result so Syncoid behavior and receive permission cannot drift.
 
-**Failure Diagnosis**:
-A concise, sanitized, best-effort explanation of why a replication attempt failed. It is intended for operators, not as a stable classification or an input to automated behavior.
+**Syncoid Runtime**:
+The focused process adapter that executes the fixed Syncoid executable with a ready argument vector and forwards standard output and standard error unchanged.
+
+**Syncoid Runtime Outcome**:
+The immutable completion result of one Syncoid Runtime operation. It contains only the final exit code and a Sender Failure Message.
+
+**Sender Failure Message**:
+A generic, bounded explanation of a Syncoid process startup or completion failure. It is transported through Kubernetes termination status without interpretation and never contains detail derived from Syncoid output.
 
 **Replication Run Success**:
 A terminal outcome indicating that the configured replication operation completed without reporting a failure. It does not assert that warning-level post-transfer work, such as target snapshot deletion, completed.

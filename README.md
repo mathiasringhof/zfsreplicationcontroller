@@ -234,7 +234,8 @@ the replication behavior:
   false. When true, Syncoid may destroy snapshots that exist only on the target
   after a successful sync. Use it only for strict mirror targets whose snapshot
   lifecycle is owned by the source.
-- `compress`: pass `--compress=<value>`. Defaults to `none` in the sender.
+- `compress`: pass `--compress=<value>`. The Syncoid Replication Contract
+  defaults it to `none`.
 - `receiveUnmounted`: pass `--recvoptions=u` when true. Defaults to true.
   Mounted receives are only authorized when this is false.
 - `receiveResumable`: pass `--no-resume` when false. Defaults to true.
@@ -291,12 +292,17 @@ the Replication Source. Receiver DaemonSet Pods publish their own node and Pod I
 Sender Jobs use `backoffLimit: 0`, `restartPolicy: Never`, and
 `automountServiceAccountToken: false`.
 
+The Sender forwards Syncoid standard output and standard error unchanged to its
+Pod log streams. Replication Run failure status receives only a generic bounded
+Sender Failure Message through Kubernetes termination status; inspect the
+retained Sender Job logs for Syncoid's detailed evidence.
+
 ## Operational Notes
 
 The target dataset must be passive and suitable for `syncoid` to receive into.
 
-The component boundaries, event policy, field conventions, redaction
-constraints, and testing approach for operational logs are documented in
+The component boundaries, event policy, field conventions, Syncoid stream
+ownership, and testing approach for operational logs are documented in
 [`docs/logging.md`](docs/logging.md).
 
 `forceDelete` is destructive. When enabled, the sender passes `--force-delete`
