@@ -1,0 +1,16 @@
+--- syncoid
++++ syncoid
+@@ -946,11 +946,11 @@
+ 	my $stdout;
+ 	my $ret;
+ 	if ($pvsize == 0) {
+ 		($stdout, $ret) = tee_stderr {
+-			system("$synccmd");
++			system("bash", "-o", "pipefail", "-c", $synccmd);
+ 		};
+ 	} else {
+ 		($stdout, $ret) = tee_stdout {
+-			system("$synccmd");
++			system("bash", "-o", "pipefail", "-c", $synccmd);
+ 		};
+ 	}

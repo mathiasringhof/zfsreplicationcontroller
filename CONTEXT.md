@@ -28,7 +28,7 @@ The immutable completion result of one Syncoid Runtime operation. It contains on
 A generic, bounded explanation of a Syncoid process startup or completion failure. It is transported through Kubernetes termination status without interpretation and never contains detail derived from Syncoid output.
 
 **Replication Run Success**:
-A terminal outcome indicating that the configured replication operation completed without reporting a failure. It does not assert that warning-level post-transfer work, such as target snapshot deletion, completed.
+A terminal outcome indicating that patched Syncoid exited successfully after every transfer-critical stage reported success. It does not assert that warning-level post-transfer work, such as target snapshot deletion, completed.
 _Avoid_: Warning-free success, clean mirror
 
 **Receiver Authorization Snapshot**:

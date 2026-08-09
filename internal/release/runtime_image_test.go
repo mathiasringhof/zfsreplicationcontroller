@@ -34,3 +34,36 @@ func TestRuntimeImagePinsSyncoid230(t *testing.T) {
 		t.Fatalf("Dockerfile still installs distro sanoid package")
 	}
 }
+
+func TestRuntimeImageAppliesSyncoidPipefailPatch(t *testing.T) {
+	dockerfileBytes, err := os.ReadFile("../../Dockerfile")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	patchBytes, err := os.ReadFile("../../patches/syncoid-pipefail.patch")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dockerfile := string(dockerfileBytes)
+	for _, want := range []string{
+		"bash \\",
+		"COPY patches/syncoid-pipefail.patch /tmp/syncoid-pipefail.patch",
+		"patch --batch --forward",
+		"/tmp/syncoid-pipefail.patch",
+	} {
+		if !strings.Contains(dockerfile, want) {
+			t.Fatalf("Dockerfile missing %q", want)
+		}
+	}
+
+	patch := string(patchBytes)
+	for _, want := range []string{
+		"system(\"bash\", \"-o\", \"pipefail\", \"-c\", $synccmd)",
+	} {
+		if !strings.Contains(patch, want) {
+			t.Fatalf("Syncoid patch missing %q", want)
+		}
+	}
+}

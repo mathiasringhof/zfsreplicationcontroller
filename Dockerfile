@@ -10,7 +10,9 @@ RUN CGO_ENABLED=0 go build -o /out/zfsrep-receiver ./cmd/zfsrep-receiver
 FROM docker.io/library/ubuntu:24.04
 ARG SANOID_VERSION=2.3.0
 ARG SANOID_SHA256=1d8735a271a34ec87ea46313a66f6f20bd38b583886924574d3c1f72ea173620
+COPY patches/syncoid-pipefail.patch /tmp/syncoid-pipefail.patch
 RUN apt-get update && apt-get install -y --no-install-recommends \
+		bash \
 		ca-certificates \
 		curl \
 		libcapture-tiny-perl \
@@ -18,18 +20,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 		mbuffer \
 		openssh-client \
 		openssh-server \
+		patch \
 		perl \
 		pv \
 		zfsutils-linux \
 	&& curl -fsSL "https://github.com/jimsalterjrs/sanoid/archive/refs/tags/v${SANOID_VERSION}.tar.gz" -o /tmp/sanoid.tar.gz \
 	&& printf '%s  /tmp/sanoid.tar.gz\n' "${SANOID_SHA256}" | sha256sum -c - \
 	&& tar -xzf /tmp/sanoid.tar.gz -C /tmp \
+	&& patch --batch --forward --fuzz=0 "/tmp/sanoid-${SANOID_VERSION}/syncoid" < /tmp/syncoid-pipefail.patch \
 	&& install -m 0755 "/tmp/sanoid-${SANOID_VERSION}/syncoid" /usr/local/bin/syncoid \
 	&& syncoid --version | grep -F "${SANOID_VERSION}" \
 	&& syncoid --help 2>&1 | grep -F -- "--include-snaps" \
 	&& syncoid --help 2>&1 | grep -F -- "--identifier" \
 	&& syncoid --help 2>&1 | grep -F -- "--delete-target-snapshots" \
-	&& rm -rf /tmp/sanoid.tar.gz "/tmp/sanoid-${SANOID_VERSION}" /var/lib/apt/lists/*
+	&& rm -rf /tmp/sanoid.tar.gz "/tmp/sanoid-${SANOID_VERSION}" /tmp/syncoid-pipefail.patch /var/lib/apt/lists/*
 RUN useradd -o -u 0 -g 0 -M -d /run/zfs-receiver -s /bin/sh zfs-recv \
 	&& usermod -p '*' zfs-recv
 COPY --from=build /out/manager /usr/local/bin/manager
