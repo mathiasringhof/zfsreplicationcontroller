@@ -67,3 +67,29 @@ func TestRuntimeImageAppliesSyncoidPipefailPatch(t *testing.T) {
 		}
 	}
 }
+
+func TestSyncoidPatchUsesCanonicalGNUContext(t *testing.T) {
+	patchBytes, err := os.ReadFile("../../patches/syncoid-pipefail.patch")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	expectedHunk := `@@ -947,11 +947,11 @@
+	my $ret;
+	if ($pvsize == 0) {
+		($stdout, $ret) = tee_stderr {
+-			system("$synccmd");
++			system("bash", "-o", "pipefail", "-c", $synccmd);
+		};
+	} else {
+		($stdout, $ret) = tee_stdout {
+-			system("$synccmd");
++			system("bash", "-o", "pipefail", "-c", $synccmd);
+		};
+	}
+` + " \n"
+	expectedHunk = strings.ReplaceAll(expectedHunk, "\n\t", "\n \t")
+	if !strings.Contains(string(patchBytes), expectedHunk) {
+		t.Fatalf("Syncoid patch is not in canonical GNU patch form:\n%s", patchBytes)
+	}
+}
