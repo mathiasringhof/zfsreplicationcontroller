@@ -218,8 +218,22 @@ Scheduled run history mirrors Kubernetes CronJob history limits. By default the
 controller keeps the last three successful scheduled runs and the last failed
 scheduled run. Set `successfulRunsHistoryLimit` or `failedRunsHistoryLimit` to
 `0` to remove terminal scheduled runs of that phase after reconciliation.
-Manually created `ZFSReplicationRun` objects are not pruned by schedule history
-limits.
+Only runs with a controller-owner reference matching the schedule's API version,
+kind, name, and UID count toward history limits or the `Forbid` policy. Runs from
+a deleted schedule incarnation and manually created runs carrying the schedule's
+label do not count. History deletion uses the observed run UID, so a replacement
+with the same name survives pruning.
+
+New scheduled run names include a digest of the exact schedule incarnation and
+due instant, distinguishing subminute ticks and names that normalize or truncate
+identically. Names and schedule label values stay within Kubernetes's 63-character
+limits. After upgrading, an existing run with the legacy minute-based name is
+reused only when its controller owner and `scheduled-at` annotation match the
+exact schedule and due instant; its original name is recorded in schedule status.
+Other legacy-name occupants do not prevent creation under the new naming scheme,
+subject to the concurrency policy. Existing owned legacy runs continue to count
+toward concurrency and history limits. Upgrading does not replay ticks already
+recorded in `lastScheduleTime`.
 
 ## Syncoid Options
 

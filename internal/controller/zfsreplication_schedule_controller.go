@@ -2,9 +2,11 @@ package controller
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	zfsv1 "github.com/mathias/zfsreplicationcontroller/api/v1alpha1"
@@ -68,7 +70,11 @@ func (r *ZFSReplicationScheduleReconciler) Reconcile(ctx context.Context, req ct
 		})
 	}
 
-	if policy == zfsv1.ConcurrencyPolicyForbid {
+	runName, err := r.existingScheduledRun(ctx, &schedule, due)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if runName == "" && policy == zfsv1.ConcurrencyPolicyForbid {
 		active, err := r.hasActiveRun(ctx, &schedule)
 		if err != nil {
 			return ctrl.Result{}, err
@@ -83,9 +89,11 @@ func (r *ZFSReplicationScheduleReconciler) Reconcile(ctx context.Context, req ct
 		}
 	}
 
-	runName := scheduledRunName(schedule.Name, due)
-	if err := r.ensureScheduledRun(ctx, &schedule, runName, due); err != nil {
-		return ctrl.Result{}, err
+	if runName == "" {
+		runName = scheduledRunName(&schedule, due)
+		if err := r.ensureScheduledRun(ctx, &schedule, runName, due); err != nil {
+			return ctrl.Result{}, err
+		}
 	}
 	result := requeueAt(now, next)
 	return r.patchScheduleStatusAndPruneHistory(ctx, &schedule, result, func(st *zfsv1.ZFSReplicationScheduleStatus) {
@@ -110,22 +118,35 @@ func (r *ZFSReplicationScheduleReconciler) now() time.Time {
 	return time.Now()
 }
 
-func (r *ZFSReplicationScheduleReconciler) ensureScheduledRun(ctx context.Context, schedule *zfsv1.ZFSReplicationSchedule, runName string, due time.Time) error {
+func (r *ZFSReplicationScheduleReconciler) existingScheduledRun(ctx context.Context, schedule *zfsv1.ZFSReplicationSchedule, due time.Time) (string, error) {
 	var existing zfsv1.ZFSReplicationRun
+	runName := scheduledRunName(schedule, due)
 	key := types.NamespacedName{Name: runName, Namespace: schedule.Namespace}
 	err := r.Get(ctx, key, &existing)
 	if err == nil {
-		return nil
+		return runName, validateScheduledRun(&existing, schedule, due)
 	}
 	if !apierrors.IsNotFound(err) {
-		return err
+		return "", err
 	}
+	// A legacy minute-based name is reusable only for this exact owner and tick.
+	key.Name = sanitizeName("zfsrep", schedule.Name, due.UTC().Format("20060102-1504"))
+	if err := r.Get(ctx, key, &existing); err != nil {
+		return "", client.IgnoreNotFound(err)
+	}
+	if scheduledRunMatchesTick(&existing, schedule, due) {
+		return existing.Name, nil
+	}
+	return "", nil
+}
+
+func (r *ZFSReplicationScheduleReconciler) ensureScheduledRun(ctx context.Context, schedule *zfsv1.ZFSReplicationSchedule, runName string, due time.Time) error {
 	run := &zfsv1.ZFSReplicationRun{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      runName,
 			Namespace: schedule.Namespace,
 			Labels: map[string]string{
-				labelPrefix + "/schedule": schedule.Name,
+				labelPrefix + "/schedule": scheduleRunLabel(schedule.Name),
 			},
 			Annotations: map[string]string{
 				labelPrefix + "/scheduled-at": due.UTC().Format(time.RFC3339),
@@ -136,16 +157,49 @@ func (r *ZFSReplicationScheduleReconciler) ensureScheduledRun(ctx context.Contex
 	if err := ctrl.SetControllerReference(schedule, run, r.Scheme); err != nil {
 		return err
 	}
-	return r.Create(ctx, run)
+	if err := r.Create(ctx, run); err != nil {
+		if !apierrors.IsAlreadyExists(err) {
+			return err
+		}
+		var existing zfsv1.ZFSReplicationRun
+		key := types.NamespacedName{Name: runName, Namespace: schedule.Namespace}
+		if err := r.Get(ctx, key, &existing); err != nil {
+			return err
+		}
+		return validateScheduledRun(&existing, schedule, due)
+	}
+	return nil
+}
+
+func runControlledBySchedule(run *zfsv1.ZFSReplicationRun, schedule *zfsv1.ZFSReplicationSchedule) bool {
+	owner := metav1.GetControllerOf(run)
+	return schedule.UID != "" && run.Namespace == schedule.Namespace && owner != nil &&
+		owner.APIVersion == zfsv1.SchemeGroupVersion.String() && owner.Kind == "ZFSReplicationSchedule" &&
+		owner.Name == schedule.Name && owner.UID == schedule.UID
+}
+
+func scheduledRunMatchesTick(run *zfsv1.ZFSReplicationRun, schedule *zfsv1.ZFSReplicationSchedule, due time.Time) bool {
+	if !runControlledBySchedule(run, schedule) {
+		return false
+	}
+	scheduledAt, err := time.Parse(time.RFC3339Nano, run.Annotations[labelPrefix+"/scheduled-at"])
+	return err == nil && scheduledAt.Equal(due)
+}
+
+func validateScheduledRun(run *zfsv1.ZFSReplicationRun, schedule *zfsv1.ZFSReplicationSchedule, due time.Time) error {
+	if !scheduledRunMatchesTick(run, schedule, due) {
+		return fmt.Errorf("scheduled run %s/%s conflicts with schedule ownership or due instant", run.Namespace, run.Name)
+	}
+	return nil
 }
 
 func (r *ZFSReplicationScheduleReconciler) hasActiveRun(ctx context.Context, schedule *zfsv1.ZFSReplicationSchedule) (bool, error) {
 	var runs zfsv1.ZFSReplicationRunList
-	if err := r.List(ctx, &runs, client.InNamespace(schedule.Namespace), client.MatchingLabels{labelPrefix + "/schedule": schedule.Name}); err != nil {
+	if err := r.List(ctx, &runs, client.InNamespace(schedule.Namespace), client.MatchingLabels{labelPrefix + "/schedule": scheduleRunLabel(schedule.Name)}); err != nil {
 		return false, err
 	}
 	for _, run := range runs.Items {
-		if run.Status.Phase.Active() {
+		if runControlledBySchedule(&run, schedule) && run.Status.Phase.Active() {
 			return true, nil
 		}
 	}
@@ -154,13 +208,16 @@ func (r *ZFSReplicationScheduleReconciler) hasActiveRun(ctx context.Context, sch
 
 func (r *ZFSReplicationScheduleReconciler) pruneScheduleRunHistory(ctx context.Context, schedule *zfsv1.ZFSReplicationSchedule) error {
 	var runs zfsv1.ZFSReplicationRunList
-	if err := r.List(ctx, &runs, client.InNamespace(schedule.Namespace), client.MatchingLabels{labelPrefix + "/schedule": schedule.Name}); err != nil {
+	if err := r.List(ctx, &runs, client.InNamespace(schedule.Namespace), client.MatchingLabels{labelPrefix + "/schedule": scheduleRunLabel(schedule.Name)}); err != nil {
 		return err
 	}
 
 	var successful []zfsv1.ZFSReplicationRun
 	var failed []zfsv1.ZFSReplicationRun
 	for _, run := range runs.Items {
+		if !runControlledBySchedule(&run, schedule) {
+			continue
+		}
 		switch run.Status.Phase {
 		case zfsv1.PhaseSucceeded:
 			successful = append(successful, run)
@@ -185,7 +242,7 @@ func (r *ZFSReplicationScheduleReconciler) pruneTerminalRuns(ctx context.Context
 
 	for i := 0; i < len(runs)-limit; i++ {
 		run := runs[i].DeepCopy()
-		if err := r.Delete(ctx, run); client.IgnoreNotFound(err) != nil {
+		if err := r.Delete(ctx, run, client.Preconditions{UID: &run.UID}); client.IgnoreNotFound(err) != nil {
 			return fmt.Errorf("delete old scheduled run %s/%s: %w", run.Namespace, run.Name, err)
 		}
 	}
@@ -241,8 +298,25 @@ func (r *ZFSReplicationScheduleReconciler) patchScheduleStatusAndPruneHistory(
 	return result, r.pruneScheduleRunHistory(ctx, schedule)
 }
 
-func scheduledRunName(scheduleName string, due time.Time) string {
-	return sanitizeName("zfsrep", scheduleName, due.UTC().Format("20060102-1504"))
+func scheduledRunName(schedule *zfsv1.ZFSReplicationSchedule, due time.Time) string {
+	identity := strings.Join([]string{
+		zfsv1.SchemeGroupVersion.String(), "ZFSReplicationSchedule",
+		schedule.Namespace, schedule.Name, string(schedule.UID), due.UTC().Format(time.RFC3339Nano),
+	}, "\x00")
+	sum := sha256.Sum256([]byte(identity))
+	prefix := normalizeDNSLabel(schedule.Name)
+	const prefixLength = dnsLabelMaxLength - len("zfsrep-") - 1 - 32
+	if len(prefix) > prefixLength {
+		prefix = strings.TrimRight(prefix[:prefixLength], "-")
+	}
+	return fmt.Sprintf("zfsrep-%s-%x", prefix, sum[:16])
+}
+
+func scheduleRunLabel(scheduleName string) string {
+	if len(scheduleName) <= dnsLabelMaxLength {
+		return scheduleName
+	}
+	return sanitizeName(scheduleName)
 }
 
 func validateConcurrencyPolicy(policy zfsv1.ConcurrencyPolicy) (zfsv1.ConcurrencyPolicy, error) {
