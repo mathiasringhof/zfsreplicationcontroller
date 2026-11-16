@@ -144,12 +144,17 @@ func (r *receiverAuthorizationReconciler) handlePublicationFailure(publicationEr
 	return nil
 }
 
+// overdueDeadlineRequeue delays reconciliation of a deadline that is already due.
+// Grant expiry is also enforced by OpenSSH expiry-time and by admission, so a
+// short delay never extends authority while avoiding a hot loop.
+const overdueDeadlineRequeue = time.Second
+
 func deadlineResult(now, next time.Time) ctrl.Result {
 	if next.IsZero() {
 		return ctrl.Result{}
 	}
 	if !next.After(now) {
-		return ctrl.Result{Requeue: true}
+		return ctrl.Result{RequeueAfter: overdueDeadlineRequeue}
 	}
 	return ctrl.Result{RequeueAfter: next.Sub(now)}
 }

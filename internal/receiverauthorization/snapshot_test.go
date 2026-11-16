@@ -34,8 +34,8 @@ func TestActivateUsesDeterministicImmutableSnapshot(t *testing.T) {
 	}
 	for _, want := range []string{
 		"# receiver-authorization-snapshot " + firstSnapshot + "\n",
-		"--snapshot-id " + firstSnapshot + " --grant-id " + grantID(first.TaskUID),
-		"--snapshot-id " + firstSnapshot + " --grant-id " + grantID(second.TaskUID),
+		"exec --grant-id " + candidateGrantID(t, first),
+		"exec --grant-id " + candidateGrantID(t, second),
 	} {
 		if !strings.Contains(string(content), want) {
 			t.Fatalf("authorized_keys = %q, want %q", content, want)
@@ -44,7 +44,7 @@ func TestActivateUsesDeterministicImmutableSnapshot(t *testing.T) {
 	assertMode(t, manifest, 0o600)
 	assertMode(t, module.generationPath(firstSnapshot), 0o700)
 	assertMode(t, filepath.Join(module.generationPath(firstSnapshot), "authorized_keys"), 0o400)
-	assertMode(t, filepath.Join(module.generationPath(firstSnapshot), "grants", grantID(first.TaskUID)+".json"), 0o400)
+	assertMode(t, filepath.Join(module.generationPath(firstSnapshot), "grants", candidateGrantID(t, first)+".json"), 0o400)
 
 	activation, err = module.Replace([]Candidate{second, first})
 	if err != nil {
@@ -112,7 +112,7 @@ func TestSnapshotIdentityIncludesEveryAuthorityBearingGrantField(t *testing.T) {
 	}
 }
 
-func TestLeaseRenewalActivatesNewSnapshotWithoutInvalidatingAdmittedPlan(t *testing.T) {
+func TestLeaseRenewalPreservesAuthenticatedReferenceAndAdmittedPlan(t *testing.T) {
 	now := time.Date(2026, 7, 20, 12, 0, 0, 0, time.UTC)
 	manifest := filepath.Join(t.TempDir(), "authorized_keys")
 	module := New(manifest)
@@ -122,7 +122,7 @@ func TestLeaseRenewalActivatesNewSnapshotWithoutInvalidatingAdmittedPlan(t *test
 		t.Fatal(err)
 	}
 	oldSnapshot := activeSnapshotID(t, manifest)
-	oldReference := snapshotReference(t, oldSnapshot, grantID(candidate.TaskUID))
+	oldReference := grantReference(t, candidateGrantID(t, candidate))
 	plan, err := module.Admit(oldReference, "zfs receive -u tank/dst")
 	if err != nil {
 		t.Fatal(err)
@@ -140,10 +140,10 @@ func TestLeaseRenewalActivatesNewSnapshotWithoutInvalidatingAdmittedPlan(t *test
 	if renewedSnapshot == oldSnapshot {
 		t.Fatalf("renewed lease retained snapshot ID %q", oldSnapshot)
 	}
-	if _, err := module.Admit(oldReference, "zfs receive -u tank/dst"); err == nil || !strings.Contains(err.Error(), "snapshot is not active") {
-		t.Fatalf("old snapshot admitted a later command after renewal: %v", err)
+	if _, err := module.Admit(oldReference, "zfs receive -u tank/dst"); err != nil {
+		t.Fatalf("authenticated grant rejected after renewal: %v", err)
 	}
-	renewedReference := snapshotReference(t, renewedSnapshot, grantID(candidate.TaskUID))
+	renewedReference := grantReference(t, candidateGrantID(t, candidate))
 	if _, err := module.Admit(renewedReference, "zfs receive -u tank/dst"); err != nil {
 		t.Fatalf("renewed snapshot admission failed: %v", err)
 	}
@@ -176,7 +176,7 @@ func TestRestartAcceptsDurablyRenewedFreshTaskState(t *testing.T) {
 	if !activation.Changed || len(activation.Outcomes()) != 1 || activation.Outcomes()[0].Rejection != "" {
 		t.Fatalf("restart activation = %#v, want renewed fresh task accepted", activation)
 	}
-	reference := snapshotReference(t, activeSnapshotID(t, manifest), grantID(renewedState.TaskUID))
+	reference := grantReference(t, candidateGrantID(t, renewedState))
 	if _, err := newProcess.Admit(reference, "zfs receive -u tank/dst"); err != nil {
 		t.Fatalf("renewed task admission after restart failed: %v", err)
 	}
@@ -312,7 +312,7 @@ func TestActivateFailureAroundCommitKeepsAuthorityOrReturnsWarning(t *testing.T)
 	}
 }
 
-func TestAdmitRequiresExactActiveSnapshotAndRechecksBeforeReturning(t *testing.T) {
+func TestAdmitRequiresActiveGrantAndRechecksSnapshotBeforeReturning(t *testing.T) {
 	now := time.Date(2026, 7, 20, 12, 0, 0, 0, time.UTC)
 	manifest := filepath.Join(t.TempDir(), "authorized_keys")
 	module := New(manifest)
@@ -322,28 +322,23 @@ func TestAdmitRequiresExactActiveSnapshotAndRechecksBeforeReturning(t *testing.T
 	if _, err := module.Replace([]Candidate{first}); err != nil {
 		t.Fatal(err)
 	}
-	firstSnapshot := activeSnapshotID(t, manifest)
-	firstReference := snapshotReference(t, firstSnapshot, grantID(first.TaskUID))
+	firstReference := grantReference(t, candidateGrantID(t, first))
 	plan, err := module.Admit(firstReference, "zfs receive -u tank/first")
 	if err != nil {
 		t.Fatal(err)
 	}
+	module.hooks.removeGeneration = func(string) error { return errors.New("cleanup delayed") }
 	if _, err := module.Replace([]Candidate{second}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := module.Admit(firstReference, "zfs receive -u tank/first"); err == nil || !strings.Contains(err.Error(), "snapshot is not active") {
-		t.Fatalf("retired snapshot admission error = %v, want inactive rejection", err)
+	if _, err := module.Admit(firstReference, "zfs receive -u tank/first"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("retired grant admission error = %v, want absent active grant rejection", err)
 	}
 	if plan.command.kind == "" {
 		t.Fatal("plan admitted before activation was invalidated")
 	}
 
-	secondSnapshot := activeSnapshotID(t, manifest)
-	wrongGrant := snapshotReference(t, secondSnapshot, grantID(first.TaskUID))
-	if _, err := module.Admit(wrongGrant, "zfs receive -u tank/first"); err == nil {
-		t.Fatal("snapshot/grant mismatch admission succeeded")
-	}
-	secondReference := snapshotReference(t, secondSnapshot, grantID(second.TaskUID))
+	secondReference := grantReference(t, candidateGrantID(t, second))
 	module.hooks.beforeAdmissionRecheck = func() {
 		module.hooks.beforeAdmissionRecheck = nil
 		_, activateErr := module.Replace([]Candidate{first})
@@ -366,7 +361,7 @@ func TestAdmitFailsClosedForMalformedManifestAndSymlinkedGenerationPath(t *testi
 		t.Fatal(err)
 	}
 	snapshotID := activeSnapshotID(t, manifest)
-	reference := snapshotReference(t, snapshotID, grantID(candidate.TaskUID))
+	reference := grantReference(t, candidateGrantID(t, candidate))
 	activeData, err := os.ReadFile(manifest)
 	if err != nil {
 		t.Fatal(err)
@@ -448,9 +443,9 @@ func TestReplaceRejectsSymlinkedRuntimeAncestor(t *testing.T) {
 	}
 }
 
-func snapshotReference(t *testing.T, snapshotID, grantID string) Reference {
+func grantReference(t *testing.T, grantID string) Reference {
 	t.Helper()
-	reference, err := ReferenceFromArgs([]string{"--snapshot-id", snapshotID, "--grant-id", grantID})
+	reference, err := ReferenceFromArgs([]string{"--grant-id", grantID})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -497,4 +492,13 @@ func validSnapshotCandidate(uid, key, dataset string, expiry time.Time) Candidat
 		ReceiveUnmounted:    true,
 		Compression:         "none",
 	}
+}
+
+func candidateGrantID(t *testing.T, candidate Candidate) string {
+	t.Helper()
+	key, err := canonicalPublicKey(candidate.AuthorizedPublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return grantID(candidate.TaskUID, key)
 }

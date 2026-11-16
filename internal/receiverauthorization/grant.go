@@ -213,8 +213,12 @@ func canonicalPublicKey(raw string) (string, error) {
 	return strings.TrimSpace(string(ssh.MarshalAuthorizedKey(key))), nil
 }
 
-func grantID(taskUID string) string {
-	sum := sha256.Sum256([]byte(taskUID))
+// The Receive Task CRD makes destination and policy immutable for a task UID.
+// Bind the canonical public key explicitly as well so an old SSH connection
+// cannot inherit authority even if a caller supplies a different key for that
+// UID. Lease expiry is deliberately excluded: it is resolved at each admission.
+func grantID(taskUID, canonicalKey string) string {
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%q:%q", taskUID, canonicalKey)))
 	return "grant-" + hex.EncodeToString(sum[:])
 }
 

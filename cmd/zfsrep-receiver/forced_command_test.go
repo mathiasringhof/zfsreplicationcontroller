@@ -14,10 +14,7 @@ import (
 	"github.com/mathias/zfsreplicationcontroller/internal/receiverauthorization"
 )
 
-const (
-	testReceiverTaskUID  = "11111111-2222-3333-4444-555555555555"
-	testReceiverPolicyID = "grant-666ff6ccaa5b3c07feaa3a95d3a4bd2c46ac9e9abdb09ca9133528d3dc1e8952"
-)
+const testReceiverTaskUID = "11111111-2222-3333-4444-555555555555"
 
 type receiverCommandPolicy struct {
 	TargetDataset string
@@ -440,11 +437,16 @@ func testAuthorizationReference(t *testing.T, dir string) receiverauthorization.
 	if err != nil {
 		t.Fatal(err)
 	}
-	header := strings.Fields(strings.SplitN(string(data), "\n", 2)[0])
-	if len(header) != 3 {
-		t.Fatalf("manifest header = %q, want snapshot identity", data)
+	_, command, found := strings.Cut(string(data), `command="`)
+	if !found {
+		t.Fatalf("manifest = %q, want forced command", data)
 	}
-	reference, err := receiverauthorization.ReferenceFromArgs([]string{"--snapshot-id", header[2], "--grant-id", testReceiverPolicyID})
+	command, _, _ = strings.Cut(command, `"`)
+	args := strings.Fields(command)
+	if len(args) != 4 || args[1] != "exec" {
+		t.Fatalf("unexpected forced command %q", command)
+	}
+	reference, err := receiverauthorization.ReferenceFromArgs(args[2:])
 	if err != nil {
 		t.Fatal(err)
 	}

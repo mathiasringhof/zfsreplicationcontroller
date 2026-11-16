@@ -5,6 +5,14 @@ metadata:
   namespace: zfsreplication-smoke
 rules:
   - apiGroups:
+      - coordination.k8s.io
+    resources:
+      - leases
+    verbs:
+      - get
+      - create
+      - update
+  - apiGroups:
       - zfsreplication.ringhof.io
     resources:
       - zfsreplicationschedules

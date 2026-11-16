@@ -39,3 +39,20 @@ func TestManagerOptionsWatchAllNamespacesByDefault(t *testing.T) {
 		t.Fatalf("DefaultNamespaces = %#v, want empty all-namespaces cache", opts.Cache.DefaultNamespaces)
 	}
 }
+
+func TestDestinationLockNamespace(t *testing.T) {
+	for _, tt := range []struct {
+		name, watched, podNamespace, want string
+	}{
+		{"cluster", "", "zfsreplication-system", "zfsreplication-system"},
+		{"namespaced", "storage", "zfsreplication-system", "storage"},
+		{"trimmed namespaced", " storage ", "zfsreplication-system", "storage"},
+		{"blank watches cluster", "  ", "zfsreplication-system", "zfsreplication-system"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := destinationLockNamespace(tt.watched, tt.podNamespace); got != tt.want {
+				t.Fatalf("destinationLockNamespace() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}

@@ -47,7 +47,7 @@ func TestLeaseLapseIsProcessLocalTerminalWithoutCancellingAdmittedPlan(t *testin
 	if _, err := module.Replace([]Candidate{candidate}); err != nil {
 		t.Fatal(err)
 	}
-	reference := snapshotReference(t, activeSnapshotID(t, manifestPath), grantID(candidate.TaskUID))
+	reference := grantReference(t, candidateGrantID(t, candidate))
 	plan, err := module.Admit(reference, "echo -n admitted")
 	if err != nil {
 		t.Fatal(err)
@@ -72,8 +72,8 @@ func TestLeaseLapseIsProcessLocalTerminalWithoutCancellingAdmittedPlan(t *testin
 	if outcome := activation.Outcomes()[0]; !strings.Contains(outcome.Rejection, "expired") {
 		t.Fatalf("lapse outcome = %#v, want expiry rejection", outcome)
 	}
-	if _, err := module.Admit(reference, "echo -n denied"); err == nil || !strings.Contains(err.Error(), "snapshot is not active") {
-		t.Fatalf("post-lapse Admit() error = %v, want inactive snapshot rejection", err)
+	if _, err := module.Admit(reference, "echo -n denied"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("post-lapse Admit() error = %v, want absent active grant rejection", err)
 	}
 
 	renewed := candidate

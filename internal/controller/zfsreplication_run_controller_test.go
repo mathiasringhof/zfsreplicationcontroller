@@ -1515,7 +1515,7 @@ func TestRunReconcileLogsDestinationWaitOnlyOnTransition(t *testing.T) {
 	if result.RequeueAfter == 0 {
 		t.Fatalf("RequeueAfter = %v, want destination wait", result.RequeueAfter)
 	}
-	wantReason := "waiting for active run manual-active to finish receiving into tank/dst on worker-b"
+	wantReason := "waiting for active run storage/manual-active to finish receiving into tank/dst on worker-b"
 	assertLogEntry(t, logs, "waiting for replication destination", map[string]string{
 		"namespace":     run.Namespace,
 		"run":           run.Name,
@@ -1830,11 +1830,12 @@ func newRunReconciler(t *testing.T, objs ...client.Object) *ZFSReplicationRunRec
 	scheme := newTestScheme(t)
 	c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&zfsv1.ZFSReplicationRun{}, &zfsv1.ZFSReceiveTask{}).WithObjects(objs...).Build()
 	return &ZFSReplicationRunReconciler{
-		Client:            c,
-		APIReader:         c,
-		Scheme:            scheme,
-		ReleaseImage:      "sender:test",
-		ReceiverNamespace: "zfsreplication-system",
+		Client:                   c,
+		APIReader:                c,
+		Scheme:                   scheme,
+		ReleaseImage:             "sender:test",
+		ReceiverNamespace:        "zfsreplication-system",
+		DestinationLockNamespace: "zfsreplication-system",
 	}
 }
 
@@ -1857,11 +1858,12 @@ func newRunReconcilerWithInterceptors(t *testing.T, funcs interceptor.Funcs, obj
 		WithInterceptorFuncs(funcs).
 		Build()
 	return &ZFSReplicationRunReconciler{
-		Client:            c,
-		APIReader:         c,
-		Scheme:            scheme,
-		ReleaseImage:      "sender:test",
-		ReceiverNamespace: "zfsreplication-system",
+		Client:                   c,
+		APIReader:                c,
+		Scheme:                   scheme,
+		ReleaseImage:             "sender:test",
+		ReceiverNamespace:        "zfsreplication-system",
+		DestinationLockNamespace: "zfsreplication-system",
 	}
 }
 

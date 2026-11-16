@@ -48,8 +48,7 @@ func TestCompileCandidatesUsesExactTaskUIDAndPreservesMountedReceiveDenial(t *te
 			t.Fatalf("authorized key contains user-controlled authority value %q: %q", disallowed, keys[0])
 		}
 	}
-	snapshotID := activeSnapshotID(t, module.manifestPath)
-	reference, err := ReferenceFromArgs([]string{"--snapshot-id", snapshotID, "--grant-id", grantID(candidate.TaskUID)})
+	reference, err := ReferenceFromArgs([]string{"--grant-id", candidateGrantID(t, candidate)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -62,8 +61,8 @@ func TestCompileCandidatesUsesExactTaskUIDAndPreservesMountedReceiveDenial(t *te
 	replacement.TaskUID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
 	replacement.TargetDataset = "tank/replacement"
 	replacement.ReceiveUnmounted = true
-	if grantID(replacement.TaskUID) == grantID(candidate.TaskUID) {
-		t.Fatalf("replacement grant ID = %q, want identity distinct from old task incarnation", grantID(replacement.TaskUID))
+	if candidateGrantID(t, replacement) == candidateGrantID(t, candidate) {
+		t.Fatalf("replacement grant ID = %q, want identity distinct from old task incarnation", candidateGrantID(t, replacement))
 	}
 	replacementCompilation := compileCandidates(now, []Candidate{replacement})
 	if _, err := activateTestKeys(module, replacementCompilation); err != nil {
@@ -72,8 +71,7 @@ func TestCompileCandidatesUsesExactTaskUIDAndPreservesMountedReceiveDenial(t *te
 	if _, err := module.Admit(reference, "zfs receive tank/dst"); err == nil {
 		t.Fatal("old task reference admitted replacement authority")
 	}
-	replacementSnapshotID := activeSnapshotID(t, module.manifestPath)
-	replacementReference, err := ReferenceFromArgs([]string{"--snapshot-id", replacementSnapshotID, "--grant-id", grantID(replacement.TaskUID)})
+	replacementReference, err := ReferenceFromArgs([]string{"--grant-id", candidateGrantID(t, replacement)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -84,18 +82,26 @@ func TestCompileCandidatesUsesExactTaskUIDAndPreservesMountedReceiveDenial(t *te
 
 func TestReferenceFromArgsRejectsInvalidGrantReference(t *testing.T) {
 	t.Parallel()
-	validSnapshot := "snapshot-0000000000000000000000000000000000000000000000000000000000000000"
 	for _, args := range [][]string{
 		nil,
 		{"--policy-id", "storage/receive-task"},
-		{"--snapshot-id", "snapshot-../../replacement", "--grant-id", grantID("11111111-2222-3333-4444-555555555555")},
-		{"--snapshot-id", validSnapshot, "--grant-id", "storage/receive-task"},
-		{"--snapshot-id", validSnapshot, "--grant-id", "grant-../../replacement"},
-		{"--snapshot-id", validSnapshot, "--grant-id", grantID("11111111-2222-3333-4444-555555555555"), "extra"},
+		{"--grant-id", "storage/receive-task"},
+		{"--grant-id", "grant-../../replacement"},
+		{"--grant-id", testPolicyID, "extra"},
 	} {
 		if _, err := ReferenceFromArgs(args); err == nil {
 			t.Fatalf("ReferenceFromArgs(%q) error = nil, want rejection", args)
 		}
+	}
+}
+
+func TestReferenceFromArgsUsesOnlyStableGrantID(t *testing.T) {
+	id := "grant-" + strings.Repeat("0", 64)
+	if _, err := ReferenceFromArgs([]string{"--grant-id", id}); err != nil {
+		t.Fatalf("stable grant reference: %v", err)
+	}
+	if _, err := ReferenceFromArgs([]string{"--snapshot-id", "snapshot-" + strings.Repeat("0", 64), "--grant-id", id}); err == nil {
+		t.Fatal("removed snapshot-id flag was accepted")
 	}
 }
 
@@ -155,7 +161,7 @@ func TestCompileCandidatesStoresExplicitDefaultCompression(t *testing.T) {
 		t.Fatal(err)
 	}
 	snapshotID := activeSnapshotID(t, module.manifestPath)
-	data, err := os.ReadFile(filepath.Join(module.generationPath(snapshotID), "grants", grantID(candidate.TaskUID)+".json"))
+	data, err := os.ReadFile(filepath.Join(module.generationPath(snapshotID), "grants", candidateGrantID(t, candidate)+".json"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -234,6 +240,10 @@ func TestAdmitRejectsMalformedOrUnknownPersistedGrantFields(t *testing.T) {
 		{name: "malformed field", mutate: func(fields map[string]json.RawMessage) { fields["allowMount"] = json.RawMessage(`"false"`) }},
 		{name: "null capability", mutate: func(fields map[string]json.RawMessage) { fields["allowMount"] = json.RawMessage("null") }},
 		{name: "noncanonical compression", mutate: func(fields map[string]json.RawMessage) { fields["compression"] = json.RawMessage(`""`) }},
+		{name: "substituted public key", mutate: func(fields map[string]json.RawMessage) {
+			fields["authorizedPublicKey"] = json.RawMessage(`"` + strings.TrimSuffix(otherAuthorizedPublicKey, " unrelated") + `"`)
+		}},
+		{name: "substituted task UID", mutate: func(fields map[string]json.RawMessage) { fields["taskUID"] = json.RawMessage(`"replacement-task"`) }},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			compiled := compileCandidates(now, []Candidate{validCandidate(now, "11111111-2222-3333-4444-555555555555", testAuthorizedPublicKey)})
@@ -243,7 +253,7 @@ func TestAdmitRejectsMalformedOrUnknownPersistedGrantFields(t *testing.T) {
 				t.Fatal(err)
 			}
 			snapshotID := activeSnapshotID(t, module.manifestPath)
-			path := filepath.Join(module.generationPath(snapshotID), "grants", grantID("11111111-2222-3333-4444-555555555555")+".json")
+			path := filepath.Join(module.generationPath(snapshotID), "grants", grantID(compiled.grants[0].TaskUID, compiled.grants[0].AuthorizedPublicKey)+".json")
 			data, err := os.ReadFile(path)
 			if err != nil {
 				t.Fatal(err)
@@ -263,7 +273,7 @@ func TestAdmitRejectsMalformedOrUnknownPersistedGrantFields(t *testing.T) {
 			if err := os.WriteFile(path, data, 0o400); err != nil {
 				t.Fatal(err)
 			}
-			reference, err := ReferenceFromArgs([]string{"--snapshot-id", snapshotID, "--grant-id", grantID("11111111-2222-3333-4444-555555555555")})
+			reference, err := ReferenceFromArgs([]string{"--grant-id", grantID(compiled.grants[0].TaskUID, compiled.grants[0].AuthorizedPublicKey)})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -286,7 +296,7 @@ func TestAdmitRejectsDuplicatePersistedGrantFields(t *testing.T) {
 		t.Fatal(err)
 	}
 	snapshotID := activeSnapshotID(t, module.manifestPath)
-	path := filepath.Join(module.generationPath(snapshotID), "grants", grantID(uid)+".json")
+	path := filepath.Join(module.generationPath(snapshotID), "grants", grantID(compiled.grants[0].TaskUID, compiled.grants[0].AuthorizedPublicKey)+".json")
 	data, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
@@ -299,7 +309,7 @@ func TestAdmitRejectsDuplicatePersistedGrantFields(t *testing.T) {
 		t.Fatal(err)
 	}
 	module.now = func() time.Time { return now }
-	reference, err := ReferenceFromArgs([]string{"--snapshot-id", snapshotID, "--grant-id", grantID(uid)})
+	reference, err := ReferenceFromArgs([]string{"--grant-id", grantID(compiled.grants[0].TaskUID, compiled.grants[0].AuthorizedPublicKey)})
 	if err != nil {
 		t.Fatal(err)
 	}

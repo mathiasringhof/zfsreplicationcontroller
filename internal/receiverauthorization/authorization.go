@@ -31,11 +31,10 @@ type leaseState struct {
 	lapsed map[string]struct{}
 }
 
-// Reference is an opaque receiver authorization reference parsed from a
-// forced-command invocation.
+// Reference identifies the authenticated Receive Task and canonical public key,
+// independently of the snapshot active when SSH authentication took place.
 type Reference struct {
-	snapshotID string
-	grantID    string
+	grantID string
 }
 
 // ReferenceFromArgs parses the authorization reference carried by a
@@ -44,8 +43,6 @@ func ReferenceFromArgs(args []string) (Reference, error) {
 	fs := flag.NewFlagSet("exec", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	var grantID string
-	var snapshotID string
-	fs.StringVar(&snapshotID, "snapshot-id", "", "receiver authorization snapshot ID")
 	fs.StringVar(&grantID, "grant-id", "", "receiver authorization grant ID")
 	if err := fs.Parse(args); err != nil {
 		return Reference{}, err
@@ -53,19 +50,13 @@ func ReferenceFromArgs(args []string) (Reference, error) {
 	if fs.NArg() != 0 {
 		return Reference{}, fmt.Errorf("unexpected receiver authorization reference arguments")
 	}
-	if snapshotID == "" {
-		return Reference{}, fmt.Errorf("receiver authorization snapshot ID is required")
-	}
-	if !validSnapshotID(snapshotID) {
-		return Reference{}, fmt.Errorf("invalid receiver authorization snapshot ID %q", snapshotID)
-	}
 	if grantID == "" {
 		return Reference{}, fmt.Errorf("receiver authorization grant ID is required")
 	}
 	if !validGrantID(grantID) {
 		return Reference{}, fmt.Errorf("invalid receiver authorization grant ID %q", grantID)
 	}
-	return Reference{snapshotID: snapshotID, grantID: grantID}, nil
+	return Reference{grantID: grantID}, nil
 }
 
 // New constructs a Receiver Authorization module backed by one stable
@@ -78,20 +69,21 @@ func New(manifestPath string) Module {
 	}
 }
 
-// Admit resolves the referenced policy and authorizes the original SSH
-// command into an opaque executable plan.
+// Admit resolves the grant in the currently active snapshot and authorizes the
+// original SSH command into an opaque executable plan.
 func (m Module) Admit(reference Reference, originalCommand string) (Plan, error) {
 	if err := validateManifestPath(m.manifestPath); err != nil {
 		return Plan{}, err
 	}
-	if err := m.requireActiveSnapshot(reference.snapshotID); err != nil {
+	snapshotID, err := m.activeSnapshot()
+	if err != nil {
 		return Plan{}, err
 	}
-	grantDir := filepath.Join(m.generationPath(reference.snapshotID), "grants")
-	if err := requireSafeGenerationDirectory(filepath.Dir(m.manifestPath), m.runtimeRoot(), m.generationsRoot(), m.generationPath(reference.snapshotID), grantDir); err != nil {
+	grantDir := filepath.Join(m.generationPath(snapshotID), "grants")
+	if err := requireSafeGenerationDirectory(filepath.Dir(m.manifestPath), m.runtimeRoot(), m.generationsRoot(), m.generationPath(snapshotID), grantDir); err != nil {
 		return Plan{}, err
 	}
-	if err := verifySnapshotGrantSet(grantDir, reference.snapshotID); err != nil {
+	if err := verifySnapshotGrantSet(grantDir, snapshotID); err != nil {
 		return Plan{}, err
 	}
 	grantPath, err := grantPathForID(grantDir, reference.grantID)
@@ -112,32 +104,46 @@ func (m Module) Admit(reference Reference, originalCommand string) (Plan, error)
 	if m.hooks.beforeAdmissionRecheck != nil {
 		m.hooks.beforeAdmissionRecheck()
 	}
-	if err := m.requireActiveSnapshot(reference.snapshotID); err != nil {
+	// Expiry may have passed during authorization. A concurrent publication or
+	// cleanup may also retire this generation; missing files fail closed, while
+	// an already returned Plan owns its command independently of these files.
+	if _, err := readGrantPolicy(grantPath, reference.grantID, m.now()); err != nil {
+		return Plan{}, err
+	}
+	if err := m.requireActiveSnapshot(snapshotID); err != nil {
 		return Plan{}, err
 	}
 	return Plan{command: command}, nil
 }
 
 func (m Module) requireActiveSnapshot(expected string) error {
-	active, manifest, err := readActiveManifest(m.manifestPath)
+	active, err := m.activeSnapshot()
 	if err != nil {
-		return fmt.Errorf("read active receiver authorization snapshot: %w", err)
+		return err
 	}
 	if active != expected {
 		return fmt.Errorf("receiver authorization snapshot is not active")
 	}
+	return nil
+}
+
+func (m Module) activeSnapshot() (string, error) {
+	active, manifest, err := readActiveManifest(m.manifestPath)
+	if err != nil {
+		return "", fmt.Errorf("read active receiver authorization snapshot: %w", err)
+	}
 	generationPath := m.generationPath(active)
 	if err := requireSafeGenerationDirectory(filepath.Dir(m.manifestPath), m.runtimeRoot(), m.generationsRoot(), generationPath); err != nil {
-		return err
+		return "", err
 	}
 	generationManifest, err := readSafeRegularFile(filepath.Join(generationPath, "authorized_keys"), "receiver authorization generation manifest")
 	if err != nil {
-		return err
+		return "", err
 	}
 	if !bytes.Equal(manifest, generationManifest) {
-		return fmt.Errorf("active receiver authorization manifest content mismatch")
+		return "", fmt.Errorf("active receiver authorization manifest content mismatch")
 	}
-	return nil
+	return active, nil
 }
 
 // Plan is an admitted command whose authorized arguments are private to this
@@ -256,7 +262,7 @@ func readGrantPolicy(path, expectedGrantID string, now time.Time) (commandPolicy
 	if err != nil {
 		return commandPolicy{}, fmt.Errorf("parse receiver grant: %w", err)
 	}
-	if grantID(compiledGrant.TaskUID) != expectedGrantID {
+	if grantID(compiledGrant.TaskUID, compiledGrant.AuthorizedPublicKey) != expectedGrantID {
 		return commandPolicy{}, fmt.Errorf("receiver grant identity does not match reference")
 	}
 	if err := validateGrant(now, compiledGrant); err != nil {

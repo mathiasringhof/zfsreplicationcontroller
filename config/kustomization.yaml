@@ -7,6 +7,8 @@ resources:
   - rbac/receiver_service_account.yaml
   - rbac/role.yaml
   - rbac/role_binding.yaml
+  - rbac/destination_lock_role.yaml
+  - rbac/destination_lock_role_binding.yaml
   - rbac/receiver_role.yaml
   - rbac/receiver_role_binding.yaml
   - manager/deployment.yaml

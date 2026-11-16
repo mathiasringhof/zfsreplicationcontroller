@@ -15,10 +15,9 @@ import (
 	"time"
 )
 
-const (
-	testTaskUID  = "11111111-2222-3333-4444-555555555555"
-	testPolicyID = "grant-666ff6ccaa5b3c07feaa3a95d3a4bd2c46ac9e9abdb09ca9133528d3dc1e8952"
-)
+const testTaskUID = "11111111-2222-3333-4444-555555555555"
+
+var testPolicyID = grantID(testTaskUID, strings.TrimSuffix(testAuthorizedPublicKey, " receiver"))
 
 func TestModuleAdmitsAllowedCommand(t *testing.T) {
 	dir := t.TempDir()
@@ -287,7 +286,7 @@ func writeTestPolicy(t *testing.T, dir, policy string) {
 	t.Helper()
 	fields := map[string]json.RawMessage{
 		"taskUID":                    json.RawMessage(`"` + testTaskUID + `"`),
-		"authorizedPublicKey":        json.RawMessage(`"` + testAuthorizedPublicKey + `"`),
+		"authorizedPublicKey":        json.RawMessage(`"` + strings.TrimSuffix(testAuthorizedPublicKey, " receiver") + `"`),
 		"targetDataset":              json.RawMessage(`"tank/dst"`),
 		"receiveUnmounted":           json.RawMessage("false"),
 		"receiveResumable":           json.RawMessage("false"),
@@ -332,8 +331,7 @@ func writeTestPolicy(t *testing.T, dir, policy string) {
 
 func testReference(t *testing.T, dir string) Reference {
 	t.Helper()
-	snapshotID := activeSnapshotID(t, filepath.Join(dir, "authorized_keys"))
-	reference, err := ReferenceFromArgs([]string{"--snapshot-id", snapshotID, "--grant-id", testPolicyID})
+	reference, err := ReferenceFromArgs([]string{"--grant-id", testPolicyID})
 	if err != nil {
 		t.Fatal(err)
 	}
