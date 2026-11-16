@@ -210,7 +210,7 @@ func (m Module) activate(compilation compilation) (Activation, error) {
 func canonicalSnapshot(grants []grant) ([]grant, string, error) {
 	canonical := append([]grant(nil), grants...)
 	sort.Slice(canonical, func(i, j int) bool {
-		return grantID(canonical[i].TaskUID) < grantID(canonical[j].TaskUID)
+		return grantID(canonical[i].TaskUID, canonical[i].AuthorizedPublicKey) < grantID(canonical[j].TaskUID, canonical[j].AuthorizedPublicKey)
 	})
 	data, err := json.Marshal(canonical)
 	if err != nil {
@@ -229,8 +229,8 @@ func renderManifest(grants []grant, snapshotID string) ([]byte, error) {
 	content.WriteString(snapshotID)
 	content.WriteByte('\n')
 	for _, compiledGrant := range grants {
-		id := grantID(compiledGrant.TaskUID)
-		forcedCommand := receiverCommandPath + " exec --snapshot-id " + snapshotID + " --grant-id " + id
+		id := grantID(compiledGrant.TaskUID, compiledGrant.AuthorizedPublicKey)
+		forcedCommand := receiverCommandPath + " exec --grant-id " + id
 		expiry := openSSHExpiryTime(compiledGrant.ExpiresAt)
 		content.WriteString("restrict,expiry-time=\"")
 		content.WriteString(expiry)
@@ -297,7 +297,7 @@ func (m Module) materializeGeneration(grants []grant, snapshotID string, manifes
 		if err != nil {
 			return fmt.Errorf("marshal receiver grant: %w", err)
 		}
-		path := filepath.Join(grantsPath, grantID(compiledGrant.TaskUID)+".json")
+		path := filepath.Join(grantsPath, grantID(compiledGrant.TaskUID, compiledGrant.AuthorizedPublicKey)+".json")
 		if err := writeNewFile(path, append(data, '\n'), 0o400); err != nil {
 			return fmt.Errorf("write receiver grant: %w", err)
 		}
@@ -588,7 +588,7 @@ func readGenerationGrants(grantDir string) ([]grant, error) {
 		if err != nil {
 			return nil, fmt.Errorf("parse receiver grant: %w", err)
 		}
-		if grantID(compiledGrant.TaskUID) != id {
+		if grantID(compiledGrant.TaskUID, compiledGrant.AuthorizedPublicKey) != id {
 			return nil, fmt.Errorf("receiver grant identity does not match filename")
 		}
 		grants = append(grants, compiledGrant)
