@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -132,7 +133,48 @@ func TestControllerClusterRoleMatchesCapabilityContract(t *testing.T) {
 		t.Fatalf("parse %s: %v", rolePath, err)
 	}
 
-	assertExactControllerCapabilities(t, role.Rules)
+	assertExactControllerCapabilities(t, role.Rules, false)
+}
+
+func TestDestinationLockRBACIsNamespaceScoped(t *testing.T) {
+	var role, binding manifestObject
+	for name, obj := range map[string]*manifestObject{
+		"destination_lock_role.yaml":         &role,
+		"destination_lock_role_binding.yaml": &binding,
+	} {
+		data, err := os.ReadFile(filepath.Join("..", "..", "config", "rbac", name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := yaml.Unmarshal(data, obj); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if role.Kind != "Role" || role.Metadata.Namespace != "zfsreplication-system" {
+		t.Fatalf("Destination Lock role = %s in %s, want Role in controller namespace", role.Kind, role.Metadata.Namespace)
+	}
+	assertExactCapabilities(t, role.Rules, map[manifestCapability][]string{
+		{APIGroup: "coordination.k8s.io", Resource: "leases"}: {"get", "create", "update"},
+	})
+	if binding.Kind != "RoleBinding" || binding.Metadata.Namespace != role.Metadata.Namespace {
+		t.Fatalf("Destination Lock binding = %s in %s, want RoleBinding in controller namespace", binding.Kind, binding.Metadata.Namespace)
+	}
+	assertRenderedRoleBinding(t, &binding, "Role", role.Metadata.Name)
+	data, err := os.ReadFile(filepath.Join("..", "..", "config", "kustomization.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var kustomization struct {
+		Resources []string `yaml:"resources"`
+	}
+	if err := yaml.Unmarshal(data, &kustomization); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"rbac/destination_lock_role.yaml", "rbac/destination_lock_role_binding.yaml"} {
+		if !slices.Contains(kustomization.Resources, name) {
+			t.Errorf("cluster install omits %s", name)
+		}
+	}
 }
 
 func TestRenderedControllerPodReadRBACIsLeastPrivilege(t *testing.T) {
@@ -160,7 +202,7 @@ func TestRenderedControllerPodReadRBACIsLeastPrivilege(t *testing.T) {
 			if role == nil {
 				t.Fatalf("rendered %s has no zfsreplication-controller %s", tt.name, tt.roleKind)
 			}
-			assertExactControllerCapabilities(t, role.Rules)
+			assertExactControllerCapabilities(t, role.Rules, tt.roleKind == "Role")
 
 			podVerbs := verbsForResource(role.Rules, "", "pods")
 			if !slices.Equal(podVerbs, []string{"get", "list", "watch"}) {
@@ -328,7 +370,7 @@ func TestNamespacedRBACRestrictsWorkloadPermissionsToWatchedNamespace(t *testing
 		t.Fatalf("namespaced RBAC namespace = %q, want %s", role.Metadata.Namespace, smokeNamespace)
 	}
 
-	assertExactControllerCapabilities(t, role.Rules)
+	assertExactControllerCapabilities(t, role.Rules, true)
 }
 
 func TestReceiverNamespacedRBACRestrictsTaskPermissionsToWatchedNamespace(t *testing.T) {
@@ -737,7 +779,16 @@ func verbsForResource(rules []manifestPolicyRule, apiGroup, resource string) []s
 	return nil
 }
 
-func assertExactControllerCapabilities(t *testing.T, rules []manifestPolicyRule) {
+func assertExactControllerCapabilities(t *testing.T, rules []manifestPolicyRule, destinationLocks bool) {
+	t.Helper()
+	expected := maps.Clone(controllerRBACCapabilities)
+	if destinationLocks {
+		expected[manifestCapability{APIGroup: "coordination.k8s.io", Resource: "leases"}] = []string{"get", "create", "update"}
+	}
+	assertExactCapabilities(t, rules, expected)
+}
+
+func assertExactCapabilities(t *testing.T, rules []manifestPolicyRule, expected map[manifestCapability][]string) {
 	t.Helper()
 
 	actual := make(map[manifestCapability][]string)
@@ -756,7 +807,7 @@ func assertExactControllerCapabilities(t *testing.T, rules []manifestPolicyRule)
 		}
 	}
 
-	for capability, wantVerbs := range controllerRBACCapabilities {
+	for capability, wantVerbs := range expected {
 		gotVerbs := slices.Clone(actual[capability])
 		wantVerbs = slices.Clone(wantVerbs)
 		slices.Sort(gotVerbs)
@@ -766,7 +817,7 @@ func assertExactControllerCapabilities(t *testing.T, rules []manifestPolicyRule)
 		}
 	}
 	for capability, verbs := range actual {
-		if _, ok := controllerRBACCapabilities[capability]; !ok {
+		if _, ok := expected[capability]; !ok {
 			t.Errorf("unexpected RBAC capability %s/%s with verbs %v", capability.APIGroup, capability.Resource, verbs)
 		}
 	}

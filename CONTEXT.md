@@ -12,6 +12,9 @@ _Avoid_: Src, origin
 The node and dataset to which a Replication Run sends snapshots.
 _Avoid_: Dst, destination when referring to a Replication Run
 
+**Destination Lock**:
+A per-target-node Kubernetes Lease recording active Replication Run UID claims on datasets. Optimistic concurrency excludes equal or overlapping parent/child Replication Targets within the controller's coordination scope; terminal runs release their claims, and deleted or replaced runs are pruned on acquisition. It is independent of an Authorization Lease and never expires a live run's claim by age.
+
 **Receiver**:
 A long-lived node-level replication endpoint that enforces the active Receiver Authorization Snapshot for one or more Replication Runs. Its lifecycle is independent of any individual run.
 

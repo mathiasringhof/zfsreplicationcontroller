@@ -66,11 +66,12 @@ func runManager() error {
 		return fmt.Errorf("create manager: %w", err)
 	}
 	runReconciler := &controller.ZFSReplicationRunReconciler{
-		Client:            mgr.GetClient(),
-		APIReader:         mgr.GetAPIReader(),
-		Scheme:            scheme,
-		ReleaseImage:      releaseImage,
-		ReceiverNamespace: os.Getenv("POD_NAMESPACE"),
+		Client:                   mgr.GetClient(),
+		APIReader:                mgr.GetAPIReader(),
+		Scheme:                   scheme,
+		ReleaseImage:             releaseImage,
+		ReceiverNamespace:        os.Getenv("POD_NAMESPACE"),
+		DestinationLockNamespace: destinationLockNamespace(watchNamespace, os.Getenv("POD_NAMESPACE")),
 	}
 	if err := runReconciler.SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("set up replication run controller: %w", err)
@@ -107,4 +108,11 @@ func managerOptions(scheme *runtime.Scheme, metricsAddr, probeAddr, watchNamespa
 		}
 	}
 	return opts
+}
+
+func destinationLockNamespace(watchNamespace, podNamespace string) string {
+	if watched := strings.TrimSpace(watchNamespace); watched != "" {
+		return watched
+	}
+	return podNamespace
 }

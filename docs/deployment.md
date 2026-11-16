@@ -4,6 +4,31 @@ Use this checklist when promoting a released controller image into a GitOps
 repository or another long-lived Kubernetes install. The image is only one part
 of a release; CRDs and RBAC are part of the runtime contract too.
 
+## Destination Lock Scope
+
+The Destination Lock uses one Kubernetes Lease per target node to exclude equal
+or overlapping parent/child Replication Targets, including across controller
+instances during a rolling update. Cluster-scoped deployments coordinate runs
+across all namespaces, storing Leases in the controller's `POD_NAMESPACE`.
+With `--watch-namespace` (or `WATCH_NAMESPACE`), Leases live in the watched
+namespace and exclusion covers only that namespace.
+
+Two controller deployments (two namespaced deployments, or a namespaced and a
+cluster-scoped deployment) managing runs that target overlapping datasets on the
+same node are unsupported. Operators must keep their Replication Targets
+separate. Cluster-scoped instances coordinating the same targets must share the
+same coordination namespace.
+
+The controller needs exactly `get`, `create`, and `update` on
+`coordination.k8s.io/leases`: the cluster profile adds
+`config/rbac/destination_lock_role.yaml` and its RoleBinding in the controller
+namespace; the namespaced profile grants these verbs in `namespaced_role.yaml`.
+Lease and claim verification reads bypass the cache; no Lease list/watch or
+delete permission is needed. Terminal runs release their claims. Acquisition
+prunes claims only after an uncached read confirms deletion, a different run UID,
+or a terminal phase; unreadable runs retain their claims. Empty Leases remain,
+and live claims survive controller restarts without a timeout or run finalizer.
+
 ## Before Deploying
 
 1. Pick the release version and immutable image reference.

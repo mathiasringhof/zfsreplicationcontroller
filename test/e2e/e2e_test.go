@@ -224,37 +224,54 @@ func TestE2ESyncoidFailure(t *testing.T) {
 }
 
 func TestE2EDestinationContentionWaits(t *testing.T) {
-	k := newKubectlRunner(t)
-	suffix := uniqueSuffix()
-	pool := realZFSPool()
-	blocker := replicationCase{
-		Name:          "e2e-lock-a-" + suffix,
-		SourceNode:    "missing-source-" + suffix,
-		TargetNode:    e2eTargetNode,
-		SourceDataset: pool + "/src-lock-a-" + suffix,
-		TargetDataset: pool + "/dst-lock-" + suffix,
+	for _, tt := range []struct {
+		name, blockerNamespace, blockerSuffix, blockedSuffix string
+	}{
+		{"same namespace", e2eNamespace, "", ""},
+		{"cross namespace equal", "storage-other", "", ""},
+		{"cross namespace parent", "storage-other", "", "/child"},
+		{"cross namespace child", "storage-other", "/child", ""},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			k := newKubectlRunner(t)
+			k.ensureNamespace(tt.blockerNamespace)
+			suffix := uniqueSuffix()
+			pool := realZFSPool()
+			target := pool + "/dst-lock-" + suffix
+			blocker := replicationCase{
+				Name:          "e2e-lock-a-" + suffix,
+				SourceNode:    "missing-source-" + suffix,
+				TargetNode:    e2eTargetNode,
+				SourceDataset: pool + "/src-lock-a-" + suffix,
+				TargetDataset: target + tt.blockerSuffix,
+			}
+			blocked := replicationCase{
+				Name:          "e2e-lock-b-" + suffix,
+				SourceNode:    e2eSourceNode,
+				TargetNode:    e2eTargetNode,
+				SourceDataset: pool + "/src-lock-b-" + suffix,
+				TargetDataset: target + tt.blockedSuffix,
+			}
+			k.cleanupReplicationOnExitInNamespace(tt.blockerNamespace, blocker.Name)
+			k.cleanupReplicationOnExit(blocked.Name)
+			k.cleanupReplicationInNamespace(tt.blockerNamespace, blocker.Name)
+			k.cleanupReplication(blocked.Name)
+
+			k.applyReplicationInNamespace(tt.blockerNamespace, blocker)
+			// A missing source node keeps the sender unscheduled while the real
+			// controller acquires and retains this run's Destination Lock.
+			k.waitForStatusInNamespace(tt.blockerNamespace, blocker, 90*time.Second, func(st replicationStatus) bool {
+				return st.Phase == "Running"
+			}, "Running with unscheduled sender")
+			k.applyReplication(blocked)
+
+			k.waitForDestinationLock(blocked, tt.blockerNamespace+"/"+blocker.Name, blocked.TargetDataset, 90*time.Second)
+			k.assertNoJobsOrSecrets(blocked.Name)
+
+			k.cleanupReplicationInNamespace(tt.blockerNamespace, blocker.Name)
+			k.waitForRunPastPending(blocked, 2*time.Minute)
+		})
 	}
-	blocked := replicationCase{
-		Name:          "e2e-lock-b-" + suffix,
-		SourceNode:    e2eSourceNode,
-		TargetNode:    e2eTargetNode,
-		SourceDataset: pool + "/src-lock-b-" + suffix,
-		TargetDataset: blocker.TargetDataset,
-	}
-	k.cleanupReplicationOnExit(blocker.Name)
-	k.cleanupReplicationOnExit(blocked.Name)
-	k.cleanupReplication(blocker.Name)
-	k.cleanupReplication(blocked.Name)
-
-	k.applyReplication(blocker)
-	k.patchRunPhase(e2eNamespace, blocker.Name, "Running")
-	k.applyReplication(blocked)
-
-	k.waitForDestinationLock(blocked, blocker.Name, blocker.TargetDataset, 90*time.Second)
-	k.assertNoSenderJob(blocked.Name)
-
-	k.cleanupReplication(blocker.Name)
-	k.waitForRunPastPending(blocked, 2*time.Minute)
 }
 
 func TestE2ETerminalCleanupCurrentStateMatrix(t *testing.T) {
@@ -347,6 +364,7 @@ func TestE2EControllerServiceAccountRBAC(t *testing.T) {
 		k.assertCanIWithSubresource(tt.verb, tt.resource, tt.subresource, e2eNamespace, true)
 	}
 	k.assertCanI("delete", "pods", e2eNamespace, false)
+	k.assertDestinationLockRBAC(e2eControllerNamespace, e2eNamespace)
 }
 
 func TestE2ENamespacedDeploymentSmoke(t *testing.T) {
@@ -368,6 +386,8 @@ func TestE2ENamespacedDeploymentSmoke(t *testing.T) {
 	k.assertCanI("delete", "pods", e2eSmokeNamespace, false)
 	k.assertCanI("create", "jobs.batch", e2eNamespace, false)
 	k.assertCanI("delete", "pods", e2eNamespace, false)
+	k.assertDestinationLockRBAC(e2eSmokeNamespace, e2eControllerNamespace)
+	k.assertDestinationLockRBAC(e2eSmokeNamespace, e2eNamespace)
 
 	smoke := replicationCase{
 		Name:          smokeName,
@@ -1334,6 +1354,17 @@ func (k kubectlRunner) assertCanI(verb, resource, namespace string, want bool) {
 	k.assertCanIWithSubresource(verb, resource, "", namespace, want)
 }
 
+func (k kubectlRunner) assertDestinationLockRBAC(lockNamespace, otherNamespace string) {
+	k.t.Helper()
+	for _, verb := range []string{"get", "create", "update"} {
+		k.assertCanI(verb, "leases.coordination.k8s.io", lockNamespace, true)
+		k.assertCanI(verb, "leases.coordination.k8s.io", otherNamespace, false)
+	}
+	for _, verb := range []string{"list", "watch", "patch", "delete"} {
+		k.assertCanI(verb, "leases.coordination.k8s.io", lockNamespace, false)
+	}
+}
+
 func (k kubectlRunner) assertCanIWithSubresource(verb, resource, subresource, namespace string, want bool) {
 	k.t.Helper()
 	args := []string{"auth", "can-i", verb, resource, "--as=" + e2eControllerServiceAccount}
@@ -1362,6 +1393,8 @@ func (k kubectlRunner) applyNamespacedControllerProfile() {
 	repoRoot := e2eRepoRoot(k.t)
 	k.run(60*time.Second, "delete", "clusterrolebinding", e2eControllerDeploymentName, "--ignore-not-found=true")
 	k.run(60*time.Second, "delete", "clusterrole", e2eControllerDeploymentName, "--ignore-not-found=true")
+	k.run(60*time.Second, "delete", "rolebinding", e2eControllerDeploymentName+"-destination-lock", "-n", e2eControllerNamespace, "--ignore-not-found=true")
+	k.run(60*time.Second, "delete", "role", e2eControllerDeploymentName+"-destination-lock", "-n", e2eControllerNamespace, "--ignore-not-found=true")
 	k.run(120*time.Second, "apply", "-k", repoRoot)
 	k.useE2EImages()
 	k.run(180*time.Second, "rollout", "status", "deployment/"+e2eControllerDeploymentName, "-n", e2eControllerNamespace, "--timeout=180s")

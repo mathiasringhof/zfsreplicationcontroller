@@ -28,11 +28,12 @@ import (
 
 type ZFSReplicationRunReconciler struct {
 	client.Client
-	APIReader         client.Reader
-	Scheme            *runtime.Scheme
-	ReleaseImage      string
-	ReceiverNamespace string
-	now               func() time.Time
+	APIReader                client.Reader
+	Scheme                   *runtime.Scheme
+	ReleaseImage             string
+	ReceiverNamespace        string
+	DestinationLockNamespace string
+	now                      func() time.Time
 }
 
 type runReceiverStatus struct {
@@ -61,7 +62,7 @@ func (r *ZFSReplicationRunReconciler) Reconcile(ctx context.Context, req ctrl.Re
 	if err := validateRunSpec(run.Spec); err != nil {
 		return ctrl.Result{}, r.failRunValidation(ctx, &run, err.Error())
 	}
-	if locked, msg, err := r.destinationLocked(ctx, &run); err != nil || locked {
+	if locked, msg, err := r.claimDestination(ctx, &run); err != nil || locked {
 		if err != nil {
 			return ctrl.Result{}, err
 		}
@@ -124,6 +125,7 @@ func (r *ZFSReplicationRunReconciler) Reconcile(ctx context.Context, req ctrl.Re
 		}
 		return result, r.patchRunStatus(ctx, &run, func(st *zfsv1.ZFSReplicationRunStatus) {
 			st.Phase = zfsv1.PhaseRunning
+			st.LastError = ""
 			st.ReceiverPodName = receiver.podName
 			st.ReceiverPodIP = receiver.podIP
 			initializeRunStatus(st, names)
@@ -154,6 +156,7 @@ func (r *ZFSReplicationRunReconciler) reconcileTerminalRun(ctx context.Context, 
 	return errors.Join(
 		r.markReceiveTaskTerminal(ctx, run, names, run.Status.Phase.ReceiveTaskTerminalPhase(), run.Status.LastError),
 		r.deleteRunSSHSecret(ctx, run, names),
+		r.destinationLock().release(ctx, run),
 	)
 }
 
@@ -191,6 +194,7 @@ func (r *ZFSReplicationRunReconciler) ensureSenderStarted(ctx context.Context, r
 	initialStatus := r.needsInitialRunStatus(ctx, run)
 	if err := r.patchRunStatus(ctx, run, func(st *zfsv1.ZFSReplicationRunStatus) {
 		st.Phase = zfsv1.PhaseReceiverReady
+		st.LastError = ""
 		st.ReceiverPodName = receiver.podName
 		st.ReceiverPodIP = receiver.podIP
 		initializeRunStatus(st, names)
@@ -274,10 +278,9 @@ func (r *ZFSReplicationRunReconciler) finishFromSenderJob(
 			return ctrl.Result{}, false, err
 		}
 		log.FromContext(ctx).WithValues("senderJob", names.SenderName, "receiverPod", receiver.podName).Info("replication succeeded")
-		return ctrl.Result{}, true, errors.Join(
-			r.markReceiveTaskTerminal(ctx, run, names, zfsv1.ReceiveTaskPhaseCompleted, ""),
-			r.deleteRunSSHSecret(ctx, run, names),
-		)
+		run.Status.Phase = zfsv1.PhaseSucceeded
+		run.Status.LastError = ""
+		return ctrl.Result{}, true, r.reconcileTerminalRun(ctx, run, names)
 	}
 
 	return ctrl.Result{}, false, nil
@@ -303,6 +306,7 @@ func (r *ZFSReplicationRunReconciler) waitForReplicationReceiver(ctx context.Con
 	initialStatus := runStatusNeedsInitialStatus(observedStatus)
 	err := r.patchRunStatus(ctx, run, func(st *zfsv1.ZFSReplicationRunStatus) {
 		st.Phase = zfsv1.PhaseStartingReceiver
+		st.LastError = ""
 		initializeRunStatus(st, names)
 	})
 	if err == nil && initialStatus {
@@ -820,10 +824,9 @@ func (r *ZFSReplicationRunReconciler) failRunObject(ctx context.Context, run *zf
 	if !wasFailed {
 		log.FromContext(ctx).WithValues("reason", msg).Info("replication failed")
 	}
-	return errors.Join(
-		r.markReceiveTaskTerminal(ctx, run, names, zfsv1.ReceiveTaskPhaseFailed, msg),
-		r.deleteRunSSHSecret(ctx, run, names),
-	)
+	run.Status.Phase = zfsv1.PhaseFailed
+	run.Status.LastError = msg
+	return r.reconcileTerminalRun(ctx, run, names)
 }
 
 func (r *ZFSReplicationRunReconciler) failRunValidation(ctx context.Context, run *zfsv1.ZFSReplicationRun, msg string) error {
@@ -842,7 +845,9 @@ func (r *ZFSReplicationRunReconciler) failRunValidation(ctx context.Context, run
 	if !wasFailed {
 		log.FromContext(ctx).WithValues("reason", msg).Info("replication failed")
 	}
-	return nil
+	run.Status.Phase = zfsv1.PhaseFailed
+	run.Status.LastError = msg
+	return r.reconcileTerminalRun(ctx, run, objectNamesForRun(run.Name))
 }
 
 func (r *ZFSReplicationRunReconciler) markReceiveTaskTerminal(ctx context.Context, run *zfsv1.ZFSReplicationRun, names runObjects, phase zfsv1.ReceiveTaskPhase, msg string) error {
@@ -920,18 +925,18 @@ func validateRunSpec(spec zfsv1.ZFSReplicationRunSpec) error {
 
 func (r *ZFSReplicationRunReconciler) destinationLocked(ctx context.Context, run *zfsv1.ZFSReplicationRun) (bool, string, error) {
 	var runs zfsv1.ZFSReplicationRunList
-	if err := r.List(ctx, &runs, client.InNamespace(run.Namespace)); err != nil {
+	if err := r.List(ctx, &runs); err != nil {
 		return false, "", err
 	}
 	for _, other := range runs.Items {
-		if other.Name == run.Name || !other.Status.Phase.Active() {
+		if other.Name == run.Name && other.Namespace == run.Namespace || !other.Status.Phase.Active() {
 			continue
 		}
 		if other.Spec.Target.NodeName != run.Spec.Target.NodeName || !targetDatasetsOverlap(run.Spec.Target.Dataset, other.Spec.Target.Dataset) {
 			continue
 		}
 		if shouldWaitForDestinationRun(run, &other) {
-			msg := fmt.Sprintf("waiting for active run %s to finish receiving into %s on %s", other.Name, run.Spec.Target.Dataset, run.Spec.Target.NodeName)
+			msg := destinationWaitMessage(run, other.Namespace, other.Name)
 			return true, msg, nil
 		}
 	}
@@ -949,7 +954,7 @@ func shouldWaitForDestinationRun(run, other *zfsv1.ZFSReplicationRun) bool {
 	runTime := run.CreationTimestamp.Time
 	otherTime := other.CreationTimestamp.Time
 	if runTime.IsZero() || otherTime.IsZero() || runTime.Equal(otherTime) {
-		return other.Name < run.Name
+		return client.ObjectKeyFromObject(other).String() < client.ObjectKeyFromObject(run).String()
 	}
 	return otherTime.Before(runTime)
 }
