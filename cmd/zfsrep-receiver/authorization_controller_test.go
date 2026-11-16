@@ -41,8 +41,8 @@ func TestAuthorizationDeadlineResultSchedulesFutureAndDueDeadlines(t *testing.T)
 	}{
 		{name: "none", want: ctrl.Result{}},
 		{name: "future", next: now.Add(10 * time.Minute), want: ctrl.Result{RequeueAfter: 10 * time.Minute}},
-		{name: "exact boundary", next: now, want: ctrl.Result{Requeue: true}},
-		{name: "overdue after clock sample", next: now.Add(-time.Nanosecond), want: ctrl.Result{Requeue: true}},
+		{name: "exact boundary", next: now, want: ctrl.Result{RequeueAfter: overdueDeadlineRequeue}},
+		{name: "overdue after clock sample", next: now.Add(-time.Nanosecond), want: ctrl.Result{RequeueAfter: overdueDeadlineRequeue}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
